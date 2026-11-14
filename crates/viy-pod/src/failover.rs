@@ -3,14 +3,17 @@
 //!
 //! The success path is the single create request it always was. It asks
 //! for GPU_PREFERRED's types only (the A100s); when DATA_CENTER_ID has none
-//! free, the user is asked whether to try the backup volume for them, then
-//! the other types are asked for in DATA_CENTER_ID and then in the backup's
-//! region, the cheapest first as GPU_TYPE_IDS orders them (kb d138; with
-//! no GPU_PREFERRED each region gets one request for every type, as rpctl
-//! sends). When no type is free in either region, or there is no backup
-//! yet, RunPod's stock of our GPU types is sampled and the user asked once
-//! whether to move the backup to the regions that showed one free, the
-//! cheapest type first. On yes each of
+//! free, the user is asked whether to try the backup volume for them. When
+//! the backup has none either, or there is no backup yet, RunPod's stock is
+//! sampled and the user asked whether to move the backup to the regions
+//! that showed a preferred type free. Declined, or nowhere free, the other
+//! types are asked for in DATA_CENTER_ID and then in the backup's region,
+//! the cheapest first as GPU_TYPE_IDS orders them; and when no region
+//! showed a preferred type, the move is offered once more for the regions
+//! that showed any of our types (kb d138, d147). With no GPU_PREFERRED,
+//! as rpctl: each region gets one request for every type, and the move
+//! goes to the regions that showed any type free, the cheapest type
+//! first. On yes each of
 //! them gets a new volume and a pod request, refusals are retried for
 //! FAILOVER_RETRY_MIN (the primary and the old backup too), and the first
 //! region to take the pod wins. Volumes no pod used are deleted at once,
@@ -20,6 +23,7 @@
 //! Questions go to an [`Asker`]; with nobody to ask, the backup is tried
 //! and nothing is made or deleted.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::pin::pin;
 use std::sync::atomic::AtomicU32;
@@ -72,7 +76,7 @@ pub struct Created {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ask {
     /// Every type: a region's one request without GPU_PREFERRED, and
-    /// every request of the backup's move.
+    /// every request of the backup's move to where any type is free.
     Every,
     /// GPU_PREFERRED's types.
     Preferred,
@@ -490,8 +494,11 @@ impl<'a> Creation<'a> {
 
     /// regions.py's `failover`: called once DATA_CENTER_ID refused the
     /// pod for lack of capacity. With GPU_PREFERRED that request asked for
-    /// its types only: the backup is asked for them next, then
-    /// DATA_CENTER_ID and the backup for the others.
+    /// its types only: the backup is asked for them next, then the backup
+    /// is offered a move to a region RunPod shows one of them free in, and
+    /// only then are DATA_CENTER_ID and the backup asked for the others
+    /// (kb d147). Without GPU_PREFERRED, as rpctl: the backup, then a move
+    /// to where any of our types is free.
     async fn failover(&mut self, primary_volume: &str) -> Result<Won, Stop> {
         let (paths, time) = (self.env.paths, self.env.time);
         let primary = self.primary.clone();
@@ -499,8 +506,13 @@ impl<'a> Creation<'a> {
         let backup_region = backup
             .as_ref()
             .map(|b| crate::api::shown(b.get("dataCenterId")));
+        let first = self.first();
+        let gpu = if first == Ask::Preferred {
+            "preferred GPU type"
+        } else {
+            "GPU"
+        };
         if let (Some(backup), Some(region)) = (&backup, &backup_region) {
-            let first = self.first();
             let question = if first == Ask::Preferred {
                 format!(
                     "{primary} has no preferred GPU type free. Try the backup volume in {region} \
@@ -520,25 +532,14 @@ impl<'a> Creation<'a> {
             if let Some(won) = self.in_backup(backup, region, first).await? {
                 return Ok(won);
             }
-            if let Some(won) = self.others_in_primary(primary_volume).await? {
-                return Ok(won);
-            }
-            if first == Ask::Preferred
-                && let Some(won) = self.in_backup(backup, region, Ask::Others).await?
-            {
-                return Ok(won);
-            }
             self.say(
                 Tone::Warn,
-                format!("The backup region {region} has no GPU free either."),
+                format!("The backup region {region} has no {gpu} free either."),
             );
         } else {
-            if let Some(won) = self.others_in_primary(primary_volume).await? {
-                return Ok(won);
-            }
             self.say(
                 Tone::Warn,
-                format!("{primary} has no GPU free, and there is no backup volume yet."),
+                format!("{primary} has no {gpu} free, and there is no backup volume yet."),
             );
         }
 
@@ -548,7 +549,7 @@ impl<'a> Creation<'a> {
             Tone::Warn,
             "Checking RunPod's stock of our GPU types in every region with network volumes...",
         );
-        let samples = regions::sample_stock(
+        let sampled = regions::sample_stock(
             self.rp,
             paths,
             time,
@@ -560,47 +561,114 @@ impl<'a> Creation<'a> {
         .map_err(|error| {
             let first = regions::first_line(&error);
             Stop::NoCapacity(format!("Could not read RunPod's stock: {first}"))
-        })?;
+        });
+        let old = backup.as_ref().zip(backup_region.as_deref());
+        // How the move to a preferred type ended, when one was offered.
+        let mut moved: Option<Stop> = None;
+        if let Some((preferred, _)) = self.tiers.clone() {
+            let offered = match &sampled {
+                Ok(samples) => {
+                    let samples = regions::showing(samples, &preferred);
+                    self.offer_move(&samples, &past, old, primary_volume, Ask::Preferred)
+                        .await
+                }
+                Err(_) => Ok(None),
+            };
+            match offered {
+                Ok(Some(won)) => return Ok(won),
+                Ok(None) if sampled.is_ok() => self.say(
+                    Tone::Warn,
+                    "No other region with network volumes shows a preferred GPU type free right \
+                     now.",
+                ),
+                Ok(None) => {}
+                Err(stop @ (Stop::Declined(_) | Stop::NoCapacity(_))) => moved = Some(stop),
+                Err(stop) => return Err(stop),
+            }
+            // The other types where the weights already are.
+            if let Some(won) = self.others_in_primary(primary_volume).await? {
+                return Ok(won);
+            }
+            if let Some((backup, region)) = old
+                && let Some(won) = self.in_backup(backup, region, Ask::Others).await?
+            {
+                return Ok(won);
+            }
+        }
+        if let Some(stop) = moved {
+            return Err(stop);
+        }
+        let samples = sampled?;
+        if let Some(won) = self
+            .offer_move(&samples, &past, old, primary_volume, Ask::Every)
+            .await?
+        {
+            return Ok(won);
+        }
+        let kept = backup_region
+            .as_ref()
+            .map(|r| format!(" The backup in {r} was kept."))
+            .unwrap_or_default();
+        Err(Stop::NoCapacity(format!(
+            "No other region with network volumes shows one of our GPU types free right now.\
+             {kept}"
+        )))
+    }
+
+    /// Offers to move the backup (or make one) where `samples` show a GPU
+    /// free, outside DATA_CENTER_ID and the old backup's region, and on
+    /// yes [`grab`](Self::grab)s a pod there asking for `ask`'s types. None
+    /// when no such region showed one.
+    async fn offer_move(
+        &mut self,
+        samples: &[regions::Snapshot],
+        past: &HashMap<String, f64>,
+        old: Option<(&Value, &str)>,
+        primary_volume: &str,
+        ask: Ask,
+    ) -> Result<Option<Won>, Stop> {
+        let primary = self.primary.clone();
         let mut exclude = HashSet::from([primary.as_str()]);
-        exclude.extend(backup_region.as_deref());
+        exclude.extend(old.map(|(_, region)| region));
         let types = regions::stock_types(self.cfg);
-        let candidates = regions::rank(&samples, &exclude, &past, &types);
+        let candidates = regions::rank(samples, &exclude, past, &types);
         if candidates.is_empty() {
-            let kept = backup_region
-                .as_ref()
-                .map(|r| format!(" The backup in {r} was kept."))
-                .unwrap_or_default();
-            return Err(Stop::NoCapacity(format!(
-                "No other region with network volumes shows one of our GPU types free right \
-                 now.{kept}"
-            )));
+            return Ok(None);
         }
         let shown: Vec<String> = candidates
             .iter()
             .map(|r| {
                 format!(
                     "{r} {}/{} ({})",
-                    regions::free_in(&samples, r),
+                    regions::free_in(samples, r),
                     samples.len(),
-                    regions::cheapest_seen(&samples, r, &types).unwrap_or("None")
+                    regions::cheapest_seen(samples, r, &types).unwrap_or("None")
                 )
             })
             .collect();
+        let what = if ask == Ask::Preferred {
+            "Preferred GPU type"
+        } else {
+            "GPU"
+        };
         self.say(
             Tone::Warn,
             format!(
-                "GPU free now (of {} samples): {}",
+                "{what} free now (of {} samples): {}",
                 samples.len(),
                 shown.join(", ")
             ),
         );
         let minutes = regions::grab_minutes(self.cfg);
-        let place = if let [only] = candidates.as_slice() {
+        let mut place = if let [only] = candidates.as_slice() {
             only.clone()
         } else {
             format!("the first of {} that takes the pod", candidates.join(", "))
         };
-        let also: Vec<&str> = [Some(primary.as_str()), backup_region.as_deref()]
+        if ask == Ask::Preferred {
+            place.push_str(" for a preferred GPU type, before trying the other types");
+        }
+        let also: Vec<&str> = [Some(primary.as_str()), old.map(|(_, region)| region)]
             .into_iter()
             .flatten()
             .collect();
@@ -614,14 +682,14 @@ impl<'a> Creation<'a> {
         } else {
             String::new()
         };
-        let question = match (&backup, &backup_region) {
-            (Some(backup), Some(region)) => format!(
+        let question = match old {
+            Some((backup, region)) => format!(
                 "Switch the backup to {place}? It makes a new volume in each region it tries and \
                  boots cold (~5 min: weights download, first compile){retry}. The old backup {} \
                  in {region} is deleted once viy is up on the new one.",
                 id(backup)
             ),
-            _ => format!(
+            None => format!(
                 "Make a backup volume in {place}? It makes a new volume in each region it tries \
                  and boots cold (~5 min: weights download, first compile){retry}. ~$7/month, \
                  deleted after {:.0} days unused.",
@@ -629,39 +697,32 @@ impl<'a> Creation<'a> {
             ),
         };
         if !self.ask(question, false).await {
-            let what = if backup.is_some() {
-                "switched."
-            } else {
-                "made."
-            };
+            let what = if old.is_some() { "switched." } else { "made." };
             return Err(Stop::Declined(format!("The backup was not {what}")));
         }
         // New volumes exist from here on: a Ctrl-C deletes them first.
         self.user.abort_at.store(u32::MAX, Ordering::SeqCst);
         let won = self
-            .grab(
-                &candidates,
-                backup.as_ref().zip(backup_region.as_deref()),
-                primary_volume,
-                minutes,
-            )
+            .grab(&candidates, old, primary_volume, minutes, ask)
             .await;
         let next = self.user.interrupt.count() + 1;
         self.user.abort_at.store(next, Ordering::SeqCst);
-        won
+        won.map(Some)
     }
 
     /// regions.py's `_grab`: the first region that accepts the pod wins,
     /// each candidate on a new volume of its own, and from the second
     /// round on also the primary and the old backup, which need no new
     /// volume and boot warm. Stock flickers, so refusals are retried every
-    /// [`RETRY_GAP_S`] until `minutes` run out.
+    /// [`RETRY_GAP_S`] until `minutes` run out. Every request asks for
+    /// `ask`'s types.
     async fn grab(
         &mut self,
         offered: &[String],
         backup: Option<(&Value, &str)>,
         primary_volume: &str,
         minutes: f64,
+        ask: Ask,
     ) -> Result<Won, Stop> {
         let paths = self.env.paths;
         // A candidate whose region RunPod's pod API does not take is
@@ -727,7 +788,7 @@ impl<'a> Creation<'a> {
                 let attempt = tokio::select! {
                     biased;
                     () = &mut stopped => { interrupted = true; break 'rounds; }
-                    attempt = self.attempt(&region, &volume_id, role, rounds > 0, Ask::Every) => attempt,
+                    attempt = self.attempt(&region, &volume_id, role, rounds > 0, ask) => attempt,
                 };
                 match attempt {
                     Ok(pod) => {

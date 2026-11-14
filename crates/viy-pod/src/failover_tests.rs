@@ -973,12 +973,50 @@ async fn the_first_request_asks_for_the_preferred_types_only() {
     assert!(r.asked.is_empty());
 }
 
+/// One stock snapshot's reply: EUR-IS-1, US-MO-1, CA-MTL-3 and EU-RO-1,
+/// with `free`'s (region, type) available.
+fn stock(free: &[(&str, &str)]) -> String {
+    let centers: Vec<Value> = ["EUR-IS-1", "US-MO-1", "CA-MTL-3", "EU-RO-1"]
+        .iter()
+        .map(|region| {
+            let gpus: Vec<Value> = free
+                .iter()
+                .filter(|(r, _)| r == region)
+                .map(|(_, gpu)| json!({"gpuTypeId": gpu, "stockStatus": "Low", "available": true}))
+                .collect();
+            json!({"id": region, "location": "synthetic", "listed": true,
+                   "storageSupport": true, "gpuAvailability": gpus})
+        })
+        .collect();
+    json!({"data": {"dataCenters": centers}}).to_string()
+}
+
+fn warned(r: &Replayed) -> Vec<&str> {
+    r.said
+        .iter()
+        .filter(|s| s[0] == "warn")
+        .filter_map(|s| s[1].as_str())
+        .collect()
+}
+
+/// The refusal AP-IN-1 gave for the A100s on 2026-08-01.
+const NO_SUCH_HOST: &str =
+    r#"{"error": "create pod: could not find any pods with required specifications"}"#;
+const NEW_IN_CA: &str =
+    r#"{"id": "new1", "name": "w-backup", "size": 100, "dataCenterId": "CA-MTL-3"}"#;
+const NEW_IN_RO: &str =
+    r#"{"id": "new1", "name": "w-backup", "size": 100, "dataCenterId": "EU-RO-1"}"#;
+
 #[tokio::test(start_paused = true)]
-async fn preferred_types_in_both_regions_come_before_the_others_in_either() {
+async fn nowhere_with_a_preferred_type_free_the_others_follow_in_both_regions() {
+    let none = stock(&[]);
     let replies = [
         (500, FULL),
         (200, VOLUMES),
         (500, FULL),
+        (200, none.as_str()),
+        (200, none.as_str()),
+        (200, none.as_str()),
         (500, FULL),
         (200, POD),
     ];
@@ -1000,17 +1038,14 @@ async fn preferred_types_in_both_regions_come_before_the_others_in_either() {
             true
         ]])
     );
-    let warned: Vec<&str> = r
-        .said
-        .iter()
-        .filter(|s| s[0] == "warn")
-        .filter_map(|s| s[1].as_str())
-        .collect();
     assert_eq!(
-        warned,
+        warned(&r),
         [
             "  EUR-IS-1 (primary, preferred types): no preferred GPU type free",
             "  US-MO-1 (backup, preferred types): no preferred GPU type free",
+            "The backup region US-MO-1 has no preferred GPU type free either.",
+            "Checking RunPod's stock of our GPU types in every region with network volumes...",
+            "No other region with network volumes shows a preferred GPU type free right now.",
             "  EUR-IS-1 (primary, other types): no other GPU type free",
         ]
     );
@@ -1026,7 +1061,16 @@ async fn preferred_types_in_both_regions_come_before_the_others_in_either() {
 
 #[tokio::test(start_paused = true)]
 async fn another_type_in_the_primary_beats_one_in_the_backup() {
-    let replies = [(500, FULL), (200, VOLUMES), (500, FULL), (200, POD)];
+    let none = stock(&[]);
+    let replies = [
+        (500, FULL),
+        (200, VOLUMES),
+        (500, FULL),
+        (200, none.as_str()),
+        (200, none.as_str()),
+        (200, none.as_str()),
+        (200, POD),
+    ];
     let r = preferring(&replies, json!([true]), "EUR-IS-1").await;
     assert_eq!(r.asks().last(), Some(&ask("EUR-IS-1", RTX, 5)));
     assert_eq!(r.ok()[1..], [json!("prim"), json!(false)]);
@@ -1035,6 +1079,154 @@ async fn another_type_in_the_primary_beats_one_in_the_backup() {
         "  pod created in EUR-IS-1 on the primary volume after all"
     ])));
     assert!(r.volume_calls().is_empty());
+}
+
+/// Gregory's case of 2026-08-01: no A100 in EUR-IS-1, no A100 host at all
+/// in the backup's region, one free elsewhere.
+#[tokio::test(start_paused = true)]
+async fn the_backup_moves_to_a_preferred_type_before_the_other_types_are_tried() {
+    let free = stock(&[("CA-MTL-3", A100), ("EU-RO-1", RTX)]);
+    let replies = [
+        (500, FULL),
+        (200, VOLUMES),
+        (500, NO_SUCH_HOST),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (200, NEW_IN_CA),
+        (200, POD),
+    ];
+    let r = preferring(&replies, json!([true, true]), "CA-MTL-3").await;
+    assert_eq!(
+        r.asks(),
+        [
+            ask("EUR-IS-1", A100, 2),
+            ask("US-MO-1", A100, 2),
+            ask("CA-MTL-3", A100, 2),
+        ]
+    );
+    assert!(r.said.contains(&json!([
+        "warn",
+        "Preferred GPU type free now (of 3 samples): CA-MTL-3 3/3 (NVIDIA A100 80GB PCIe)"
+    ])));
+    let question = r.asked[1][0].as_str().unwrap();
+    assert!(
+        question.starts_with(
+            "Switch the backup to CA-MTL-3 for a preferred GPU type, before trying the other \
+             types? It makes a new volume"
+        ),
+        "{question}"
+    );
+    assert!(
+        question
+            .ends_with("The old backup bk in US-MO-1 is deleted once viy is up on the new one.")
+    );
+    assert_eq!(r.asked[1][1], false);
+    assert_eq!(r.ok()[1..], [json!("new1"), json!(true)]);
+    assert_eq!(r.backups()["new1"]["replaces"], "bk");
+    assert_eq!(rows(&r.paths.up_failures_file())[1]["capacity"], true);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_backup_one_is_offered_where_a_preferred_type_is_free() {
+    let free = stock(&[("CA-MTL-3", A100)]);
+    let replies = [
+        (500, FULL),
+        (200, ONLY_PRIMARY),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (200, NEW_IN_CA),
+        (200, POD),
+    ];
+    let r = preferring(&replies, json!([true]), "CA-MTL-3").await;
+    assert_eq!(
+        r.asks(),
+        [ask("EUR-IS-1", A100, 2), ask("CA-MTL-3", A100, 2)]
+    );
+    assert!(
+        r.asked[0][0]
+            .as_str()
+            .unwrap()
+            .starts_with("Make a backup volume in CA-MTL-3 for a preferred GPU type, before")
+    );
+    assert!(r.said.contains(&json!([
+        "warn",
+        "EUR-IS-1 has no preferred GPU type free, and there is no backup volume yet."
+    ])));
+    assert_eq!(r.ok()[1..], [json!("new1"), json!(true)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_to_the_preferred_move_still_asks_both_regions_for_the_other_types() {
+    let free = stock(&[("CA-MTL-3", A100)]);
+    let replies = [
+        (500, FULL),
+        (200, VOLUMES),
+        (500, FULL),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (500, FULL),
+        (500, FULL),
+    ];
+    let r = preferring(&replies, json!([true, false]), "").await;
+    assert_eq!(
+        r.asks(),
+        [
+            ask("EUR-IS-1", A100, 2),
+            ask("US-MO-1", A100, 2),
+            ask("EUR-IS-1", RTX, 5),
+            ask("US-MO-1", RTX, 5),
+        ]
+    );
+    // One move offered: none for the other types after the no.
+    assert_eq!(r.asked.len(), 2);
+    assert!(r.volume_calls().is_empty());
+    assert_eq!(r.outcome["exit"], 1);
+    assert!(r.said.contains(&json!([
+        "dim",
+        "The backup was not switched. No pod was created; nothing is billing."
+    ])));
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_no_preferred_type_anywhere_the_move_goes_where_another_type_is_free() {
+    let free = stock(&[("EU-RO-1", RTX)]);
+    let replies = [
+        (500, FULL),
+        (200, VOLUMES),
+        (500, FULL),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (200, free.as_str()),
+        (500, FULL),
+        (500, FULL),
+        (200, NEW_IN_RO),
+        (200, POD),
+    ];
+    let r = preferring(&replies, json!([true, true]), "EU-RO-1").await;
+    assert_eq!(
+        r.asks(),
+        [
+            ask("EUR-IS-1", A100, 2),
+            ask("US-MO-1", A100, 2),
+            ask("EUR-IS-1", RTX, 5),
+            ask("US-MO-1", RTX, 5),
+            ask("EU-RO-1", A100, 7),
+        ]
+    );
+    assert!(
+        r.asked[1][0]
+            .as_str()
+            .unwrap()
+            .starts_with("Switch the backup to EU-RO-1? It makes")
+    );
+    assert!(r.said.contains(&json!([
+        "warn",
+        "GPU free now (of 3 samples): EU-RO-1 3/3 (NVIDIA RTX PRO 6000 Blackwell Server Edition)"
+    ])));
+    assert_eq!(r.ok()[1..], [json!("new1"), json!(true)]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1058,8 +1250,16 @@ async fn no_to_the_backup_still_asks_the_primary_for_the_other_types() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn without_a_backup_the_other_types_follow_in_the_primary() {
-    let replies = [(500, FULL), (200, ONLY_PRIMARY), (200, POD)];
+async fn without_a_backup_and_no_preferred_type_elsewhere_the_others_follow_in_the_primary() {
+    let none = stock(&[]);
+    let replies = [
+        (500, FULL),
+        (200, ONLY_PRIMARY),
+        (200, none.as_str()),
+        (200, none.as_str()),
+        (200, none.as_str()),
+        (200, POD),
+    ];
     let r = preferring(&replies, json!([]), "EUR-IS-1").await;
     assert_eq!(
         r.asks(),
@@ -1071,15 +1271,50 @@ async fn without_a_backup_the_other_types_follow_in_the_primary() {
 
 #[tokio::test(start_paused = true)]
 async fn a_refusal_that_is_not_about_capacity_ends_the_search() {
+    let none = stock(&[]);
     let replies = [
         (500, FULL),
         (200, VOLUMES),
         (500, FULL),
+        (200, none.as_str()),
+        (200, none.as_str()),
+        (200, none.as_str()),
         (400, r#"{"error": "bad"}"#),
     ];
     let r = preferring(&replies, json!([true]), "").await;
     assert_eq!(r.asks().len(), 3);
     assert_eq!(r.outcome["exit"], 1);
+}
+
+#[test]
+fn no_host_with_the_required_specifications_is_no_gpu_free() {
+    let refusal = RunPodError::new(
+        "POST /pods -> HTTP 500\n{\n  \"error\": \"create pod: could not find any pods with \
+         required specifications\",\n  \"status\": 500\n}",
+        Some(500),
+    );
+    assert!(regions::is_capacity_error(&refusal));
+}
+
+#[test]
+fn stock_names_a_preferred_type_before_a_cheaper_other_one() {
+    let mut cfg = Config::defaults();
+    cfg.set("GPU_TYPE_IDS", &format!("{RTX},{A100}"));
+    cfg.set("GPU_PREFERRED", A100);
+    assert_eq!(regions::stock_types(&cfg), [A100, RTX]);
+    cfg.set("GPU_PREFERRED", "");
+    assert_eq!(regions::stock_types(&cfg), [RTX, A100]);
+
+    let snap: Snapshot = [
+        ("CA-MTL-3".to_string(), Some(A100.to_string())),
+        ("EU-RO-1".to_string(), Some(RTX.to_string())),
+        ("US-MO-1".to_string(), None),
+    ]
+    .into_iter()
+    .collect();
+    let only = regions::showing(&[snap], &[A100.to_string()]);
+    assert_eq!(only[0]["CA-MTL-3"].as_deref(), Some(A100));
+    assert_eq!(only[0]["EU-RO-1"], None);
 }
 
 #[tokio::test(start_paused = true)]

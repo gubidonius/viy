@@ -29,6 +29,7 @@ use serde_json::Value;
 use serde_json::json;
 use viy_config::Config;
 use viy_config::Paths;
+use viy_config::config::gpu_tiers;
 use viy_config::config::gpu_type_list;
 use viy_config::redact::Redactor;
 use viy_time::TimeProvider;
@@ -62,11 +63,6 @@ const REST_CUDA: [&str; 12] = [
 pub const HISTORY_DAYS: u32 = 30;
 const DAY_S: f64 = 86400.0;
 
-/// RunPod's wording: "There are no instances currently available", and the
-/// older "There are no longer any instances available with the requested
-/// specifications". Only this refusal is one another region can fix; a
-/// credit or request error would fail anywhere, and must never move the
-/// backup.
 /// True when RunPod's REST API refuses the pod request for its region:
 /// dataCenterIds names a region outside the API's list. GraphQL's
 /// dataCenters may still list that region as supporting network volumes
@@ -88,10 +84,18 @@ pub fn backup_tier(cfg: &Config) -> Option<&str> {
     Some(cfg.get("BACKUP_VOLUME_TYPE").unwrap_or("").trim()).filter(|tier| !tier.is_empty())
 }
 
+/// RunPod's wording: "There are no instances currently available", the
+/// older "There are no longer any instances available with the requested
+/// specifications", and "could not find any pods with required
+/// specifications", which a region with no host of the types asked for
+/// gives (AP-IN-1 for the A100s on 2026-08-01, after EUR-IS-1 had answered
+/// the same request with "no instances"). Only these refusals are ones
+/// another region can fix; a credit or request error would fail anywhere,
+/// and must never move the backup.
 pub fn is_capacity_error(error: &RunPodError) -> bool {
     static CAPACITY: LazyLock<Regex> = LazyLock::new(|| {
         crate::compile_regex(
-            r"(?i)no (?:longer any )?instances|instances? currently available|not enough (?:free )?gpus|no gpus? (?:are )?available|out of capacity",
+            r"(?i)no (?:longer any )?instances|instances? currently available|not enough (?:free )?gpus|no gpus? (?:are )?available|out of capacity|could not find any pods with (?:the )?required specifications",
         )
     });
     CAPACITY.is_match(&error.to_string())
@@ -340,11 +344,32 @@ pub async fn find_backup(
 pub type Snapshot = IndexMap<String, Option<String>>;
 
 /// Our GPU types, in GPU_TYPE_IDS order: the cost policy, cheapest first
-/// (rpctl's `stock_types`). Until rpctl 03ec13a only the A100s among them
-/// counted, so a region with only an RTX PRO 6000 or an H100 free was
-/// never offered.
+/// (rpctl's `stock_types`), except that GPU_PREFERRED's types come before
+/// the others, so a stock snapshot names a preferred type wherever one is
+/// free (kb d147). Until rpctl 03ec13a only the A100s among them counted,
+/// so a region with only an RTX PRO 6000 or an H100 free was never offered.
 pub fn stock_types(cfg: &Config) -> Vec<String> {
-    gpu_type_list(cfg).into_iter().map(str::to_string).collect()
+    let ordered = match gpu_tiers(cfg) {
+        Some((preferred, others)) => [preferred, others].concat(),
+        None => gpu_type_list(cfg),
+    };
+    ordered.into_iter().map(str::to_string).collect()
+}
+
+/// `samples` with only `types` counted: a region that showed another type
+/// shows none.
+pub fn showing(samples: &[Snapshot], types: &[String]) -> Vec<Snapshot> {
+    samples
+        .iter()
+        .map(|snap| {
+            snap.iter()
+                .map(|(region, free)| {
+                    let free = free.clone().filter(|gpu| types.contains(gpu));
+                    (region.clone(), free)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn version(v: &str) -> Vec<u64> {

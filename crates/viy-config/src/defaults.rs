@@ -133,8 +133,9 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ),
     ("GPU_TYPE_PRIORITY", "custom"),
     // The types of GPU_TYPE_IDS asked for first: the primary region, then
-    // the backup, and only then the other types in the primary, then in the
-    // backup. Empty asks each region once, for every type (kb d138).
+    // the backup, then a move of the backup to where one of them is free,
+    // and only then the other types in the primary, then in the backup.
+    // Empty asks each region once, for every type (kb d138, d147).
     (
         "GPU_PREFERRED",
         "NVIDIA A100 80GB PCIe,NVIDIA A100-SXM4-80GB",
