@@ -1,6 +1,6 @@
 # The rpctl commit viy ports from. Change it only together with regenerated
 # fixtures (docs/implementation-plan.md 3.1); tools/refsnap.sh extracts it.
-commit: 573dbaaeb6b1caf7b1629171b5cc2c3b62a39fbb
+commit: 4e3645919bb803eab33dc1e0f6c57bf72fa6aeaa
 branch: leak-protection
-pinned: 2026-07-29
-subject: inline_python.py: count run_shell calls in session logs
+pinned: 2026-07-31
+subject: startup.py: skip the multimodal warmup under vLLM 0.33.0's signature too

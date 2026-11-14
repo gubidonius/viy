@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "573dbaaeb6b1caf7b1629171b5cc2c3b62a39fbb",
+ "rpctl_commit": "4e3645919bb803eab33dc1e0f6c57bf72fa6aeaa",
  "generator": "tools/fixtures.py config/init",
  "about": "`rp init` (rpctl __main__.cmd_init) in $T/project/<cwd> after laying out project_files (a trailing / is a directory): exit status, stdout, stderr (a traceback's last line only), and every path under $T/project afterwards; HOME is $T/home, XDG_CONFIG_HOME $T/config",
  "cases": [

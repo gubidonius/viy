@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "573dbaaeb6b1caf7b1629171b5cc2c3b62a39fbb",
+ "rpctl_commit": "4e3645919bb803eab33dc1e0f6c57bf72fa6aeaa",
  "generator": "tools/fixtures.py config/persist",
  "about": "rpctl config.persist(cfg, KEY, VALUE) after config.load() in a synthetic tree: cfg[KEY] afterwards and the files under $T/config/rpctl",
  "cases": [

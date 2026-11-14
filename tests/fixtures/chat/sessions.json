@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "573dbaaeb6b1caf7b1629171b5cc2c3b62a39fbb",
+ "rpctl_commit": "4e3645919bb803eab33dc1e0f6c57bf72fa6aeaa",
  "generator": "tools/fixtures.py chat/sessions",
  "about": "rpctl's sessions.py run through scripts of steps (see tools/fixtures.py chat/sessions): the clock at 1761868800.25 plus the step's index, ids shown as the name of the log that made them, the case's directory as $T. Per log its bytes, events, replay() and sidecar; then the listings, searches and resolves the case asks for",
  "cases": [

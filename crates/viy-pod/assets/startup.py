@@ -223,7 +223,9 @@ def skip_mm_warmup():
     maximum size through the processor on a single CPU thread before the server
     may start, 16.5s of every boot (2026-06-26). It only exists to make the
     first image request faster; image input works the same without it. If this
-    vLLM version has no such method, nothing changes and the warmup runs."""
+    vLLM version has no such method, nothing changes and the warmup runs.
+    The replacement takes any positional arguments: vLLM 0.33.0 added a
+    `cache` argument after `processor` that 0.27.1 does not pass."""
     try:
         from vllm.renderers import base
     except Exception:
@@ -231,7 +233,7 @@ def skip_mm_warmup():
     if not hasattr(base.BaseRenderer, "_warmup_mm_processor"):
         return False
 
-    def skipped(self, processor, *, log_prefix):
+    def skipped(self, *args, log_prefix="", **kwargs):
         base.logger.info("%s warmup skipped by rpctl (boot-time budget)", log_prefix)
 
     base.BaseRenderer._warmup_mm_processor = skipped

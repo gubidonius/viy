@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ASSET = Path(__file__).resolve().parent.parent / "assets" / "startup.py"
 _spec = importlib.util.spec_from_file_location("startup", ASSET)
@@ -78,6 +78,35 @@ class BootBudgetTests(unittest.TestCase):
 class PrewarmTests(unittest.TestCase):
     def test_mm_warmup_patch_is_harmless_without_vllm(self):
         self.assertFalse(startup.skip_mm_warmup())
+
+    def test_mm_warmup_patch_takes_both_vllm_signatures(self):
+        # 0.27.1 calls (processor, *, log_prefix); 0.33.0 added a positional
+        # cache: (processor, cache, *, log_prefix). Both must be skipped, and
+        # logged as skipped, not raise into vLLM's "warmup failed" handler.
+        import types
+        ran = []
+
+        class BaseRenderer:
+            def _warmup_mm_processor(self, processor, *, log_prefix):
+                ran.append(log_prefix)
+
+        base = types.ModuleType("vllm.renderers.base")
+        base.BaseRenderer = BaseRenderer
+        base.logger = Mock()
+        renderers = types.ModuleType("vllm.renderers")
+        renderers.base = base
+        modules = {"vllm": types.ModuleType("vllm"), "vllm.renderers": renderers,
+                   "vllm.renderers.base": base}
+        with patch.dict("sys.modules", modules):
+            self.assertTrue(startup.skip_mm_warmup())
+        renderer = BaseRenderer()
+        renderer._warmup_mm_processor("processor", log_prefix="Multi-modal")
+        renderer._warmup_mm_processor("processor", "cache", log_prefix="Multi-modal")
+        self.assertEqual(ran, [])
+        self.assertEqual(base.logger.info.call_count, 2)
+        for call in base.logger.info.call_args_list:
+            self.assertEqual(call.args, ("%s warmup skipped by rpctl (boot-time budget)",
+                                         "Multi-modal"))
 
     def test_prewarm_reads_every_shard(self):
         with tempfile.TemporaryDirectory() as directory:
