@@ -138,6 +138,9 @@ struct Summary {
     /// The newest line summarised so far.
     newest: Option<DateTime<Utc>>,
     failure: Option<String>,
+    /// The last fetch met RunPod's rate limit, which holds until then:
+    /// the log is out of reach, and what it showed last is stale.
+    limited_until: Option<Instant>,
 }
 
 impl Progress {
@@ -179,14 +182,21 @@ impl Progress {
     }
 
     async fn refresh(&self) {
-        let entries = self
+        let fetched = self
             .rp
             .pod_logs(&self.pod_id, 30, Duration::from_secs(8))
-            .await
-            .unwrap_or_default();
+            .await;
         let mut summary = self.summary();
-        summary.summarise(&entries, self.require_ssh);
         summary.fetching = false;
+        match fetched {
+            Ok(entries) => {
+                summary.limited_until = None;
+                summary.summarise(&entries, self.require_ssh);
+            }
+            Err(error) => {
+                summary.limited_until = error.retry_after().map(|wait| Instant::now() + wait);
+            }
+        }
     }
 }
 
@@ -205,10 +215,17 @@ const PULL_WORDS: [&str; 8] = [
 
 impl Summary {
     fn result(&self) -> Result<String, WaitError> {
-        match &self.failure {
-            Some(failure) => Err(WaitError::Startup(failure.clone())),
-            None => Ok(self.text.clone()),
+        if let Some(failure) = &self.failure {
+            return Err(WaitError::Startup(failure.clone()));
         }
+        let left = self
+            .limited_until
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .filter(|left| !left.is_zero());
+        Ok(match left {
+            Some(left) => crate::ssh::rate_limited(left),
+            None => self.text.clone(),
+        })
     }
 
     fn summarise(&mut self, entries: &[LogEntry], require_ssh: bool) {

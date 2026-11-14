@@ -12,6 +12,7 @@ use viy_testkit::exec::FakeExec;
 use viy_testkit::exec::Reply as Run;
 use viy_testkit::fixtures;
 use viy_testkit::http::FakeHttp;
+use viy_testkit::http::Piece;
 use viy_testkit::http::Reply;
 use viy_testkit::http::RouteHttp;
 use viy_testkit::scratch::ScratchDir;
@@ -1316,4 +1317,56 @@ async fn ssh_failure_surfaces_from_platform_log() {
     let progress = Progress::new(&rp, "pod111", true);
     progress.refresh().await;
     assert!(matches!(progress.poll(), Err(WaitError::Startup(_))));
+}
+
+/// A boot of 2026-08-01: once RunPod refused every call with 429
+/// ("rate limit exceeded for the hour window"), the clock went on saying
+/// "pulling container image" for the rest of the wait. A wait that cannot
+/// see the pod says so, and how long for (kb d140).
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_wait_says_it_cannot_see_the_pod_not_the_last_stage() {
+    let pull = Reply::answer(
+        200,
+        format!(
+            "data: {}\n",
+            json!({"ts": "2026-08-01T01:17:11Z", "source": "system",
+                "line": "0f06d63f7039 Downloading"})
+        ),
+    );
+    let limited = Reply::Headed {
+        status: 429,
+        headers: vec![("Retry-After".into(), "1812".into())],
+        body: vec![Piece::Data(
+            br#"{"error":"rate limit exceeded for the hour window","status":429}"#.to_vec(),
+        )],
+    };
+    let http = Arc::new(FakeHttp::new([pull.clone(), limited, pull]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    let progress = Progress::new(&rp, "pod111", true);
+    let mut seen = Vec::new();
+    progress.refresh().await;
+    seen.push(progress.summary().result().unwrap());
+    progress.refresh().await;
+    seen.push(progress.summary().result().unwrap());
+    tokio::time::advance(Duration::from_secs(812)).await;
+    seen.push(progress.summary().result().unwrap());
+
+    // The SSH watch shares the client's hold: no call goes out.
+    let mut watch = crate::ssh::SshWatch::new(&rp, "pod111");
+    seen.push(watch.probe().await.unwrap_err());
+    assert_eq!(http.sent().len(), 2);
+
+    tokio::time::advance(Duration::from_secs(1000)).await;
+    progress.refresh().await;
+    seen.push(progress.summary().result().unwrap());
+    assert_eq!(
+        seen,
+        [
+            "pulling container image",
+            "RunPod rate limit: the pod is out of sight for 30m 12s",
+            "RunPod rate limit: the pod is out of sight for 16m 40s",
+            "RunPod rate limit: the pod is out of sight for 16m 40s",
+            "pulling container image",
+        ]
+    );
 }

@@ -178,8 +178,24 @@ fn viy_message(name: &str, rp_message: &str) -> String {
         "pod_logs_unreachable" => {
             "Platform logs unavailable (connection failed: synthetic: connection refused)".into()
         }
+        // A 429 says when RunPod takes requests again (kb d140); without
+        // headers, the fallback.
+        "get_volume_http_429" => format!(
+            "{}\nRunPod's rate limit: it takes requests again in 1m 0s.",
+            pretty_detail(rp_message)
+        ),
+        "graphql_http_429_json" => {
+            format!("{rp_message}\nRunPod's rate limit: it takes requests again in 1m 0s.")
+        }
         _ => rp_message.into(),
     }
+}
+
+/// `rp_message` with its JSON detail as viy pretty-prints it.
+fn pretty_detail(rp_message: &str) -> String {
+    let (head, detail) = rp_message.split_once('\n').unwrap_or((rp_message, ""));
+    let detail: Value = serde_json::from_str(detail).unwrap();
+    format!("{head}\n{}", serde_json::to_string_pretty(&detail).unwrap())
 }
 
 fn check_error(name: &str, error: &RunPodError, case: &Value) {
@@ -475,4 +491,104 @@ async fn a_volume_with_a_tier_is_made_through_v2_and_reads_as_v1s() {
         .await
         .unwrap_err();
     assert!(crate::regions::is_tier_unavailable(&error), "{error}");
+}
+
+// ---- RunPod's rate limit (kb d140) ---------------------------------------
+
+const LIMITED: &str = r#"{"error":"rate limit exceeded for the hour window","status":429}"#;
+
+fn limited(headers: &[(&str, &str)]) -> Reply {
+    Reply::Headed {
+        status: 429,
+        headers: headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+        body: vec![Piece::Data(LIMITED.into())],
+    }
+}
+
+fn pod_reply() -> Reply {
+    Reply::answer(200, r#"{"id":"pod111"}"#)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_429_holds_every_clone_until_retry_after_and_says_how_long() {
+    let http = Arc::new(FakeHttp::new([
+        limited(&[("Retry-After", "1812")]),
+        pod_reply(),
+    ]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    let refused = rp.get_pod("pod111").await.unwrap_err();
+    assert_eq!(refused.status_code(), Some(429));
+    assert!(refused.transient());
+    assert_eq!(refused.retry_after(), Some(Duration::from_secs(1812)));
+    assert!(
+        refused.to_string().ends_with(
+            "-> HTTP 429\n{\n  \"error\": \"rate limit exceeded for the hour window\",\n  \
+             \"status\": 429\n}\nRunPod's rate limit: it takes requests again in 30m 12s."
+        ),
+        "{refused}"
+    );
+
+    // A clone, as the wait's progress holds one: not sent.
+    let clone = rp.clone();
+    tokio::time::advance(Duration::from_secs(812)).await;
+    let held = clone.pod_logs("pod111", 30, LOG_BUDGET).await.unwrap_err();
+    assert_eq!(held.retry_after(), Some(Duration::from_secs(1000)));
+    assert_eq!(
+        held.to_string(),
+        "Platform logs -> not sent\nRunPod's rate limit: it takes requests again in 16m 40s."
+    );
+    let held = rp.get_pod("pod111").await.unwrap_err();
+    assert!(
+        held.to_string()
+            .starts_with("GET /pods/pod111 -> not sent\n"),
+        "{held}"
+    );
+    assert_eq!(http.sent().len(), 1);
+
+    tokio::time::advance(Duration::from_secs(1000)).await;
+    assert_eq!(rp.held_for(), None);
+    assert_eq!(
+        rp.get_pod("pod111").await.unwrap(),
+        Some(json!({"id": "pod111"}))
+    );
+    assert_eq!(http.sent().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_retry_after_the_spent_windows_reset_holds_else_the_fallback() {
+    let http = Arc::new(FakeHttp::new([
+        limited(&[(
+            "RateLimit",
+            r#""minute";r=41;t=12, "hour";r=0;t=1812, "day";r=48000;t=80000"#,
+        )]),
+        limited(&[]),
+    ]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    let refused = rp.list_pods().await.unwrap_err();
+    assert_eq!(refused.retry_after(), Some(Duration::from_secs(1812)));
+
+    tokio::time::advance(Duration::from_secs(1812)).await;
+    let refused = rp.data_centers().await.unwrap_err();
+    assert_eq!(refused.status_code(), Some(429));
+    assert_eq!(refused.retry_after(), Some(RATE_LIMIT_FALLBACK));
+    assert!(
+        refused.to_string().starts_with("GraphQL -> HTTP 429\n"),
+        "{refused}"
+    );
+    assert_eq!(http.sent().len(), 2);
+}
+
+#[test]
+fn a_wait_is_spoken_in_whole_seconds_rounded_up() {
+    let said: Vec<String> = [0.0, 0.2, 45.0, 60.0, 1812.0, 3600.0, 86399.0]
+        .into_iter()
+        .map(|s| spoken(Duration::from_secs_f64(s)))
+        .collect();
+    assert_eq!(
+        said,
+        ["0s", "1s", "45s", "1m 0s", "30m 12s", "1h 0m", "23h 59m"]
+    );
 }

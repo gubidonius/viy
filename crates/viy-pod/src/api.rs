@@ -10,6 +10,7 @@
 //! |---|---|---|---|
 //! | No answer: refused, reset, DNS, timeout | `None` | yes | unknown: keep what we had |
 //! | HTTP 429, 500, 502, 503, 504 | the status | yes | unknown: keep what we had |
+//! | Not sent: a 429 holds the client | 429 | yes | unknown: keep what we had |
 //! | HTTP 404 | 404 | no | gone; [`RunPod::get_pod`] returns `Ok(None)` |
 //! | Any other HTTP status from 400 | the status | no | refused (key, quota, request) |
 //! | GraphQL answer with `errors` or without `data` | the status, often 200 | by the status, as above | refused |
@@ -20,9 +21,20 @@
 //! characters of the text), except where `requests` named an exception
 //! class: viy names its own error kind (flags.md F22), as in
 //! `"GET /pods -> connection failed: ..."`.
+//!
+//! RunPod's quota is per user, in minute, hour and day windows, and a
+//! request it refuses with 429 may count against it too
+//! (https://docs.runpod.io/api-reference-v2/rate-limits). So a 429 holds
+//! the client and every clone of it: until RunPod's `Retry-After` (or the
+//! reset of the window its `RateLimit` header shows spent, or
+//! [`RATE_LIMIT_FALLBACK`]) has passed, calls fail at once without being
+//! sent, and the error says how long is left (kb d140). rpctl 573dbaa
+//! polled on through a 429.
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -54,12 +66,18 @@ const FAR_FUTURE: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
 /// How much of a non-JSON error body the message keeps.
 const DETAIL_CHARS: usize = 2000;
 
+/// How long a 429 holds the client when RunPod says nothing of when to
+/// come back.
+pub const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(60);
+
 /// A failed RunPod call; see the module docs for the kinds.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct RunPodError {
     message: String,
     status_code: Option<u16>,
+    /// After a 429: how long until RunPod takes requests again.
+    retry_after: Option<Duration>,
 }
 
 impl RunPodError {
@@ -67,7 +85,27 @@ impl RunPodError {
         Self {
             message: message.into(),
             status_code,
+            retry_after: None,
         }
+    }
+
+    /// A 429, RunPod's or the client's hold: `message`, then when RunPod
+    /// takes requests again.
+    fn rate_limited(message: impl Into<String>, wait: Duration) -> Self {
+        Self {
+            message: format!(
+                "{}\nRunPod's rate limit: it takes requests again in {}.",
+                message.into(),
+                spoken(wait)
+            ),
+            status_code: Some(429),
+            retry_after: Some(wait),
+        }
+    }
+
+    /// After a 429: how long until RunPod takes requests again.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 
     /// The HTTP status when RunPod answered, `None` when it did not.
@@ -128,6 +166,15 @@ pub struct RunPod {
     http: Arc<dyn HttpClient>,
     api_key: String,
     user_agent: &'static str,
+    /// Until when a 429 holds every call (module docs).
+    held_until: Arc<Mutex<Option<Instant>>>,
+}
+
+/// Why a call has no response.
+enum Unsent {
+    /// The client's hold has this long left.
+    Held(Duration),
+    Http(HttpError),
 }
 
 /// The key stays out.
@@ -143,7 +190,42 @@ impl RunPod {
             http,
             api_key: api_key.into(),
             user_agent: user_agent::PROVIDER_API,
+            held_until: Arc::default(),
         }
+    }
+
+    /// How long the hold a 429 left still lasts, if it does.
+    pub fn held_for(&self) -> Option<Duration> {
+        let until = (*self
+            .held_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))?;
+        let left = until.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
+    /// Sends `request` unless a hold is on; a 429 starts or extends one.
+    async fn send(&self, request: Request) -> Result<viy_http::Response, Unsent> {
+        if let Some(left) = self.held_for() {
+            return Err(Unsent::Held(left));
+        }
+        let response = viy_http::send(&*self.http, request)
+            .await
+            .map_err(Unsent::Http)?;
+        if response.status == 429 {
+            let until = Instant::now() + retry_after(&response).unwrap_or(RATE_LIMIT_FALLBACK);
+            let mut held = self
+                .held_until
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *held = (*held).max(Some(until));
+        }
+        Ok(response)
+    }
+
+    /// The hold's time left for a 429 just received.
+    fn wait_after_429(&self) -> Duration {
+        self.held_for().unwrap_or(RATE_LIMIT_FALLBACK)
     }
 
     /// As [`RunPod::new`], with CLIENT_TAG off sending rp's User-Agent.
@@ -195,28 +277,32 @@ impl RunPod {
             request = request.body(body.to_string());
         }
         let request = with_content_length(request);
-        let no_answer =
-            |error: HttpError| RunPodError::new(format!("{method} {path} -> {error}"), None);
-        let (status, bytes) = self.fetch(request).await.map_err(no_answer)?;
+        let (status, bytes) = self.fetch(request).await.map_err(|unsent| match unsent {
+            Unsent::Held(left) => {
+                RunPodError::rate_limited(format!("{method} {path} -> not sent"), left)
+            }
+            Unsent::Http(error) => RunPodError::new(format!("{method} {path} -> {error}"), None),
+        })?;
         if status >= 400 {
             let detail = match serde_json::from_slice::<Value>(&bytes) {
                 Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_default(),
                 Err(_) => text(&bytes),
             };
-            return Err(RunPodError::new(
-                format!("{method} {path} -> HTTP {status}\n{detail}"),
-                Some(status),
-            ));
+            let message = format!("{method} {path} -> HTTP {status}\n{detail}");
+            if status == 429 {
+                return Err(RunPodError::rate_limited(message, self.wait_after_429()));
+            }
+            return Err(RunPodError::new(message, Some(status)));
         }
         Ok(serde_json::from_slice(&bytes)
             .ok()
             .filter(|value: &Value| !value.is_null()))
     }
 
-    async fn fetch(&self, request: Request) -> Result<(u16, Vec<u8>), HttpError> {
-        let response = viy_http::send(&*self.http, request).await?;
+    async fn fetch(&self, request: Request) -> Result<(u16, Vec<u8>), Unsent> {
+        let response = self.send(request).await?;
         let status = response.status;
-        Ok((status, response.bytes().await?))
+        Ok((status, response.bytes().await.map_err(Unsent::Http)?))
     }
 
     /// One GraphQL query: its `data`, an empty map when that is `null`.
@@ -225,10 +311,10 @@ impl RunPod {
             self.request(Method::POST, GRAPHQL.to_string())
                 .body(json!({ "query": query }).to_string()),
         );
-        let (status, bytes) = self
-            .fetch(request)
-            .await
-            .map_err(|error| RunPodError::new(format!("GraphQL -> {error}"), None))?;
+        let (status, bytes) = self.fetch(request).await.map_err(|unsent| match unsent {
+            Unsent::Held(left) => RunPodError::rate_limited("GraphQL -> not sent", left),
+            Unsent::Http(error) => RunPodError::new(format!("GraphQL -> {error}"), None),
+        })?;
         let mut body = match serde_json::from_slice(&bytes) {
             Ok(Value::Object(body)) => body,
             _ => Map::new(),
@@ -236,10 +322,11 @@ impl RunPod {
         let errors = body.get("errors").filter(|errors| truthy(errors));
         if status >= 400 || errors.is_some() || !body.contains_key("data") {
             let detail = errors.map_or_else(|| text(&bytes), Value::to_string);
-            return Err(RunPodError::new(
-                format!("GraphQL -> HTTP {status}\n{detail}"),
-                Some(status),
-            ));
+            let message = format!("GraphQL -> HTTP {status}\n{detail}");
+            if status == 429 {
+                return Err(RunPodError::rate_limited(message, self.wait_after_429()));
+            }
+            return Err(RunPodError::new(message, Some(status)));
         }
         Ok(match body.remove("data") {
             Some(Value::Object(data)) => data,
@@ -439,15 +526,17 @@ impl RunPod {
         let unavailable = |error: HttpError| {
             RunPodError::new(format!("Platform logs unavailable ({error})"), None)
         };
-        let mut response = viy_http::send(&*self.http, request)
-            .await
-            .map_err(unavailable)?;
+        let mut response = self.send(request).await.map_err(|unsent| match unsent {
+            Unsent::Held(left) => RunPodError::rate_limited("Platform logs -> not sent", left),
+            Unsent::Http(error) => unavailable(error),
+        })?;
         if response.status != 200 {
             let status = response.status;
-            return Err(RunPodError::new(
-                format!("Platform logs -> HTTP {status}"),
-                Some(status),
-            ));
+            let message = format!("Platform logs -> HTTP {status}");
+            if status == 429 {
+                return Err(RunPodError::rate_limited(message, self.wait_after_429()));
+            }
+            return Err(RunPodError::new(message, Some(status)));
         }
         let mut entries = Vec::new();
         let mut pending = Vec::new();
@@ -534,6 +623,45 @@ fn log_entry(line: &[u8]) -> Option<LogEntry> {
 /// rp's `requests` declares a length on every request with a body and a
 /// zero one on a bodiless request other than GET and HEAD; hyper leaves the
 /// header off when there is no body.
+/// When RunPod takes requests again after this 429: its `Retry-After` in
+/// seconds, else the largest reset among the windows its `RateLimit` header
+/// shows spent (`"hour";r=0;t=1812, ...`).
+fn retry_after(response: &viy_http::Response) -> Option<Duration> {
+    if let Some(seconds) = response
+        .header("retry-after")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+    response
+        .header("ratelimit")?
+        .split(',')
+        .filter_map(|window| {
+            let mut remaining = None;
+            let mut reset = None;
+            for param in window.split(';').skip(1) {
+                match param.trim().split_once('=') {
+                    Some(("r", value)) => remaining = value.trim().parse::<u64>().ok(),
+                    Some(("t", value)) => reset = value.trim().parse::<u64>().ok(),
+                    _ => {}
+                }
+            }
+            (remaining == Some(0)).then_some(reset).flatten()
+        })
+        .max()
+        .map(Duration::from_secs)
+}
+
+/// A wait as people say it: "45s", "12m 5s", "1h 2m".
+pub fn spoken(wait: Duration) -> String {
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    match (secs / 3600, secs % 3600 / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
 fn with_content_length(request: Request) -> Request {
     let length = match &request.body {
         Some(body) => body.len(),

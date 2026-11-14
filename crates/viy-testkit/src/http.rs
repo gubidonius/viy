@@ -20,6 +20,12 @@ use viy_http::Response;
 pub enum Reply {
     /// A status, then the body's pieces; the body ends after the last.
     Answer { status: u16, body: Vec<Piece> },
+    /// As `Answer`, with headers.
+    Headed {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<Piece>,
+    },
     /// No answer at all.
     Fail(HttpError),
     /// No answer, ever.
@@ -138,6 +144,11 @@ async fn play(reply: Reply) -> Result<Response, HttpError> {
         Reply::Answer { status, body } => {
             Ok(Response::new(status, Pieces(body.into_iter().collect())))
         }
+        Reply::Headed {
+            status,
+            headers,
+            body,
+        } => Ok(Response::new(status, Pieces(body.into_iter().collect())).with_headers(headers)),
         Reply::Fail(error) => Err(error),
         Reply::Hang => std::future::pending().await,
     }

@@ -11,6 +11,7 @@ use pretty_assertions::assert_eq;
 use viy_exec::Command;
 use viy_testkit::exec::FakeExec;
 use viy_testkit::exec::Reply as Run;
+use viy_testkit::http::Piece;
 use viy_testkit::http::Reply;
 use viy_testkit::http::RouteHttp;
 use viy_testkit::scratch::ScratchDir;
@@ -586,6 +587,26 @@ async fn up_creates_nothing_when_runpod_cannot_say_whether_a_pod_exists() {
     let error = run_up(&mut home, &told).await.unwrap_err();
     assert!(matches!(error, CommandError::Failed));
     assert!(told.texts()[0].starts_with("Could not check RunPod for an existing pod"));
+    assert!(!home.sent().iter().any(|r| r.starts_with("POST")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn up_blocked_by_the_rate_limit_says_when_to_try_again() {
+    let mut home = Home::new(None, |_| Reply::Headed {
+        status: 429,
+        headers: vec![("Retry-After".into(), "1395".into())],
+        body: vec![Piece::Data(
+            br#"{"error": "rate limit exceeded for the hour window", "status": 429}"#.to_vec(),
+        )],
+    });
+    let told = Told::default();
+    let error = run_up(&mut home, &told).await.unwrap_err();
+    assert!(matches!(error, CommandError::Failed));
+    assert_eq!(
+        told.texts()[0],
+        "Could not check RunPod for an existing pod, so not creating one (that would risk a \
+         duplicate). Try again in 23m 15s."
+    );
     assert!(!home.sent().iter().any(|r| r.starts_with("POST")));
 }
 

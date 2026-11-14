@@ -148,9 +148,11 @@ pub trait Body: Send {
     fn chunk(&mut self) -> BoxFuture<'_, Result<Option<Vec<u8>>, HttpError>>;
 }
 
-/// A status and a body still to be read.
+/// A status, the headers and a body still to be read.
 pub struct Response {
     pub status: u16,
+    /// Names in lower case, in the order they came.
+    headers: Vec<(String, String)>,
     body: Box<dyn Body>,
     read_timeout: Option<Duration>,
 }
@@ -159,9 +161,30 @@ impl Response {
     pub fn new(status: u16, body: impl Body + 'static) -> Self {
         Self {
             status,
+            headers: Vec::new(),
             body: Box::new(body),
             read_timeout: None,
         }
+    }
+
+    /// The same response with these headers.
+    pub fn with_headers(
+        mut self,
+        headers: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        self.headers = headers
+            .into_iter()
+            .map(|(name, value)| (name.into().to_ascii_lowercase(), value.into()))
+            .collect();
+        self
+    }
+
+    /// The first value of the header `name`, whatever its case.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(have, _)| have.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
     }
 
     /// The next piece of the body, `None` at the end; after [`send`], a

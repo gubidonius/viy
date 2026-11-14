@@ -41,6 +41,7 @@ use crate::api::RunPod;
 use crate::api::RunPodError;
 use crate::api::proxy_url;
 use crate::api::shown;
+use crate::api::spoken;
 use crate::bootreport::Outcome;
 use crate::bootreport::Timeline;
 use crate::failover::Creation;
@@ -276,11 +277,18 @@ async fn up_until(
     let existing = match resolve(&rp, env, cfg, report).await {
         Ok(existing) => existing,
         Err(ResolveError::RunPod(error)) => {
+            // A 429 says when RunPod takes requests again (kb d140).
+            let when = error.retry_after().map_or_else(
+                || "in a moment".to_string(),
+                |wait| format!("in {}", spoken(wait)),
+            );
             say(
                 report,
                 Tone::Error,
-                "Could not check RunPod for an existing pod, so not creating one (that would \
-                 risk a duplicate). Try again in a moment.",
+                format!(
+                    "Could not check RunPod for an existing pod, so not creating one (that \
+                     would risk a duplicate). Try again {when}."
+                ),
             );
             say(report, Tone::Dim, error.to_string());
             return Err(CommandError::Failed);

@@ -425,6 +425,15 @@ impl Ssh<'_> {
     }
 }
 
+/// What a wait shows while RunPod refuses its calls with 429: it cannot
+/// see the pod, so it must not show a stage as if it could.
+pub fn rate_limited(wait: Duration) -> String {
+    format!(
+        "RunPod rate limit: the pod is out of sight for {}",
+        crate::api::spoken(wait)
+    )
+}
+
 /// `wait_ssh`'s probe: the pod's SSH endpoint, asked of RunPod on every
 /// probe, since a starting or restarted pod can change its mapping.
 pub struct SshWatch<'a> {
@@ -443,11 +452,16 @@ impl<'a> SshWatch<'a> {
     }
 
     /// The endpoint once it accepts a connection, or what is awaited. A
-    /// failed call keeps the last endpoint RunPod gave.
+    /// failed call keeps the last endpoint RunPod gave. Without an
+    /// endpoint while RunPod's rate limit holds, that is what is awaited.
     pub async fn probe(&mut self) -> Result<(String, u16), String> {
-        if let Ok(pod) = self.rp.get_pod(&self.pod_id).await {
-            self.endpoint = pod.as_ref().and_then(ssh_endpoint);
-        }
+        let limited = match self.rp.get_pod(&self.pod_id).await {
+            Ok(pod) => {
+                self.endpoint = pod.as_ref().and_then(ssh_endpoint);
+                None
+            }
+            Err(error) => error.retry_after(),
+        };
         match &self.endpoint {
             Some((ip, port)) => {
                 if port_open(ip, *port, Duration::from_secs(5)).await {
@@ -456,7 +470,10 @@ impl<'a> SshWatch<'a> {
                     Err(format!("{ip}:{port} not accepting"))
                 }
             }
-            None => Err("no port mapping yet".to_string()),
+            None => Err(match limited {
+                Some(wait) => rate_limited(wait),
+                None => "no port mapping yet".to_string(),
+            }),
         }
     }
 }

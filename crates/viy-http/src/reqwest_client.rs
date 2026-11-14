@@ -46,10 +46,17 @@ impl HttpClient for ReqwestHttp {
                 builder = builder.body(body);
             }
             let response = builder.send().await.map_err(from_reqwest)?;
-            Ok(Response::new(
-                response.status().as_u16(),
-                ReqwestBody(response),
-            ))
+            let headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((name.as_str().to_string(), value.to_str().ok()?.to_string()))
+                })
+                .collect();
+            Ok(
+                Response::new(response.status().as_u16(), ReqwestBody(response))
+                    .with_headers(headers),
+            )
         })
     }
 }
