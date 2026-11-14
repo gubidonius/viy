@@ -78,6 +78,28 @@ pub const SSH_POLL: Duration = Duration::from_secs(2);
 /// The pod's log is summarised at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_secs(20);
 
+/// Past the boot budget a wait asks RunPod less often (kb d141): at the
+/// pace above (about 33 calls a minute), a long image pull spent the
+/// account's hourly quota of RunPod calls in about 20 minutes and left the
+/// wait unable to see the pod until the hour turned. A boot within the budget
+/// is unchanged; one past it sees a new SSH mapping up to 8 s later.
+pub const LONG_WAIT_AFTER: Duration = Duration::from_secs(crate::bootreport::BUDGET_S);
+/// How often a long wait asks RunPod for the pod's SSH mapping; the
+/// mapping it has is still probed every [`SSH_POLL`], which costs no call.
+pub const LONG_WAIT_POD_EVERY: Duration = Duration::from_secs(10);
+/// How often a long wait summarises the pod's log.
+const LONG_WAIT_PROGRESS_EVERY: Duration = Duration::from_secs(60);
+
+/// How often a wait that began at `started` makes a RunPod call it would
+/// make `every` in a short wait and `every_long` past [`LONG_WAIT_AFTER`].
+pub(crate) fn runpod_every(started: Instant, every: Duration, every_long: Duration) -> Duration {
+    if started.elapsed() >= LONG_WAIT_AFTER {
+        every_long
+    } else {
+        every
+    }
+}
+
 /// The hidden `viy` subcommand that collects a boot's logs:
 /// `viy capture-boot <boot_id> <pod_id>`, run by [`spawn_capture`].
 pub const CAPTURE_SUBCOMMAND: &str = "capture-boot";
@@ -115,12 +137,13 @@ pub fn redact_log(line: &str, cfg: &Config) -> String {
 // ------------------------------------------------------------ progress
 
 /// What the pod's log says the boot is doing, for the wait's clock. The
-/// log is fetched in the background at most every 20 s, so a slow fetch
-/// (up to 8 s) never delays the next probe.
+/// log is fetched in the background at most every 20 s (60 s past the boot
+/// budget), so a slow fetch (up to 8 s) never delays the next probe.
 #[derive(Debug, Clone)]
 pub struct Progress {
     rp: RunPod,
     pod_id: Arc<str>,
+    started: Instant,
     /// An `RPCTL_ERROR` line ends the wait: sshd failed on the pod.
     require_ssh: bool,
     summary: Arc<Mutex<Summary>>,
@@ -148,6 +171,7 @@ impl Progress {
         Self {
             rp: rp.clone(),
             pod_id: pod_id.into(),
+            started: Instant::now(),
             require_ssh,
             summary: Arc::default(),
         }
@@ -161,12 +185,11 @@ impl Progress {
     /// the background when it is due. Fails once the log showed the boot
     /// cannot succeed.
     pub fn poll(&self) -> Result<String, WaitError> {
+        let every = runpod_every(self.started, PROGRESS_EVERY, LONG_WAIT_PROGRESS_EVERY);
         let mut summary = self.summary();
         if summary.failure.is_none()
             && !summary.fetching
-            && summary
-                .fetched
-                .is_none_or(|at| at.elapsed() >= PROGRESS_EVERY)
+            && summary.fetched.is_none_or(|at| at.elapsed() >= every)
         {
             summary.fetched = Some(Instant::now());
             summary.fetching = true;

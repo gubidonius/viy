@@ -1370,3 +1370,71 @@ async fn a_rate_limited_wait_says_it_cannot_see_the_pod_not_the_last_stage() {
         ]
     );
 }
+
+/// Two boots of 2026-08-01 pulled the image for over 18 minutes; at
+/// rpctl's pace (sshd's mapping every 2 s, the log every 20 s) the wait
+/// spent the account's hourly quota of RunPod calls in about 20 minutes.
+/// Within the boot budget the pace is unchanged; past it the mapping is
+/// asked every 10 s and the log every 60 s, and a mapping that appears is
+/// still seen within 10 s (kb d141).
+#[tokio::test(start_paused = true)]
+async fn past_the_boot_budget_the_wait_asks_runpod_less_often() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let start = Instant::now();
+    let mapped_at = Duration::from_secs(301);
+    let calls: Arc<Mutex<Vec<(u64, bool)>>> = Arc::default();
+    let http = {
+        let calls = Arc::clone(&calls);
+        RouteHttp::new(move |request| {
+            let elapsed = start.elapsed();
+            let logs = request.url.contains("/logs");
+            calls.lock().unwrap().push((elapsed.as_secs(), logs));
+            if logs {
+                return Reply::answer(
+                    200,
+                    format!(
+                        "data: {}\n",
+                        json!({"ts": "2026-08-01T02:53:19Z", "source": "system",
+                            "line": "0f06d63f7039 Downloading"})
+                    ),
+                );
+            }
+            let pod = if elapsed >= mapped_at {
+                json!({"id": "pod111", "publicIp": "127.0.0.1", "portMappings": {"22": port}})
+            } else {
+                json!({"id": "pod111"})
+            };
+            Reply::answer(200, pod.to_string())
+        })
+    };
+    let rp = RunPod::new(API_KEY, Arc::new(http));
+    let progress = Progress::new(&rp, "pod111", true);
+    let told = Told::default();
+    let got = wait_ssh(
+        &rp,
+        "pod111",
+        Duration::from_secs(600),
+        Some(&progress),
+        &told.reporter(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, Some(("127.0.0.1".to_string(), port)));
+    let seen = start.elapsed().as_secs();
+    assert!((301..=311).contains(&seen), "seen at {seen}s");
+
+    let calls = calls.lock().unwrap().clone();
+    let count = |logs: bool, from: u64, to: u64| {
+        calls
+            .iter()
+            .filter(|&&(at, l)| l == logs && (from..to).contains(&at))
+            .count()
+    };
+    // The first 180 s: every 2 s and every 20 s, as rpctl.
+    assert_eq!(count(false, 0, 180), 90);
+    assert_eq!(count(true, 0, 180), 9);
+    // The next 120 s: every 10 s and every 60 s.
+    assert_eq!(count(false, 180, 300), 12);
+    assert_eq!(count(true, 180, 300), 2);
+}

@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use regex::Regex;
 use serde_json::Value;
+use tokio::time::Instant;
 use viy_config::Config;
 use viy_config::Paths;
 use viy_exec::Command;
@@ -37,6 +38,9 @@ use crate::notice::Say;
 use crate::notice::Tone;
 use crate::state;
 use crate::state::PodState;
+use crate::wait::LONG_WAIT_POD_EVERY;
+use crate::wait::SSH_POLL;
+use crate::wait::runpod_every;
 
 /// What the ssh and tunnel functions work with.
 #[derive(Clone, Copy)]
@@ -435,11 +439,17 @@ pub fn rate_limited(wait: Duration) -> String {
 }
 
 /// `wait_ssh`'s probe: the pod's SSH endpoint, asked of RunPod on every
-/// probe, since a starting or restarted pod can change its mapping.
+/// probe, since a starting or restarted pod can change its mapping; past
+/// the boot budget, every [`LONG_WAIT_POD_EVERY`] (kb d141).
 pub struct SshWatch<'a> {
     rp: &'a RunPod,
     pod_id: String,
+    started: Instant,
+    /// When RunPod was last asked.
+    asked: Option<Instant>,
     endpoint: Option<(String, u16)>,
+    /// RunPod's rate limit holds until then.
+    limited_until: Option<Instant>,
 }
 
 impl<'a> SshWatch<'a> {
@@ -447,7 +457,10 @@ impl<'a> SshWatch<'a> {
         Self {
             rp,
             pod_id: pod_id.into(),
+            started: Instant::now(),
+            asked: None,
             endpoint: None,
+            limited_until: None,
         }
     }
 
@@ -455,13 +468,24 @@ impl<'a> SshWatch<'a> {
     /// failed call keeps the last endpoint RunPod gave. Without an
     /// endpoint while RunPod's rate limit holds, that is what is awaited.
     pub async fn probe(&mut self) -> Result<(String, u16), String> {
-        let limited = match self.rp.get_pod(&self.pod_id).await {
-            Ok(pod) => {
-                self.endpoint = pod.as_ref().and_then(ssh_endpoint);
-                None
+        // Probes come every SSH_POLL, so a call due within half of one is
+        // made now rather than a whole poll late.
+        let every = runpod_every(self.started, Duration::ZERO, LONG_WAIT_POD_EVERY);
+        if self
+            .asked
+            .is_none_or(|at| at.elapsed() + SSH_POLL / 2 >= every)
+        {
+            self.asked = Some(Instant::now());
+            match self.rp.get_pod(&self.pod_id).await {
+                Ok(pod) => {
+                    self.endpoint = pod.as_ref().and_then(ssh_endpoint);
+                    self.limited_until = None;
+                }
+                Err(error) => {
+                    self.limited_until = error.retry_after().map(|wait| Instant::now() + wait);
+                }
             }
-            Err(error) => error.retry_after(),
-        };
+        }
         match &self.endpoint {
             Some((ip, port)) => {
                 if port_open(ip, *port, Duration::from_secs(5)).await {
@@ -470,10 +494,16 @@ impl<'a> SshWatch<'a> {
                     Err(format!("{ip}:{port} not accepting"))
                 }
             }
-            None => Err(match limited {
-                Some(wait) => rate_limited(wait),
-                None => "no port mapping yet".to_string(),
-            }),
+            None => Err(
+                match self
+                    .limited_until
+                    .map(|until| until.saturating_duration_since(Instant::now()))
+                    .filter(|left| !left.is_zero())
+                {
+                    Some(left) => rate_limited(left),
+                    None => "no port mapping yet".to_string(),
+                },
+            ),
         }
     }
 }
