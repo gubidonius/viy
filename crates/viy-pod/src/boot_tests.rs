@@ -457,7 +457,7 @@ fn cache_archive_survives_image_and_config_changes() {
 #[test]
 fn default_image_is_docker_hub() {
     let image = DEFAULTS.iter().find(|(k, _)| *k == "VLLM_IMAGE").unwrap().1;
-    assert_eq!(image, "vllm/vllm-openai:v0.27.1");
+    assert_eq!(image, "vllm/vllm-openai:v0.33.0");
 }
 
 /// rpctl's tests of startup.py alone, run on the embedded copy (F17: the

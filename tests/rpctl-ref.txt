@@ -1,6 +1,6 @@
 # The rpctl commit viy ports from. Change it only together with regenerated
 # fixtures (docs/implementation-plan.md 3.1); tools/refsnap.sh extracts it.
-commit: 4e3645919bb803eab33dc1e0f6c57bf72fa6aeaa
+commit: 65b16c9d7eee7ac227e5a8589d76c4c8b9a8c6aa
 branch: leak-protection
-pinned: 2026-07-31
-subject: startup.py: skip the multimodal warmup under vLLM 0.33.0's signature too
+pinned: 2026-08-01
+subject: Default to vLLM 0.33.0 with MTP 3 (viy kb d142)

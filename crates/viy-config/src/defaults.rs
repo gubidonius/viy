@@ -75,7 +75,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("MAX_IMAGES_PER_PROMPT", "4"),
     ("MAX_NUM_SEQS", "64"),
     ("KV_CACHE_DTYPE", ""),
-    ("MTP_SPECULATIVE_TOKENS", ""),
+    // 3 draft tokens per step: single-stream decode on an A100 went from 28.5
+    // tok/s without it (vLLM 0.27.1) to 53.5 with it on 0.27.1 and 58.1 on
+    // 0.33.0, every drafted token verified by the main model (kb f119,
+    // f134). Each prefix-cache hit costs ~1.2s more (f139). Empty turns it off.
+    ("MTP_SPECULATIVE_TOKENS", "3"),
     ("STARTUP_CACHE", "1"),
     ("MODEL_CACHE_MODE", "auto"),
     ("SAFETENSORS_LOAD_STRATEGY", "prefetch"),
@@ -134,8 +138,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // ghcr.io sshd variant (docker/Dockerfile) shares every base layer, but a
     // host without them pulls all 9.1GB from ghcr.io, measured at 10+ minutes
     // with retries (2026-06-25). That costs far more than the ~20s apt install
-    // of sshd it saves, so it is opt-in only.
-    ("VLLM_IMAGE", "vllm/vllm-openai:v0.27.1"),
+    // of sshd it saves, so it is opt-in only. 0.33.0 since 2026-08-01: the
+    // fused GDN MTP kernel and Model Runner V2, measured faster on an A100
+    // and with the same parser output as 0.27.1 (kb f134-f139, d142).
+    ("VLLM_IMAGE", "vllm/vllm-openai:v0.33.0"),
     // CUDA versions a host's driver must support, as RunPod lists them
     // (allowedCudaVersions; its newest value is 13.0). The image above needs
     // cuda>=13.0 (NVIDIA_REQUIRE_CUDA in its config). A 12.8 host crash-looped
@@ -200,7 +206,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("LOCAL_VLLM_PORT", ""),
     // --- web search -------------------------------------------------------
     // The model's chat template emits <tool_call><function=..><parameter=..>,
-    // which vLLM parses with qwen3_xml (alias of qwen3_coder in 0.27.1).
+    // which vLLM parses with qwen3_xml (alias of qwen3_coder in 0.27.1 and 0.33.0).
     ("TOOL_CALL_PARSER", "qwen3_xml"),
     ("SEARCH_ENABLED", "1"),
     ("TAVILY_API_KEY", ""),

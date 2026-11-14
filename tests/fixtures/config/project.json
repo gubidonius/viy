@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "4e3645919bb803eab33dc1e0f6c57bf72fa6aeaa",
+ "rpctl_commit": "65b16c9d7eee7ac227e5a8589d76c4c8b9a8c6aa",
  "generator": "tools/fixtures.py config/project",
  "about": "rpctl config's project root (find_project from the cwd), has_project() and module paths for synthetic trees; $T is the case's root, HOME is $T/home, XDG_* are $T/config, $T/state, $T/data unless the case says",
  "cases": [

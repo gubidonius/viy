@@ -1,7 +1,7 @@
 //! One request to the model and its streamed reply: rpctl's `_stream_once`
 //! and `_consume` (chat.py 1098-1256). The SSE body is read line by line as
 //! rp's `iter_lines` does: `data: ` lines only, `[DONE]` ends it, a line
-//! that is not JSON is skipped. Reasoning comes as `reasoning` (vLLM 0.27)
+//! that is not JSON is skipped. Reasoning comes as `reasoning` (vLLM 0.27, 0.33)
 //! or `reasoning_content` (older builds, other servers); tool calls are
 //! reassembled by index; the last usage and finish reason are kept. Every
 //! chunk touches the pod's activity file through the caller's `touch`, as
