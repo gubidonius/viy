@@ -37,7 +37,7 @@ pub const BUDGET_S: u64 = 180;
 pub const KEEP_RECORDS: usize = 50;
 
 /// Config keys that shape a boot, copied into each record. No secrets.
-pub const BOOT_KEYS: [&str; 25] = [
+pub const BOOT_KEYS: [&str; 26] = [
     "VLLM_IMAGE",
     "MODEL_REPO",
     "MAX_MODEL_LEN",
@@ -46,6 +46,7 @@ pub const BOOT_KEYS: [&str; 25] = [
     "MAX_IMAGES_PER_PROMPT",
     "KV_CACHE_DTYPE",
     "MTP_SPECULATIVE_TOKENS",
+    "MTP_DRAFT_HEAD_QUANTIZATION",
     "SAFETENSORS_LOAD_STRATEGY",
     "WEIGHTS_PREWARM",
     "MM_WARMUP",

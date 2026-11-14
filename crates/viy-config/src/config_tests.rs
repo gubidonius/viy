@@ -130,14 +130,14 @@ fn the_layers_merge_as_rpctl_merges_them() {
     }
 }
 
-/// rpctl's 111 keys but CHAT_AUTOSAVE: viy always saves chats, as Codex
-/// (kb d083); and viy's own CHAT_HEADER, the chat's header art, and
-/// CLIENT_TAG (kb d137), GPU_PREFERRED (kb d138) and BACKUP_VOLUME_TYPE
-/// (kb d139).
+/// rpctl's 112 keys (111 plus MTP_DRAFT_HEAD_QUANTIZATION at d528c14) but
+/// CHAT_AUTOSAVE: viy always saves chats, as Codex (kb d083); and viy's own
+/// CHAT_HEADER, the chat's header art, and CLIENT_TAG (kb d137),
+/// GPU_PREFERRED (kb d138) and BACKUP_VOLUME_TYPE (kb d139).
 #[test]
 fn defaults_are_rpctls_keys_but_chat_autosave() {
-    assert_eq!(DEFAULTS.len(), 114);
-    assert_eq!(Config::defaults().iter().count(), 114);
+    assert_eq!(DEFAULTS.len(), 115);
+    assert_eq!(Config::defaults().iter().count(), 115);
     assert!(Config::defaults().get("CHAT_AUTOSAVE").is_none());
     assert_eq!(Config::defaults().get("CHAT_HEADER"), Some("1"));
 }

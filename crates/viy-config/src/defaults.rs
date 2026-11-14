@@ -80,6 +80,16 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // 0.33.0, every drafted token verified by the main model (kb f119,
     // f134). Each prefix-cache hit costs ~1.2s more (f139). Empty turns it off.
     ("MTP_SPECULATIVE_TOKENS", "3"),
+    // vLLM 0.33.0's draft_lm_head_quantization: "nvfp4" (any GPU from SM75,
+    // weight-only Marlin on an A100) or "fp8" (SM89 and up). Only the drafter's
+    // copy of the lm_head is quantized and the main model verifies every token,
+    // so output is unchanged: greedy text byte-identical, acceptance within 1%.
+    // nvfp4 on an A100: single-stream decode 58.3 -> 63.0-63.3 tok/s, four
+    // requests 167 -> 185-187 (kb f143). It takes 0.67 GiB of GPU memory
+    // from the KV cache, about 10,600 tokens (f144). Empty by default:
+    // MAX_MODEL_LEN 262144 at GPU_MEMORY_UTILIZATION 0.94 then no longer fits a
+    // boot that compiles; 0.95 makes room.
+    ("MTP_DRAFT_HEAD_QUANTIZATION", ""),
     ("STARTUP_CACHE", "1"),
     ("MODEL_CACHE_MODE", "auto"),
     ("SAFETENSORS_LOAD_STRATEGY", "prefetch"),

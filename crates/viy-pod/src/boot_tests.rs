@@ -271,6 +271,7 @@ fn vllm_flags_are_approved() {
     let cfg = with([
         ("KV_CACHE_DTYPE", "fp8"),
         ("MTP_SPECULATIVE_TOKENS", "3"),
+        ("MTP_DRAFT_HEAD_QUANTIZATION", "nvfp4"),
         ("TRUST_REMOTE_CODE", "1"),
     ]);
     let flags: BTreeSet<String> = build_vllm_args(&cfg, "KEY", None)
@@ -509,4 +510,35 @@ fn prefix_caching_flag_follows_config() {
         ("PREFIX_CACHING", "0"),
     ]);
     assert!(!build_vllm_args(&off, "k", None).contains(&"--enable-prefix-caching".to_string()));
+}
+
+// rpctl's test_features.py
+// ContextTests.test_draft_head_quantization_goes_into_the_speculative_config.
+#[test]
+fn draft_head_quantization_goes_into_the_speculative_config() {
+    let spec = |extra: &[(&str, &str)]| -> Option<serde_json::Value> {
+        let mut pairs = vec![("VLLM_PORT", "8000"), ("SERVED_MODEL_NAME", "m")];
+        pairs.extend_from_slice(extra);
+        let a = build_vllm_args(&with(pairs), "k", None);
+        let i = a.iter().position(|x| x == "--speculative-config")?;
+        Some(serde_json::from_str(&a[i + 1]).unwrap())
+    };
+    assert_eq!(
+        spec(&[]),
+        Some(serde_json::json!({"method": "mtp", "num_speculative_tokens": 3}))
+    );
+    assert_eq!(
+        spec(&[("MTP_DRAFT_HEAD_QUANTIZATION", "nvfp4")]),
+        Some(
+            serde_json::json!({"method": "mtp", "num_speculative_tokens": 3,
+                                "draft_lm_head_quantization": "nvfp4"})
+        )
+    );
+    assert_eq!(
+        spec(&[
+            ("MTP_SPECULATIVE_TOKENS", ""),
+            ("MTP_DRAFT_HEAD_QUANTIZATION", "nvfp4")
+        ]),
+        None
+    );
 }

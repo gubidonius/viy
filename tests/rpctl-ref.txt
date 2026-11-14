@@ -1,6 +1,6 @@
 # The rpctl commit viy ports from. Change it only together with regenerated
 # fixtures (docs/implementation-plan.md 3.1); tools/refsnap.sh extracts it.
-commit: 65b16c9d7eee7ac227e5a8589d76c4c8b9a8c6aa
+commit: d528c14e31dbbbe904d11bfe82f2302e08dd0e61
 branch: leak-protection
 pinned: 2026-08-01
-subject: Default to vLLM 0.33.0 with MTP 3 (viy kb d142)
+subject: MTP_DRAFT_HEAD_QUANTIZATION: a quantized lm_head copy for the MTP drafter, empty by default (viy kb d146)

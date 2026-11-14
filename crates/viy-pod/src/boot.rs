@@ -116,7 +116,15 @@ pub fn build_vllm_args(cfg: &Config, api_key: &str, host: Option<&str>) -> Vec<S
     }
     let mtp = at(cfg, "MTP_SPECULATIVE_TOKENS");
     if !mtp.is_empty() {
-        let spec = format!(r#"{{"method":"mtp","num_speculative_tokens":{mtp}}}"#);
+        let mut spec = format!(r#"{{"method":"mtp","num_speculative_tokens":{mtp}"#);
+        // vLLM 0.33.0 (Model Runner V2 only): the drafter gets its own
+        // quantized copy of the lm_head; the main model still verifies with
+        // its bf16 head (kb d146).
+        let quant = at(cfg, "MTP_DRAFT_HEAD_QUANTIZATION");
+        if !quant.is_empty() {
+            spec += &format!(r#","draft_lm_head_quantization":{}"#, json!(quant));
+        }
+        spec.push('}');
         flag(&["--speculative-config", &spec]);
     }
     if cfg.get("TRUST_REMOTE_CODE") == Some("1") {
