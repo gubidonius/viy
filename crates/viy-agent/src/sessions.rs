@@ -147,7 +147,11 @@ pub fn default_title(messages: &[Value]) -> Option<String> {
         if let Some(parts) = m["content"].as_array() {
             let kept: Vec<Value> = parts
                 .iter()
-                .filter(|p| !p["text"].as_str().is_some_and(is_client_note))
+                .filter(|p| {
+                    !p["text"]
+                        .as_str()
+                        .is_some_and(|t| is_client_note(t) || crate::shell::is_record(t))
+                })
                 .cloned()
                 .collect();
             m = json!({"content": kept});

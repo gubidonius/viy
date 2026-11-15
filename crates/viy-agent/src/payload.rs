@@ -113,8 +113,10 @@ impl Settings {
     /// The background title request for a chat whose first user message is
     /// `user` and first real reply `reply`.
     pub fn title_body(&self, user: &Value, reply: &str) -> Value {
+        // A `!` command's output is not what the chat is about.
+        let typed = crate::shell::typed_parts(&user["content"]).join(" ");
         let prompt = TITLE_PROMPT
-            .replace("{user}", &chars(&message_text(user), 2000))
+            .replace("{user}", &chars(&typed, 2000))
             .replace("{assistant}", &chars(reply, 2000));
         let mut body = json!({
             "model": self.model,
@@ -134,21 +136,6 @@ impl Settings {
 /// The first `n` characters of `text`.
 fn chars(text: &str, n: usize) -> String {
     text.chars().take(n).collect()
-}
-
-/// A message's text without its images, rpctl `sessions.message_text` with
-/// `with_tools=False`.
-pub fn message_text(m: &Value) -> String {
-    match &m["content"] {
-        Value::String(text) => text.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter(|p| p["type"] == "text")
-            .map(|p| p["text"].as_str().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(" "),
-        _ => String::new(),
-    }
 }
 
 /// The first message that may name a chat: the first user message, and the

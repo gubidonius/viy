@@ -75,6 +75,13 @@ fn ops_are_tagged_like_events() {
     );
     round_trip(&Op::Interrupt, json!({"type": "interrupt"}));
     round_trip(
+        &Op::Shell {
+            command: "ls -la".into(),
+            model_sees: false,
+        },
+        json!({"type": "shell", "command": "ls -la", "model_sees": false}),
+    );
+    round_trip(
         &Op::QuestionAnswer {
             id: "q1".into(),
             answer: Answer::Always,

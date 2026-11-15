@@ -146,3 +146,34 @@ async fn a_timeout_between_the_two_streams_ends_cleanly() {
     assert!(done.timed_out);
     assert_eq!(done.stdout, "out\n");
 }
+
+/// kb d149: a `!` command that leaves a job holding its output open ends
+/// when it ends, its output drained for a moment, and the job runs on.
+#[tokio::test]
+async fn finish_draining_does_not_wait_for_a_job_left_holding_the_pipes() {
+    let scratch = std::env::temp_dir().join(format!("viy-drain-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let t0 = Instant::now();
+    let done = spawn(sh("(sleep 1; touch late) & echo started; exit 4", &scratch))
+        .unwrap()
+        .finish_draining(Duration::from_secs(60), Duration::from_millis(200))
+        .await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(900),
+        "{:?}",
+        t0.elapsed()
+    );
+    assert_eq!(done.stdout.trim(), "started");
+    assert_eq!(done.exit_code, Some(4));
+    assert!(!done.timed_out);
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert!(scratch.join("late").exists(), "the job ran on");
+    std::fs::remove_dir_all(&scratch).unwrap();
+    // Past its time, the group goes as with finish.
+    let done = spawn(sh("sleep 30 & sleep 30", &std::env::temp_dir()))
+        .unwrap()
+        .finish_draining(Duration::from_millis(300), Duration::from_millis(200))
+        .await;
+    assert!(done.timed_out);
+    assert_eq!(done.exit_code, None);
+}

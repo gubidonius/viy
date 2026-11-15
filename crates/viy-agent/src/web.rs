@@ -261,7 +261,9 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Text of a user message's content: a string, or its text parts.
+/// Text of a user message's content: a string, or its text parts. Of a
+/// `!` command's record only the command counts: its output is not the
+/// user's word for a URL (kb d149).
 fn user_text(c: &Value) -> String {
     match c {
         Value::String(s) => s.clone(),
@@ -269,6 +271,13 @@ fn user_text(c: &Value) -> String {
             .iter()
             .filter_map(|p| p.as_object())
             .map(|p| p.get("text").and_then(Value::as_str).unwrap_or_default())
+            .map(|t| {
+                if crate::shell::is_record(t) {
+                    crate::shell::record_command(t).unwrap_or_default()
+                } else {
+                    t
+                }
+            })
             .collect::<Vec<_>>()
             .join(" "),
         _ => String::new(),

@@ -7,7 +7,7 @@
 //! as Codex keeps `history.jsonl`
 //! (`codex-rs/message-history/src/lib.rs`): one JSON object per line,
 //! `{"ts": <unix seconds>, "text": "..."}`, so a message with newlines is
-//! one entry; each entry appended as it is sent, in one write under an
+//! one entry, and a shell command's has `"shell": "!"` or `"!!"` (kb d149); each entry appended as it is sent, in one write under an
 //! exclusive lock, owner-only, so two chats in one project both keep
 //! theirs. The newest 2000 are kept, rp's length. rp's file is copied in by
 //! `viy migrate --finish` at cutover ([`import`], kb d043, d135), not read
@@ -39,12 +39,46 @@ pub const MAX_ENTRIES: usize = 2000;
 /// so a cut is not a rewrite on every message.
 const SLACK: usize = 200;
 
+/// What a leading `!` made of a line (kb d149): a command run in the
+/// shell whose output the model sees (`!`), or only the user (`!!`). An
+/// entry keeps it in the file's `shell` field, so recalling one brings the
+/// mode back, and a message that merely starts with `!` stays a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    Shared,
+    Private,
+}
+
+impl Shell {
+    /// How it is typed.
+    pub fn bang(self) -> &'static str {
+        match self {
+            Self::Shared => "!",
+            Self::Private => "!!",
+        }
+    }
+
+    fn from_bang(bang: &str) -> Option<Self> {
+        match bang {
+            "!" => Some(Self::Shared),
+            "!!" => Some(Self::Private),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    text: String,
+    shell: Option<Shell>,
+}
+
 #[derive(Debug, Default)]
 pub struct History {
     /// Where entries are appended; none keeps them in memory only.
     path: Option<PathBuf>,
     /// Oldest first.
-    entries: Vec<String>,
+    entries: Vec<Entry>,
     /// The entry being shown, while browsing.
     at: Option<usize>,
     /// What the last recall put in the box.
@@ -57,10 +91,18 @@ impl History {
     /// skipped.
     pub fn load(path: PathBuf) -> Self {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut entries: Vec<String> = text
+        let mut entries: Vec<Entry> = text
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter_map(|v| v.get("text")?.as_str().map(str::to_string))
+            .filter_map(|v| {
+                Some(Entry {
+                    text: v.get("text")?.as_str()?.to_string(),
+                    shell: v
+                        .get("shell")
+                        .and_then(Value::as_str)
+                        .and_then(Shell::from_bang),
+                })
+            })
             .collect();
         let extra = entries.len().saturating_sub(MAX_ENTRIES);
         entries.drain(..extra);
@@ -72,25 +114,53 @@ impl History {
         }
     }
 
-    pub fn entries(&self) -> &[String] {
-        &self.entries
+    /// The entries as typed, oldest first: a shell command with its `!`.
+    pub fn entries(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|e| match e.shell {
+                Some(shell) => format!("{}{}", shell.bang(), e.text),
+                None => e.text.clone(),
+            })
+            .collect()
     }
 
-    /// Adds what was sent, unless it repeats the newest entry, and appends
-    /// it to the file. Browsing starts again from the newest.
+    /// Adds a message that was sent, unless it repeats the newest entry,
+    /// and appends it to the file. Browsing starts again from the newest.
     pub fn record(&mut self, text: &str) -> io::Result<()> {
+        self.record_entry(text, None)
+    }
+
+    /// [`History::record`] for a command run with `!` or `!!`.
+    pub fn record_shell(&mut self, command: &str, shell: Shell) -> io::Result<()> {
+        self.record_entry(command, Some(shell))
+    }
+
+    fn record_entry(&mut self, text: &str, shell: Option<Shell>) -> io::Result<()> {
         self.at = None;
         self.recalled = None;
-        if text.trim().is_empty() || self.entries.last().is_some_and(|e| e == text) {
+        let entry = Entry {
+            text: text.to_string(),
+            shell,
+        };
+        if text.trim().is_empty() || self.entries.last() == Some(&entry) {
             return Ok(());
         }
-        self.entries.push(text.to_string());
+        self.entries.push(entry);
         let extra = self.entries.len().saturating_sub(MAX_ENTRIES);
         self.entries.drain(..extra);
         match &self.path {
-            Some(path) => append(path, text),
+            Some(path) => append(path, text, shell),
             None => Ok(()),
         }
+    }
+
+    /// The mode of the entry last recalled: `None` for a message, or with
+    /// nothing recalled.
+    pub fn shown_shell(&self) -> Option<Shell> {
+        self.at
+            .and_then(|i| self.entries.get(i))
+            .and_then(|e| e.shell)
     }
 
     /// Whether Up and Down browse, for the box's `text` and `cursor`.
@@ -126,7 +196,8 @@ impl History {
     fn show(&mut self, at: Option<usize>) -> Option<String> {
         self.at = at;
         let text = at
-            .and_then(|i| self.entries.get(i).cloned())
+            .and_then(|i| self.entries.get(i))
+            .map(|e| e.text.clone())
             .unwrap_or_default();
         self.recalled = Some(text.clone());
         Some(text)
@@ -136,14 +207,18 @@ impl History {
 /// Appends one entry in one write, under an exclusive lock, and cuts the
 /// file back to the newest [`MAX_ENTRIES`] when it has grown [`SLACK`]
 /// past them.
-fn append(path: &PathBuf, text: &str) -> io::Result<()> {
+fn append(path: &PathBuf, text: &str, shell: Option<Shell>) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut line = json!({"ts": ts, "text": text}).to_string();
+    let mut entry = json!({"ts": ts, "text": text});
+    if let Some(shell) = shell {
+        entry["shell"] = shell.bang().into();
+    }
+    let mut line = entry.to_string();
     line.push('\n');
     let mut file = OpenOptions::new()
         .read(true)

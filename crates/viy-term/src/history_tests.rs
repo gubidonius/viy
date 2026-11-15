@@ -194,3 +194,29 @@ fn import_twice_imports_once_and_a_repeat_at_the_seam_goes() {
         .collect();
     assert_eq!(names, ["history"]);
 }
+
+// kb d149: the mode is kept apart from the text, so a message that starts
+// with `!` stays a message.
+#[test]
+fn a_shell_entry_keeps_its_mode_in_the_file() {
+    let dir = ScratchDir::new("history-shell").unwrap();
+    let path = dir.path().join("history");
+    let mut h = History::load(path.clone());
+    h.record_shell("ls", Shell::Shared).unwrap();
+    h.record_shell("ls", Shell::Private).unwrap();
+    h.record("!ls").unwrap();
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["shell"], "!");
+    assert_eq!(lines[1]["shell"], "!!");
+    assert!(lines[2].get("shell").is_none());
+    let mut again = History::load(path);
+    assert_eq!(again.entries(), ["!ls", "!!ls", "!ls"]);
+    assert_eq!(again.older().as_deref(), Some("!ls"));
+    assert_eq!(again.shown_shell(), None);
+    assert_eq!(again.older().as_deref(), Some("ls"));
+    assert_eq!(again.shown_shell(), Some(Shell::Private));
+}

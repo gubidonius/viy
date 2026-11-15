@@ -1014,19 +1014,13 @@ fn recent(root: &Path, sid: &str, limit: usize) -> Vec<Value> {
     rows
 }
 
-/// The text of a user message whose content is a list of parts.
-fn message_text(content: &Value) -> String {
-    match content {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter(|p| p["type"] == "text")
-            .map(|p| p["text"].as_str().unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
+/// "The user's latest message to Qwen", as Claude reads it: what the user
+/// typed, without a `!` command's record, whose output is not the user's
+/// word (kb d149).
+fn user_request(turn_user: Option<&Value>) -> String {
+    turn_user
+        .map(|c| crate::shell::typed_parts(c).join("\n"))
+        .unwrap_or_default()
 }
 
 fn prompt_for(
@@ -1299,11 +1293,7 @@ impl Chat {
         let n = meta["runs"].as_array().map_or(0, Vec::len) + 1;
         let ws = std::fs::canonicalize(&self.places.workspace)
             .unwrap_or_else(|_| self.places.workspace.clone());
-        let request = self
-            .turn_user
-            .as_ref()
-            .map(message_text)
-            .unwrap_or_default();
+        let request = user_request(self.turn_user.as_ref());
         let prompt = prompt_for(n, &mode, &task, &context, &paths, &request);
         let suffix = if n == 1 {
             String::new()

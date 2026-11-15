@@ -283,18 +283,10 @@ impl Chat {
     }
 
     /// The last three things the user asked, for the reviewer (rp's
-    /// `_recent_user_requests`).
+    /// `_recent_user_requests`). A `!` command's record is not something
+    /// the user asked: its output could argue for any command (kb d149).
     pub(crate) fn recent_user_requests(&self) -> Vec<String> {
-        let text = |c: &Value| match c {
-            Value::String(s) => s.clone(),
-            Value::Array(parts) => parts
-                .iter()
-                .filter(|p| p["type"] == "text")
-                .filter_map(|p| p["text"].as_str())
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        };
+        let text = |c: &Value| crate::shell::typed_parts(c).join(" ");
         let reqs: Vec<String> = self
             .messages
             .iter()

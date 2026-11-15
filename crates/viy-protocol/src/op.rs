@@ -22,6 +22,16 @@ pub enum Op {
     /// A slash command, `/` included; the engine answers with
     /// [`crate::EventMsg::CommandComplete`] once it has run.
     Command { text: String },
+    /// `!command` and `!!command` typed at the prompt (kb d149): run in the
+    /// workspace outside the sandbox, as Codex's `RunUserShellCommand`. The
+    /// engine frames it as a tool call: [`crate::EventMsg::ToolCallBegin`]
+    /// with the tool `!` or `!!`, then its [`crate::EventMsg::ToolCallEnd`].
+    /// `model_sees`: the output goes to the model with the next message
+    /// (`!`); otherwise only the user sees it (`!!`). Only the terminal UI
+    /// sends it, and only for a `!` typed into an empty input box: never
+    /// `viy exec`, `viy dev drive`, a paste, a recalled message or text the
+    /// engine put in the box.
+    Shell { command: String, model_sees: bool },
     /// Stop the running turn (Ctrl-C); the engine answers with
     /// [`crate::EventMsg::TurnAborted`].
     Interrupt,

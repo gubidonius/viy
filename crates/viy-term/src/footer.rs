@@ -64,6 +64,8 @@ pub struct Counts {
     pub queued: usize,
     /// Transcript rows below the screen.
     pub rows_below: usize,
+    /// The input box is in shell mode (kb d149): who sees the output.
+    pub shell: Option<crate::history::Shell>,
 }
 
 impl Status {
@@ -145,6 +147,20 @@ impl Status {
     /// longer.
     fn items(&self, counts: Counts, now: Instant) -> Vec<Item> {
         let mut items = Vec::new();
+        // Kept longest: whether the model will read what runs.
+        match counts.shell {
+            Some(crate::history::Shell::Shared) => items.push(Item::new(
+                9,
+                "shell: the model sees the output".into(),
+                Style::new().red(),
+            )),
+            Some(crate::history::Shell::Private) => items.push(Item::new(
+                9,
+                "shell: only you see the output".into(),
+                Style::new().magenta(),
+            )),
+            None => {}
+        }
         if let Some(label) = self.mode.as_deref().filter(|l| !l.is_empty()) {
             // rp's prompt label: none for the normal mode.
             items.push(Item::new(8, label.to_string(), Style::new().yellow()));

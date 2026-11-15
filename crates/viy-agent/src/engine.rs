@@ -61,6 +61,9 @@ use viy_protocol::QuestionResolvedEvent;
 use viy_protocol::Secret;
 use viy_protocol::SecretRequestEvent;
 use viy_protocol::Submission;
+use viy_protocol::ToolCallBeginEvent;
+use viy_protocol::ToolCallEndEvent;
+use viy_protocol::ToolCallStatus;
 use viy_protocol::TurnAbortReason;
 use viy_protocol::TurnAbortedEvent;
 use viy_protocol::TurnCompleteEvent;
@@ -130,6 +133,33 @@ pub trait Turns: Send + Sync + 'static {
         let _ = ctx;
         Box::pin(async {})
     }
+
+    /// Runs what the user typed after `!` or `!!` ([`Op::Shell`]) as the
+    /// tool call `call_id`, which the engine began and ends with what this
+    /// returns. Without a chat there is no shell to run it in.
+    fn shell(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        call_id: String,
+        command: String,
+        model_sees: bool,
+    ) -> BoxFuture<'static, ShellEnd> {
+        let _ = (ctx, call_id, command, model_sees);
+        Box::pin(async {
+            ShellEnd {
+                status: ToolCallStatus::Failed,
+                detail: Some("no shell here".into()),
+            }
+        })
+    }
+}
+
+/// How a `!` command ended, for its [`EventMsg::ToolCallEnd`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellEnd {
+    pub status: ToolCallStatus,
+    /// `exit 1`, `timed out`, `declined`.
+    pub detail: Option<String>,
 }
 
 /// The engine's end of the channels: where a turn's events go and how it
@@ -710,6 +740,17 @@ enum Work {
     Command,
     /// [`Op::OpenSession`], shown as `/resume`.
     Open(OpenSession),
+    /// [`Op::Shell`]: the tool call it is, and when it began.
+    Shell {
+        call_id: String,
+        model_sees: bool,
+        began: std::time::Instant,
+    },
+}
+
+/// Milliseconds since `began`, for a [`ToolCallEndEvent`].
+fn millis_since(began: std::time::Instant) -> u64 {
+    u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 struct Running {
@@ -742,6 +783,16 @@ impl Running {
             Work::Command | Work::Open(_) => {
                 EventMsg::CommandComplete(CommandCompleteEvent { command: self.text })
             }
+            // Its process group went with the task; nothing of it reaches
+            // the model.
+            Work::Shell { call_id, began, .. } => EventMsg::ToolCallEnd(ToolCallEndEvent {
+                call_id,
+                status: ToolCallStatus::Interrupted,
+                detail: None,
+                duration_ms: millis_since(began),
+                sandboxed: false,
+                network: false,
+            }),
         };
         emit(events, &self.sub_id, msg);
     }
@@ -787,7 +838,10 @@ async fn submission_loop(
                     return;
                 };
                 match sub.op {
-                    Op::UserTurn { .. } | Op::Command { .. } | Op::OpenSession { .. } => {
+                    Op::UserTurn { .. }
+                    | Op::Command { .. }
+                    | Op::OpenSession { .. }
+                    | Op::Shell { .. } => {
                         queued.push_back(sub);
                     }
                     Op::QuestionAnswer { id, answer } => questions.answer(&id, answer),
@@ -855,15 +909,38 @@ fn start(
             }),
             "/resume".to_string(),
         ),
+        Op::Shell {
+            command,
+            model_sees,
+        } => {
+            let call_id = format!("shell-{}", sub.id);
+            // Begun before its task starts, so a Ctrl-C that comes first
+            // still ends a call the UI was told of.
+            ctx.emit(EventMsg::ToolCallBegin(ToolCallBeginEvent {
+                call_id: call_id.clone(),
+                tool: if model_sees { "!" } else { "!!" }.into(),
+                summary: command.clone(),
+            }));
+            (
+                Work::Shell {
+                    call_id,
+                    model_sees,
+                    began: std::time::Instant::now(),
+                },
+                command,
+            )
+        }
         _ => return None,
     };
     let turns = Arc::clone(turns);
     let done = done.clone();
     let sub_id = sub.id.clone();
     let shown = text.clone();
-    // What cancelling it says: a turn aborted, or a command ended.
-    let kind = match work {
+    // What cancelling it says: a turn aborted, a command ended, a shell
+    // command interrupted.
+    let kind = match &work {
         Work::Turn => Work::Turn,
+        Work::Shell { .. } => work.clone(),
         _ => Work::Command,
     };
     let task = tokio::spawn(async move {
@@ -898,6 +975,23 @@ fn start(
                 turns.open_session(ctx.clone(), open).await;
                 ctx.emit(EventMsg::CommandComplete(CommandCompleteEvent {
                     command: text,
+                }));
+            }
+            Work::Shell {
+                call_id,
+                model_sees,
+                began,
+            } => {
+                let end = turns
+                    .shell(ctx.clone(), call_id.clone(), text, model_sees)
+                    .await;
+                ctx.emit(EventMsg::ToolCallEnd(ToolCallEndEvent {
+                    call_id,
+                    status: end.status,
+                    detail: end.detail,
+                    duration_ms: millis_since(began),
+                    sandboxed: false,
+                    network: false,
                 }));
             }
         }

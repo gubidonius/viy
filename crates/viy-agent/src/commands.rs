@@ -118,6 +118,11 @@ const HELP: &str = "  /help              show this
   /redraw            draw the screen again (Ctrl-L)
   /exit              quit  (the pod keeps running - use viy stop)
 
+  !<command>         run it here in your shell, outside the sandbox; the
+                     model sees the output with your next message
+  !!<command>        the same, but only you see the output. Either asks
+                     first when it runs a file the model may have written
+
   End a line with \\ to continue it on the next line.";
 
 /// The pod's commands (kb d041, d068), which the chat's server runs.
@@ -180,13 +185,18 @@ fn replay_call(tc: &Value) -> HistoryItem {
     }
 }
 
-/// What the user typed, without the client's notes; images as `[image]`
-/// (rp's `_user_text`).
+/// What the user typed, without the client's notes or the records of `!`
+/// commands; images as `[image]` (rp's `_user_text`).
 fn user_text(m: &Value) -> String {
     match &m["content"] {
         Value::Array(parts) => parts
             .iter()
-            .filter(|p| p.is_object() && !p["text"].as_str().is_some_and(sessions::is_client_note))
+            .filter(|p| {
+                p.is_object()
+                    && !p["text"]
+                        .as_str()
+                        .is_some_and(|t| sessions::is_client_note(t) || crate::shell::is_record(t))
+            })
             .map(|p| {
                 if p["type"] == "image_url" {
                     "[image]".to_string()
@@ -229,9 +239,23 @@ pub fn history_items(messages: &[Value], earlier: &[Value]) -> Vec<HistoryItem> 
             continue;
         }
         match m["role"].as_str() {
-            Some("user") => items.push(HistoryItem::User {
-                text: user_text(m).trim_matches('\n').to_string(),
-            }),
+            Some("user") => {
+                // The `!` commands run before it, as their cards.
+                for record in crate::shell::records(&m["content"]) {
+                    items.push(HistoryItem::ToolCall {
+                        call_id: String::new(),
+                        tool: "!".into(),
+                        summary: crate::shell::record_command(record)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(200)
+                            .collect(),
+                    });
+                }
+                items.push(HistoryItem::User {
+                    text: user_text(m).trim_matches('\n').to_string(),
+                });
+            }
             Some("assistant") => {
                 if sessions::truthy(&m["thought"]) {
                     items.push(HistoryItem::Thought);
@@ -888,15 +912,26 @@ impl Chat {
         );
     }
 
-    /// The next user message: the pending `/mount` and `/ssh` notes, the
-    /// line, then the pending images (rp's `_user_content`).
+    /// The next user message: the records of the `!` commands run since
+    /// the last one (kb d149), the pending `/mount` and `/ssh` notes, the
+    /// line, then the pending images (rp's `_user_content`). A record's
+    /// output is untrusted text: it taints the chat.
     pub fn user_content(&mut self, line: String) -> Value {
+        let records = std::mem::take(&mut self.shell_records);
+        if !records.is_empty() {
+            self.taint("the output of a ! command".into());
+        }
         let notes = [self.mount_note.take(), self.ssh_note.take()];
-        if self.pending_images.is_empty() && notes.iter().all(Option::is_none) {
+        if self.pending_images.is_empty() && notes.iter().all(Option::is_none) && records.is_empty()
+        {
             return Value::String(line);
         }
         let mut parts = Vec::new();
-        for text in notes.into_iter().flatten().chain(Some(line.clone())) {
+        for text in records
+            .into_iter()
+            .chain(notes.into_iter().flatten())
+            .chain(Some(line.clone()))
+        {
             if !text.is_empty() {
                 parts.push(json!({"type": "text", "text": text}));
             }
@@ -1171,7 +1206,8 @@ impl Chat {
                 .iter()
                 .zip(ends)
                 .map(|(&i, j)| {
-                    let text = sessions::message_text(&self.messages[i], false);
+                    // Without `!` records: the line the user typed.
+                    let text = crate::shell::typed_parts(&self.messages[i]["content"]).join(" ");
                     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     let more = if text.chars().count() > 70 { "..." } else { "" };
                     let writes = self.messages[i..j]
@@ -1279,11 +1315,13 @@ impl Chat {
             Value::Array(parts) => parts.clone(),
             other => vec![json!({"type": "text", "text": other.as_str().unwrap_or_default()})],
         };
+        // What the user typed: not the client's notes, nor a `!` command's
+        // record, whose output is not theirs to send again (kb d149).
         let text = parts
             .iter()
             .filter(|p| p["type"] == "text")
             .filter_map(|p| p["text"].as_str())
-            .filter(|t| !sessions::is_client_note(t))
+            .filter(|t| !sessions::is_client_note(t) && !crate::shell::is_record(t))
             .collect::<Vec<_>>()
             .join("\n");
         let images: Vec<String> = parts
@@ -1310,6 +1348,9 @@ impl Chat {
         if notes.iter().any(|t| viy_tools::remote::is_note(t)) {
             self.ssh_note = Some(viy_tools::remote::note(&self.ssh_hosts, &[]));
         }
+        // `!` output since the last message goes with the turns after the
+        // cut, as Codex's rollback drops it.
+        self.shell_records.clear();
         self.checkpoint(ctx);
         self.redraw(ctx, RewriteReason::Rewind);
         let info = |text: String| notice(ctx, NoticeLevel::Info, "rewind_to", text);

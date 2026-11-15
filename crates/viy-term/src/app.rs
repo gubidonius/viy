@@ -62,6 +62,7 @@ use crate::cells::ToolCard;
 use crate::composer::Action;
 use crate::composer::Composer;
 use crate::composer::POPUP_ROWS;
+use crate::composer::Shell;
 use crate::footer::Counts;
 use crate::footer::Status;
 use crate::frame::FrameLimiter;
@@ -125,7 +126,15 @@ struct Turn {
     answer_cell: Option<usize>,
     /// Tool calls running, in the order they began.
     tools: Vec<(ToolCard, Instant)>,
+    /// Not the model's turn: a `!` command the user runs (kb d149), which
+    /// ends with its call.
+    shell: bool,
 }
+
+/// What `!` and `!!` with nothing after them answer.
+const SHELL_HELP: &str = "!<command> runs it here in your shell, outside the sandbox; the \
+model sees the output with your next message. !!<command> runs it so only you see the \
+output. Backspace leaves the mode.";
 
 pub struct App {
     ops: mpsc::UnboundedSender<Op>,
@@ -344,6 +353,7 @@ impl App {
                     committed: 0,
                     answer_cell: None,
                     tools: Vec::new(),
+                    shell: false,
                 });
             }
             EventMsg::ReasoningContentDelta(e) => {
@@ -397,6 +407,28 @@ impl App {
                 self.push(Cell::lines(vec![Line::from(e.message.yellow())]));
             }
             EventMsg::Notice(notice) => self.push(Cell::notice(&notice)),
+            // A `!` command starting: the engine runs it in the queue's
+            // order, so it is the oldest line waiting.
+            EventMsg::ToolCallBegin(e)
+                if self.turn.is_none() && matches!(e.tool.as_str(), "!" | "!!") =>
+            {
+                self.queued.pop_front();
+                self.turn = Some(Turn {
+                    started: Instant::now(),
+                    phase: Some(StatusPhase::RunningTools),
+                    tokens: 0,
+                    reasoning: String::new(),
+                    reasoning_since: None,
+                    answer: String::new(),
+                    committed: 0,
+                    answer_cell: None,
+                    tools: vec![(
+                        ToolCard::new(&e.call_id, &e.tool, &e.summary),
+                        Instant::now(),
+                    )],
+                    shell: true,
+                });
+            }
             EventMsg::ToolCallBegin(e) => {
                 self.commit_reasoning();
                 self.commit_answer();
@@ -425,6 +457,9 @@ impl App {
                 if let Some(mut card) = card {
                     card.end = Some(e);
                     self.push(Cell::Tool(card));
+                    if self.turn.as_ref().is_some_and(|t| t.shell) {
+                        self.turn = None;
+                    }
                 }
             }
             EventMsg::QuestionRequest(e) => self.questions.push(e.question_id, e.question),
@@ -601,6 +636,10 @@ impl App {
                 self.questions.typed(now);
                 match self.composer.key(key, now) {
                     Action::Submit(text) => self.submit(text),
+                    Action::Shell { command, shell } => self.submit_shell(command, shell),
+                    Action::ShellHelp => {
+                        self.push(Cell::lines(vec![Line::from(SHELL_HELP.dim())]));
+                    }
                     Action::CycleMode => {
                         let _ = self.ops.send(Op::CycleMode { question: None });
                     }
@@ -632,11 +671,33 @@ impl App {
         self.view.end();
     }
 
+    /// Sends a command typed after `!` or `!!` (kb d149), which the
+    /// engine runs when what is ahead of it has ended. This is the one
+    /// place [`Op::Shell`] is made: from a `!` a person typed.
+    fn submit_shell(&mut self, command: String, shell: Shell) {
+        if self.closing {
+            self.composer.set_shell(&command, shell);
+            return;
+        }
+        self.queued.push_back(format!("{}{command}", shell.bang()));
+        let _ = self.ops.send(Op::Shell {
+            command,
+            model_sees: shell == Shell::Shared,
+        });
+        self.sent = true;
+        self.view.end();
+    }
+
     /// Puts a line that was not sent back into the input box: after the
     /// lines given back before it, so several come back in the order they
     /// were sent, and ahead of anything typed since.
     fn give_back(&mut self, text: &str) {
-        let draft = self.composer.text().to_string();
+        // A shell command being typed keeps its `!` in sight: the lines
+        // put back are text, and so is it now (kb d149).
+        let draft = match self.composer.shell() {
+            Some(shell) => format!("{}{}", shell.bang(), self.composer.text()),
+            None => self.composer.text().to_string(),
+        };
         let earlier = if !self.given_back.is_empty() && draft.starts_with(&self.given_back) {
             std::mem::take(&mut self.given_back)
         } else {
@@ -976,8 +1037,13 @@ impl App {
         live.extend(tail);
         let input_top = live.len();
         let mut bottom = live;
+        let prompt = match self.composer.shell() {
+            Some(Shell::Shared) => "! ".red().bold(),
+            Some(Shell::Private) => "!!".magenta().bold(),
+            None => "› ".cyan(),
+        };
         for (i, row) in input_rows.into_iter().enumerate() {
-            let prefix = if i == 0 { "› ".cyan() } else { "  ".into() };
+            let prefix = if i == 0 { prompt.clone() } else { "  ".into() };
             bottom.push(Line::from(vec![prefix, row.into()]));
         }
         let bottom_rows = bottom.len() + 1;
@@ -1036,6 +1102,7 @@ impl App {
         let elapsed = turn.started.elapsed();
         let frame = (elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize % SPINNER.len();
         let phase = match turn.phase {
+            _ if turn.shell => "running",
             None | Some(StatusPhase::Waiting) => "waiting",
             Some(StatusPhase::Reasoning) => "thinking",
             Some(StatusPhase::Answering) => "writing",
@@ -1154,6 +1221,7 @@ impl App {
                 0
             },
             rows_below: self.view.rows_below(),
+            shell: self.composer.shell(),
         };
         self.status.line(counts, width, Instant::now())
     }

@@ -20,6 +20,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -65,24 +67,41 @@ pub struct Running {
     done: bool,
 }
 
-/// A stream's reader, then what it read: a finished task is never polled
-/// again, even when a timeout cancelled the wait halfway.
+/// A stream's reader and what it has read so far: a finished task is never
+/// polled again, even when a timeout cancelled the wait halfway.
 #[derive(Debug)]
-enum Reader {
-    Reading(JoinHandle<Vec<u8>>),
-    Read(Vec<u8>),
+struct Reader {
+    got: Arc<Mutex<Vec<u8>>>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Reader {
+    /// Everything, however long the stream stays open.
     async fn get(&mut self) -> Vec<u8> {
-        if let Self::Reading(h) = self {
-            let got = h.await.unwrap_or_default();
-            *self = Self::Read(got);
+        if let Some(task) = &mut self.task {
+            let _ = task.await;
+            self.task = None;
         }
-        match self {
-            Self::Read(got) => got.clone(),
-            Self::Reading(_) => Vec::new(),
+        self.read()
+    }
+
+    /// What it read by `drain` from now; a stream still open then (a job
+    /// left in the background holds it) is no longer read.
+    async fn get_within(&mut self, drain: Duration) -> Vec<u8> {
+        if let Some(task) = &mut self.task {
+            if tokio::time::timeout(drain, &mut *task).await.is_err() {
+                task.abort();
+            }
+            self.task = None;
         }
+        self.read()
+    }
+
+    fn read(&self) -> Vec<u8> {
+        self.got
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -124,14 +143,22 @@ fn hygiene(keep: &[i32]) -> io::Result<()> {
 }
 
 fn read_all<R: tokio::io::AsyncRead + Unpin + Send + 'static>(r: Option<R>) -> Reader {
-    match r {
-        Some(mut r) => Reader::Reading(tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = r.read_to_end(&mut buf).await;
-            buf
-        })),
-        None => Reader::Read(Vec::new()),
-    }
+    let got: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let task = r.map(|mut r| {
+        let got = Arc::clone(&got);
+        tokio::spawn(async move {
+            let mut chunk = vec![0u8; 64 * 1024];
+            while let Ok(n) = r.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                got.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(&chunk[..n]);
+            }
+        })
+    });
+    Reader { got, task }
 }
 
 /// Starts `spec`: stdin `/dev/null`, stdout and stderr captured.
@@ -227,6 +254,36 @@ impl Running {
                 None
             } else {
                 status.ok().and_then(exit_code)
+            },
+            timed_out,
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            stderr: String::from_utf8_lossy(&err).into_owned(),
+        }
+    }
+
+    /// For a command the user ran (`!`, kb d149): waits for it at most
+    /// `timeout`, then for its output at most `drain` once it has ended, as
+    /// Codex's `IO_DRAIN_TIMEOUT_MS`. A job it left in the background keeps
+    /// running, and what it writes later is not read. Past `timeout` the
+    /// group is killed.
+    pub async fn finish_draining(mut self, timeout: Duration, drain: Duration) -> Finished {
+        let waited = tokio::time::timeout(timeout, self.child.wait()).await;
+        let (timed_out, status) = match waited {
+            Ok(status) => (false, status.ok()),
+            Err(_) => {
+                self.kill_group();
+                let late = tokio::time::timeout(DRAIN, self.child.wait()).await;
+                (true, late.ok().and_then(Result::ok))
+            }
+        };
+        self.status = status.or(self.status);
+        let (out, err) = tokio::join!(self.stdout.get_within(drain), self.stderr.get_within(drain));
+        self.done = true;
+        Finished {
+            exit_code: if timed_out {
+                None
+            } else {
+                status.and_then(exit_code)
             },
             timed_out,
             stdout: String::from_utf8_lossy(&out).into_owned(),

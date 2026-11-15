@@ -84,6 +84,7 @@ use crate::sessions::SessionError;
 use crate::sessions::SessionLog;
 use crate::sessions::Sessions;
 use crate::sessions::default_title;
+use crate::shell;
 use crate::stream::Endpoint;
 use crate::stream::Round;
 use crate::stream::Sink;
@@ -288,6 +289,17 @@ pub struct Chat {
     /// as the frontend starts with no name. Shared with the background
     /// title request, which sends the title it gets.
     label_sent: Arc<Mutex<String>>,
+    /// The records of `!` commands run since the last message, which the
+    /// next one carries to the model ([`crate::shell`]).
+    pub(crate) shell_records: Vec<String>,
+    /// When the model was at work, every chat's turns ([`shell::WorkLog`]).
+    pub(crate) work_log: shell::WorkLog,
+    /// Said once: the log could not be written.
+    work_log_failed: bool,
+    /// The user's login shell (`$SHELL`), which `!` commands run in, and
+    /// the `PATH` it gives them, asked at the first (empty: it said none).
+    pub(crate) login_shell: Option<std::ffi::OsString>,
+    pub(crate) login_path: Option<std::ffi::OsString>,
 }
 
 /// How long closing, switching or forking a chat waits for its title.
@@ -339,6 +351,7 @@ impl Chat {
         );
         let consult = consult::ConsultSettings::from_config(cfg, &places.home);
         let ssh_home = places.home.clone();
+        let places_state_dir = places.state_dir.clone();
         let toolbox_on = on("TOOLBOX_ENABLED", "1");
         let toolbox_snap = if toolbox_on {
             places.toolbox.scan()
@@ -445,6 +458,11 @@ impl Chat {
             ssh_machine: Arc::new(viy_tools::remote::SshTools { home: ssh_home }),
             ssh_runner: Arc::new(viy_tools::remote::SystemSsh),
             label_sent: Arc::default(),
+            shell_records: Vec::new(),
+            work_log: shell::WorkLog::new(&places_state_dir),
+            work_log_failed: false,
+            login_shell: std::env::var_os("SHELL"),
+            login_path: None,
         })
     }
 
@@ -658,6 +676,8 @@ impl Chat {
         self.mount_note = self.mounts_note();
         // a lent server stays lent in a new chat, and it is told again
         self.ssh_note = self.ssh_hosts_note();
+        // `!` output belonged to the old chat.
+        self.shell_records.clear();
         let fresh = match (&old, &self.sessions) {
             (Some(_), Some(store)) => {
                 Some(store.create(self.project.as_deref(), Some(&self.settings.model)))
@@ -743,6 +763,7 @@ impl Chat {
         self.messages = history;
         self.mount_note = self.mounts_note();
         self.ssh_note = self.ssh_hosts_note();
+        self.shell_records.clear();
     }
 
     /// Runs `f` on this chat's record of what write_file overwrote (rp's
@@ -811,6 +832,10 @@ impl Chat {
                     .is_some_and(|c| c.contains("<<<UNTRUSTED "))
             {
                 taint = Some(WEB);
+            }
+            // A `!` command ran outside the sandbox, network and all.
+            if m["role"] == "user" && !shell::records(&m["content"]).is_empty() {
+                taint = taint.or(Some("the output of a ! command earlier in this chat"));
             }
             for tc in m["tool_calls"].as_array().into_iter().flatten() {
                 let name = tc["function"]["name"].as_str().unwrap_or_default();
@@ -1310,6 +1335,16 @@ impl Chat {
             self.decide_private_git().await;
         }
         self.announce_label(ctx, content.as_str());
+        // Whatever the turn changes on disk, it changes in this window
+        // (kb d149): written before anything runs, closed when the turn
+        // ends or is dropped half way (Ctrl-C).
+        let _window = match self.work_log.begin() {
+            Ok(w) => Some(w),
+            Err(e) => {
+                self.work_log_unwritten(ctx, &e);
+                None
+            }
+        };
         let outcome = self.turn(ctx, content).await;
         self.maybe_start_title(ctx);
         self.maybe_start_background();
@@ -2166,6 +2201,28 @@ impl Turns for ChatTurns {
         })
     }
 
+    fn shell(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        call_id: String,
+        command: String,
+        model_sees: bool,
+    ) -> BoxFuture<'static, crate::ShellEnd> {
+        Box::pin(async move {
+            let busy = crate::ShellEnd {
+                status: viy_protocol::ToolCallStatus::Failed,
+                detail: Some("the chat is busy".into()),
+            };
+            let Some(mut lease) = Lease::take(&self, &ctx) else {
+                return busy;
+            };
+            let Some(chat) = lease.chat.as_mut() else {
+                return busy;
+            };
+            chat.user_shell(&ctx, &call_id, &command, model_sees).await
+        })
+    }
+
     fn opened(&self, ctx: &TurnContext) {
         self.with_chat(|chat| chat.opened(ctx));
         if let Some(server) = &self.server {
@@ -2205,6 +2262,8 @@ pub mod compact;
 pub mod consult;
 #[path = "tools.rs"]
 mod tools;
+#[path = "user_shell.rs"]
+mod user_shell;
 #[path = "web.rs"]
 pub mod web;
 #[path = "workflows.rs"]

@@ -10,6 +10,15 @@
 //! mode. A terminal without bracketed paste types a paste as keys: Enter
 //! within 120 ms of a burst of keys under 8 ms apart is a newline, not a
 //! send (Codex's direct-insert path; no person types that fast).
+//!
+//! Shell mode (kb d149), as Codex's: a `!` typed into the empty box is not
+//! text but the mode, shown in the prompt; a second makes it `!!`, whose
+//! output only the user sees; Backspace in the empty box takes one back.
+//! Only a key typed by a person enters it. A paste, text the chat puts in
+//! the box (a rewound message, a line given back) and a recalled message
+//! keep their `!` as text, and a `!` followed within 8 ms by another key
+//! came from a paste and goes back into the text. A recalled shell command
+//! comes back in its mode: the history keeps the mode apart from the text.
 
 use std::time::Duration;
 
@@ -19,6 +28,7 @@ use crossterm::event::KeyModifiers;
 use tokio::time::Instant;
 
 use crate::history::History;
+pub use crate::history::Shell;
 use crate::slash::Completion;
 use crate::slash::completions;
 use crate::textarea::TextArea;
@@ -38,6 +48,13 @@ pub enum Action {
     None,
     /// Send this, trimmed and not empty: a message or a slash command.
     Submit(String),
+    /// Run this in the shell, trimmed and not empty (`!` or `!!`).
+    Shell {
+        command: String,
+        shell: Shell,
+    },
+    /// Enter in shell mode with nothing typed: say what it does.
+    ShellHelp,
     /// Shift+Tab: the next chat mode.
     CycleMode,
 }
@@ -91,6 +108,10 @@ pub struct Composer {
     dismissed: Option<String>,
     /// The width the input was last laid out at, for Up and Down.
     width: usize,
+    /// Shell mode, and when the `!` that set it was typed, until the key
+    /// after it shows it was typed by a person.
+    shell: Option<Shell>,
+    shell_typed: Option<Instant>,
 }
 
 impl Composer {
@@ -106,18 +127,50 @@ impl Composer {
         self.area.text()
     }
 
+    /// Nothing typed, not even the `!` of shell mode.
     pub fn is_empty(&self) -> bool {
-        self.area.is_empty()
+        self.area.is_empty() && self.shell.is_none()
     }
 
-    /// Empties the box (Ctrl-C with a draft).
+    /// Shell mode, if the box is in it.
+    pub fn shell(&self) -> Option<Shell> {
+        self.shell
+    }
+
+    /// Empties the box (Ctrl-C with a draft), shell mode too.
     pub fn clear(&mut self) {
         self.area.take();
+        self.leave_shell();
     }
 
-    /// Puts `text` in the box to edit: `/rewind`'s prefill.
+    /// Puts `text` in the box to edit: `/rewind`'s prefill, a line given
+    /// back. Never shell mode: a `!` in it is text.
     pub fn set_text(&mut self, text: &str) {
+        self.leave_shell();
         self.area.set_text(text);
+    }
+
+    /// Puts back a shell command the user typed and the chat could not
+    /// take (it was closing), in its mode.
+    pub fn set_shell(&mut self, command: &str, shell: Shell) {
+        self.area.set_text(command);
+        self.shell = Some(shell);
+        self.shell_typed = None;
+    }
+
+    fn leave_shell(&mut self) {
+        self.shell = None;
+        self.shell_typed = None;
+    }
+
+    /// The `!` of shell mode came from a paste: it goes back into the
+    /// text, at the start.
+    fn shell_was_pasted(&mut self) {
+        if let Some(shell) = self.shell.take() {
+            let rest = self.area.text().to_string();
+            self.area.set_text(&format!("{}{rest}", shell.bang()));
+        }
+        self.shell_typed = None;
     }
 
     pub fn history(&self) -> &History {
@@ -130,9 +183,11 @@ impl Composer {
         self.area.insert_str(text);
     }
 
-    /// The popup's offers for the input now; none once Esc closed it.
+    /// The popup's offers for the input now; none once Esc closed it, and
+    /// none for a shell command.
     pub fn popup(&self) -> Vec<Completion> {
-        if self.area.cursor() != self.area.text().len()
+        if self.shell.is_some()
+            || self.area.cursor() != self.area.text().len()
             || self.dismissed.as_deref() == Some(self.area.text())
         {
             return Vec::new();
@@ -155,6 +210,38 @@ impl Composer {
     pub fn key(&mut self, key: KeyEvent, now: Instant) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // The key after a `!`: sooner than anyone types, it is a paste.
+        if let Some(at) = self.shell_typed.take()
+            && now.saturating_duration_since(at) <= BURST_CHAR_INTERVAL
+        {
+            self.shell_was_pasted();
+        }
+        if let KeyCode::Char('!') = key.code
+            && !ctrl
+            && !alt
+            && self.area.is_empty()
+            && self.shell != Some(Shell::Private)
+        {
+            self.burst.on_char(now);
+            self.shell = Some(match self.shell {
+                None => Shell::Shared,
+                Some(_) => Shell::Private,
+            });
+            self.shell_typed = Some(now);
+            return Action::None;
+        }
+        if key.code == KeyCode::Backspace
+            && !ctrl
+            && !alt
+            && self.area.is_empty()
+            && let Some(shell) = self.shell
+        {
+            self.shell = match shell {
+                Shell::Private => Some(Shell::Shared),
+                Shell::Shared => None,
+            };
+            return Action::None;
+        }
         let before = self.area.text().to_string();
         if !matches!(key.code, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) || ctrl || alt {
             self.burst.clear();
@@ -260,7 +347,7 @@ impl Composer {
     fn up(&mut self) -> Action {
         if self.history.browses(self.area.text(), self.area.cursor()) {
             if let Some(text) = self.history.older() {
-                self.area.set_text(&text);
+                self.recall(&text);
             }
         } else {
             self.area.move_up(self.width);
@@ -271,7 +358,7 @@ impl Composer {
     fn down(&mut self) -> Action {
         if self.history.browses(self.area.text(), self.area.cursor()) {
             if let Some(text) = self.history.newer() {
-                self.area.set_text(&text);
+                self.recall(&text);
             }
         } else {
             self.area.move_down(self.width);
@@ -279,11 +366,30 @@ impl Composer {
         Action::None
     }
 
+    /// A history entry in the box, in the mode the history kept for it.
+    fn recall(&mut self, text: &str) {
+        self.area.set_text(text);
+        self.shell = self.history.shown_shell();
+        self.shell_typed = None;
+    }
+
     /// The input, trimmed, to send; nothing when it is blank. It goes into
     /// the history; a history file that cannot be written loses the entry,
     /// never the message (rp ignores the same failure).
     fn submit(&mut self) -> Action {
         let text = self.area.text().trim().to_string();
+        if let Some(shell) = self.shell {
+            self.area.take();
+            self.leave_shell();
+            if text.is_empty() {
+                return Action::ShellHelp;
+            }
+            let _ = self.history.record_shell(&text, shell);
+            return Action::Shell {
+                command: text,
+                shell,
+            };
+        }
         if text.is_empty() {
             return Action::None;
         }

@@ -85,6 +85,34 @@ impl Turns for StandIn {
             }));
         })
     }
+
+    /// Says what it ran and who sees it; "hang" never ends.
+    fn shell(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        call_id: String,
+        command: String,
+        model_sees: bool,
+    ) -> BoxFuture<'static, ShellEnd> {
+        Box::pin(async move {
+            ctx.emit(EventMsg::ToolCallOutputDelta(
+                viy_protocol::ToolCallOutputDeltaEvent {
+                    call_id,
+                    chunk: format!(
+                        "ran {command} for {}",
+                        if model_sees { "both" } else { "you" }
+                    ),
+                },
+            ));
+            if command.contains("hang") {
+                std::future::pending::<()>().await;
+            }
+            ShellEnd {
+                status: ToolCallStatus::Completed,
+                detail: Some("exit 0".into()),
+            }
+        })
+    }
 }
 
 fn engine() -> Engine {
@@ -905,4 +933,88 @@ async fn no_mode_answers_a_secret() {
         m,
         EventMsg::QuestionResolved(QuestionResolvedEvent { by: None, .. })
     )));
+}
+
+fn call_ended(id: &str) -> impl Fn(&Event) -> bool + '_ {
+    move |e| e.id == id && matches!(e.msg, EventMsg::ToolCallEnd(_))
+}
+
+/// The call of a `!` command and how it ended, without its duration.
+fn shell_events(events: &[Event], id: &str) -> Vec<EventMsg> {
+    events
+        .iter()
+        .filter(|e| e.id == id)
+        .map(|e| match &e.msg {
+            EventMsg::ToolCallEnd(end) => EventMsg::ToolCallEnd(ToolCallEndEvent {
+                duration_ms: 0,
+                ..end.clone()
+            }),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+// kb d149: a `!` command is a tool call of its own, in the queue's order.
+#[tokio::test]
+async fn a_shell_command_is_a_call_that_waits_its_turn() {
+    let mut engine = engine();
+    let turn = engine.submit(Op::UserTurn { text: "one".into() }).unwrap();
+    let shell = engine
+        .submit(Op::Shell {
+            command: "ls -la".into(),
+            model_sees: false,
+        })
+        .unwrap();
+    let events = until(&mut engine, call_ended(&shell)).await;
+    let mut runs: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
+    runs.dedup();
+    assert_eq!(runs, [&turn, &shell]);
+    let call_id = format!("shell-{shell}");
+    assert_eq!(
+        shell_events(&events, &shell),
+        [
+            EventMsg::ToolCallBegin(ToolCallBeginEvent {
+                call_id: call_id.clone(),
+                tool: "!!".into(),
+                summary: "ls -la".into(),
+            }),
+            EventMsg::ToolCallOutputDelta(viy_protocol::ToolCallOutputDeltaEvent {
+                call_id: call_id.clone(),
+                chunk: "ran ls -la for you".into(),
+            }),
+            EventMsg::ToolCallEnd(ToolCallEndEvent {
+                call_id,
+                status: ToolCallStatus::Completed,
+                detail: Some("exit 0".into()),
+                duration_ms: 0,
+                sandboxed: false,
+                network: false,
+            }),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_ends_a_shell_command_as_interrupted() {
+    let mut engine = engine();
+    let shell = engine
+        .submit(Op::Shell {
+            command: "hang".into(),
+            model_sees: true,
+        })
+        .unwrap();
+    until(&mut engine, |e| {
+        matches!(e.msg, EventMsg::ToolCallOutputDelta(_))
+    })
+    .await;
+    engine.submit(Op::Interrupt).unwrap();
+    let events = until(&mut engine, call_ended(&shell)).await;
+    let Some(EventMsg::ToolCallEnd(end)) = events.last().map(|e| e.msg.clone()) else {
+        panic!("no end: {events:?}");
+    };
+    assert_eq!(end.status, ToolCallStatus::Interrupted);
+    assert_eq!(end.call_id, format!("shell-{shell}"));
+    // The engine goes on: the next line runs.
+    let next = engine.submit(Op::UserTurn { text: "two".into() }).unwrap();
+    until(&mut engine, turn_done(&next)).await;
 }

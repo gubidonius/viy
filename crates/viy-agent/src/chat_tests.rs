@@ -135,6 +135,9 @@ fn chat_touching(
     )
     .unwrap();
     chat.use_sessions(store.clone(), Some("/nonexistent/viy-project".into()));
+    // The model's work logged beside the test's sessions, not in viy's
+    // state folder.
+    chat.work_log = crate::shell::WorkLog::new(&store.dir().with_file_name("state"));
     chat
 }
 

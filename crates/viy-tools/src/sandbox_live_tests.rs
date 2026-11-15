@@ -140,6 +140,22 @@ async fn protected_paths_are_read_only_and_the_rest_writable() {
     );
 }
 
+/// kb d149: nothing sandboxed can type into viy's input box, where a `!`
+/// would run outside the sandbox: it has no terminal (a session of its
+/// own, stdin from /dev/null), so no TIOCSTI and no /dev/tty; the
+/// sockets a terminal multiplexer or a desktop listens on are refused by
+/// the test below.
+#[tokio::test]
+async fn a_sandboxed_command_has_no_terminal_to_type_into() {
+    let Some(b) = sandbox().await else { return };
+    let r = b
+        .sh("tty; python3 -c \"open('/dev/tty', 'w')\" && echo opened")
+        .await;
+    assert!(r.stdout.contains("not a tty"), "{r:?}");
+    assert!(!r.stdout.contains("opened"), "{r:?}");
+    assert!(r.stderr.contains("No such device or address"), "{r:?}");
+}
+
 #[tokio::test]
 async fn unix_and_vsock_sockets_and_user_namespaces_are_refused() {
     let Some(b) = sandbox().await else { return };

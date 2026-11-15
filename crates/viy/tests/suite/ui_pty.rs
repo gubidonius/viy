@@ -306,3 +306,84 @@ fn the_history_outlives_the_chat() {
     pty.send(b"\x03").unwrap();
     close(&pty, child);
 }
+
+/// The content parts of the last user message of the first streamed
+/// request `mock` saw, as text.
+fn sent_parts(mock: &MockLlm) -> Vec<String> {
+    let user = mock
+        .requests()
+        .iter()
+        .filter_map(|r| r.body.as_ref())
+        .find(|b| b["stream"] == Value::Bool(true))
+        .and_then(|b| b["messages"].as_array().cloned())
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "user").cloned())
+        .unwrap_or_default();
+    match &user["content"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// kb d149: a `!` typed by a person runs in the chat's folder and its
+/// output goes with the next message; the same text pasted is a message.
+#[test]
+fn a_typed_bang_runs_the_command_and_the_next_message_carries_it() {
+    let mock = one_turn("the answer");
+    let dir = ScratchDir::new("ui-bang").unwrap();
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = pty
+        .spawn(
+            Command::new(env!("CARGO_BIN_EXE_viy"))
+                .args(["dev", "chat", "--url", &mock.uri(), "--dir"])
+                .arg(dir.path())
+                .env("VLLM_API_KEY", "fake-key")
+                .env("SHELL", "/bin/sh"),
+        )
+        .unwrap();
+    pty.wait_for("the input box", |s| {
+        s.alternate_screen() && s.contents().contains("› ")
+    });
+    pty.send(b"!").unwrap();
+    pty.wait_for("the shell prompt", |s| {
+        s.contents().contains("shell: the model sees the output")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    pty.send(b"echo made > made.txt; echo shown-$((40+2))")
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.wait_for("the output", |s| s.contents().contains("└ shown-42"));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("made.txt")).unwrap(),
+        "made\n"
+    );
+    send_and_answer(&pty, &mock, b"what did it print");
+    let parts = sent_parts(&mock);
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    assert!(
+        parts[0].starts_with(
+            "<user_shell_command>\n<command>\necho made > made.txt; echo shown-$((40+2))\n\
+             </command>\n<result>\nExit code: 0\n"
+        ),
+        "{parts:?}"
+    );
+    assert!(parts[0].contains("\nshown-42\nUNTRUSTED "), "{parts:?}");
+    assert_eq!(parts[1], "what did it print");
+    close(&pty, child);
+}
+
+#[test]
+fn a_pasted_bang_is_a_message_and_runs_nothing() {
+    let mock = one_turn("the answer");
+    let dir = ScratchDir::new("ui-bang-paste").unwrap();
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = open_chat(&pty, &mock, dir.path());
+    let got = send_and_answer(&pty, &mock, b"\x1b[200~!echo pasted > ran.txt\x1b[201~");
+    assert_eq!(got.as_deref(), Some("!echo pasted > ran.txt"));
+    assert!(!dir.path().join("ran.txt").exists());
+    close(&pty, child);
+}

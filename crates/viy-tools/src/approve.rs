@@ -27,6 +27,7 @@ mod literal;
 mod pipe;
 mod plain;
 mod review;
+mod runs;
 mod tmp_rm;
 
 use std::path::Path;
@@ -61,6 +62,8 @@ pub use review::files_for_review;
 pub use review::parse_verdict;
 pub use review::review_schema;
 pub use review::review_with_doctrines;
+pub use runs::cd_targets;
+pub use runs::run_targets;
 pub use tmp_rm::sandbox_tmp_rm;
 
 /// After this many refusals in a row the turn is stopped, so a model that
