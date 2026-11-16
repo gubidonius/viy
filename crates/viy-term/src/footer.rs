@@ -57,7 +57,7 @@ pub struct Status {
 
 /// What the app adds: counts it keeps itself.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct Counts {
+pub struct Counts<'a> {
     /// Questions waiting behind the one shown.
     pub questions: usize,
     /// Messages queued for the turn running to end.
@@ -66,6 +66,9 @@ pub struct Counts {
     pub rows_below: usize,
     /// The input box is in shell mode (kb d149): who sees the output.
     pub shell: Option<crate::history::Shell>,
+    /// What the last copy did, for a few seconds (kb d150), and whether
+    /// it failed.
+    pub copied: Option<(&'a str, bool)>,
 }
 
 impl Status {
@@ -117,7 +120,7 @@ impl Status {
     }
 
     /// The footer for `width` columns.
-    pub fn line(&self, counts: Counts, width: usize, now: Instant) -> Line<'static> {
+    pub fn line(&self, counts: Counts<'_>, width: usize, now: Instant) -> Line<'static> {
         let mut items = self.items(counts, now);
         let total = |items: &[Item]| {
             items.iter().map(Item::width).sum::<usize>()
@@ -145,7 +148,7 @@ impl Status {
 
     /// The items in the order shown; each with its rank, higher kept
     /// longer.
-    fn items(&self, counts: Counts, now: Instant) -> Vec<Item> {
+    fn items(&self, counts: Counts<'_>, now: Instant) -> Vec<Item> {
         let mut items = Vec::new();
         // Kept longest: whether the model will read what runs.
         match counts.shell {
@@ -211,6 +214,14 @@ impl Status {
         }
         if let Some(title) = &self.title {
             items.push(Item::new(1, title.clone(), dim()));
+        }
+        if let Some((notice, failed)) = counts.copied {
+            let style = if failed {
+                Style::new().red()
+            } else {
+                Style::new().green()
+            };
+            items.push(Item::new(9, notice.to_string(), style));
         }
         if counts.rows_below > 0 {
             items.push(Item::new(

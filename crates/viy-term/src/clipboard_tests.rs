@@ -232,7 +232,7 @@ impl Backend for Fake {
 
 fn clipboard(place: Place, fake: &Fake) -> Clipboard {
     let fake = fake.clone();
-    Clipboard::with(place, move || Box::new(fake))
+    Clipboard::with(place, move || Box::new(fake.clone()))
 }
 
 #[tokio::test]
@@ -297,7 +297,7 @@ async fn without_a_desktop_clipboard_the_ui_gets_the_osc52_to_write() {
     );
     assert_eq!(
         done.notice().as_deref(),
-        Some("sent 2 chars to the terminal's clipboard")
+        Some("sent 2 chars to the terminal")
     );
 }
 
@@ -356,16 +356,16 @@ async fn a_stuck_clipboard_is_given_up_on_after_five_seconds() {
             terminal: None,
         }
     );
-    // The thread is still in the call: nothing new until it comes back.
-    assert_eq!(clip.copy("next", false), Err(Refused::Busy));
+    // The stuck thread is left behind: the next copy goes to a new one.
+    assert!(!clip.busy());
+    let next = clip.copy("next", false).unwrap();
+    // Both threads wait on the gate; the stuck one goes first.
+    release.send(()).unwrap();
     release.send(()).unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    // Its late answer is dropped, not reported.
-    let late = tokio::time::timeout(Duration::from_secs(60), clip.done()).await;
-    assert!(late.is_err(), "{late:?}");
-    release.send(()).unwrap();
-    let next = clip.copy("next", false).unwrap();
+    // The stuck thread's late answer is dropped; the new one's comes.
     assert_eq!(clip.done().await.id(), next);
+    assert_eq!(fake.log(), ["set Clipboard stuck", "set Clipboard next"]);
 }
 
 #[test]

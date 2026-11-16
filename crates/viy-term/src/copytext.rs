@@ -146,6 +146,38 @@ fn push_cells(out: &mut String, line: &Line<'_>, lo: usize, hi: usize) {
     }
 }
 
+/// The cells of the word under `column` in `line`, the end not included,
+/// by Unicode's word bounds (Codex's `SelectionUnit::Word`): a run of
+/// spaces or a punctuation mark is a word of its own. `(column, column)`
+/// past the text.
+pub fn word_at(line: &Line<'_>, column: usize) -> (usize, usize) {
+    let mut text = String::new();
+    // Each drawn grapheme: where it starts in `text`, and its first cell.
+    let mut cells: Vec<(usize, usize)> = Vec::new();
+    let mut end = 0;
+    for span in &line.spans {
+        for grapheme in span.content.graphemes(true) {
+            let width = usize::from(grapheme.cell_width());
+            if grapheme.contains(char::is_control) || width == 0 {
+                continue;
+            }
+            cells.push((text.len(), end));
+            text.push_str(grapheme);
+            end += width;
+        }
+    }
+    let column_of = |byte: usize| {
+        cells
+            .iter()
+            .find(|&&(at, _)| at >= byte)
+            .map_or(end, |&(_, cell)| cell)
+    };
+    text.split_word_bound_indices()
+        .map(|(start, word)| (column_of(start), column_of(start + word.len())))
+        .find(|&(lo, hi)| (lo..hi).contains(&column))
+        .unwrap_or((column, column))
+}
+
 fn trim_spaces(out: &mut String) {
     let kept = out.trim_end_matches(' ').len();
     out.truncate(kept);

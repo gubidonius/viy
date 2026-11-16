@@ -28,6 +28,7 @@ use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
 use crossterm::event::KeyEventKind;
 use crossterm::event::KeyModifiers;
+use crossterm::event::MouseButton;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use futures_core::Stream;
@@ -59,6 +60,8 @@ use viy_protocol::TurnOutcome;
 use crate::cells::Reasoning;
 use crate::cells::Running;
 use crate::cells::ToolCard;
+use crate::clipboard::Clipboard;
+use crate::clipboard::Done;
 use crate::composer::Action;
 use crate::composer::Composer;
 use crate::composer::POPUP_ROWS;
@@ -68,6 +71,7 @@ use crate::footer::Status;
 use crate::frame::FrameLimiter;
 use crate::history::History;
 use crate::markdown;
+use crate::markdown::Row;
 use crate::question::Questions;
 use crate::question::Taken;
 use crate::sanitize::sanitize_line_after;
@@ -196,12 +200,41 @@ pub struct App {
     markdown: bool,
     /// The reasoning trace drawn (rp `/think on`, its default).
     show_think: bool,
+    /// Where a selection is copied (kb d150).
+    clipboard: Clipboard,
+    /// What the footer says of the last copy, whether it failed, and until
+    /// when.
+    copied: Option<(String, bool, Instant)>,
+    /// OSC 52 sequences to write with the next frame: copies that went to
+    /// the terminal's clipboard.
+    osc52: Vec<String>,
+}
+
+/// How long the footer says what was copied.
+const COPIED_SHOWN: Duration = Duration::from_secs(4);
+
+/// The copy key while text is selected (Codex's `is_copy_key`): Ctrl+C,
+/// Super+C (Kitty's Cmd+C), Ctrl+Shift+C where the terminal passes it
+/// on, and Ctrl+Insert.
+fn is_copy_key(key: KeyEvent) -> bool {
+    let shortcut = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char(c) => shortcut && c.eq_ignore_ascii_case(&'c'),
+        KeyCode::Insert => key.modifiers == KeyModifiers::CONTROL,
+        _ => false,
+    }
 }
 
 impl App {
     /// The chat's screen; what is sent goes into `history`.
     pub fn new(ops: mpsc::UnboundedSender<Op>, history: History) -> Self {
         Self {
+            clipboard: Clipboard::new(),
+            copied: None,
+            osc52: Vec::new(),
             ops,
             cells: Vec::new(),
             view: TranscriptView::default(),
@@ -232,6 +265,12 @@ impl App {
             markdown: true,
             show_think: true,
         }
+    }
+
+    /// Copies selections to `clipboard` instead of the desktop's (tests,
+    /// and the chat on a terminal with no desktop to reach).
+    pub fn set_clipboard(&mut self, clipboard: Clipboard) {
+        self.clipboard = clipboard;
     }
 
     /// Sets the tab title from now on, in `encoding` (rp's
@@ -291,9 +330,34 @@ impl App {
                     }
                     None => input_open = false,
                 },
+                done = self.clipboard.done() => self.copy_done(done),
                 () = sleep_until(frame), if frame.is_some() => self.draw(term),
             }
         }
+    }
+
+    /// A copy came back: the footer says so, and one that went to the
+    /// terminal is written with the next frame.
+    fn copy_done(&mut self, done: Done) {
+        if let Done::Copy {
+            result, terminal, ..
+        } = &done
+        {
+            self.osc52.extend(terminal.clone());
+            if let Some(notice) = done.notice() {
+                self.copied = Some((notice, result.is_err(), Instant::now() + COPIED_SHOWN));
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Copies `text`: from a mouse selection, also as PRIMARY. A refusal
+    /// shows in the footer as a failed copy would.
+    fn copy(&mut self, text: &str, selected: bool) {
+        if let Err(refused) = self.clipboard.copy(text, selected) {
+            self.copied = Some((refused.copy_notice(), true, Instant::now() + COPIED_SHOWN));
+        }
+        self.dirty = true;
     }
 
     /// When the next frame is due: soon after a change, and every spinner
@@ -314,10 +378,10 @@ impl App {
         };
         // The box's keys light up when it starts taking them.
         let armed = self.questions.armed_at().filter(|&at| at > now);
-        match (next, armed) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // The copy notice goes; a drag held at an edge scrolls.
+        let copied = self.copied.as_ref().map(|&(_, _, until)| until);
+        let edge = self.view.next_edge_scroll(now);
+        [next, armed, copied, edge].into_iter().flatten().min()
     }
 
     /// Draws `header` first in the transcript, now and after every
@@ -523,17 +587,14 @@ impl App {
             }
             Input::Key(_) => {}
             Input::Paste(text) => {
+                self.view.clear_selection();
                 // A secret takes the paste; no character of it reaches the input box.
                 if !self.questions.paste(&text, Instant::now()) {
                     self.questions.typed(Instant::now());
                     self.composer.paste(&text);
                 }
             }
-            Input::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.view.scroll_up(WHEEL_ROWS),
-                MouseEventKind::ScrollDown => self.view.scroll_down(WHEEL_ROWS),
-                _ => {}
-            },
+            Input::Mouse(mouse) => self.mouse(mouse),
             Input::Resize(width, height) => term.resize(Size::new(width, height)),
             Input::Terminate => self.close(),
             Input::Hangup => {
@@ -544,10 +605,60 @@ impl App {
         None
     }
 
+    /// The mouse (kb d150): the wheel scrolls; the left button selects in
+    /// the transcript, Shift extending, and a release copies what it
+    /// selected. A press anywhere else drops the selection. The mouse
+    /// never reaches a question box, nor counts as typing.
+    fn mouse(&mut self, mouse: MouseEvent) {
+        let now = Instant::now();
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.view.scroll_up(WHEEL_ROWS),
+            MouseEventKind::ScrollDown => self.view.scroll_down(WHEEL_ROWS),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+                if !self.view.press(mouse.column, mouse.row, shift, now) {
+                    self.view.clear_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.view.drag(mouse.column, mouse.row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = self.view.release(mouse.column, mouse.row) {
+                    self.copy(&text, true);
+                }
+            }
+            _ => return,
+        }
+        self.dirty = true;
+    }
+
     /// Takes a key pressed at `now` (the input box tells a keystroke paste
     /// from typing by the time between keys).
     fn key(&mut self, key: KeyEvent, now: Instant) -> Option<Flow> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // A selection (kb d150): with nothing in front of it, the copy key
+        // copies it, without stopping, clearing or closing anything, and
+        // Esc drops it. Any other key drops it and does what it does; a
+        // question box takes its keys as before.
+        if self.view.has_selection() {
+            let free = self.questions.front().is_none() && self.picking.is_none();
+            if free && is_copy_key(key) {
+                // The release copied the selection: while that copy runs,
+                // this text is already on its way, and the selection stays.
+                if self.clipboard.busy() {
+                    return None;
+                }
+                if let Some(text) = self.view.selected_text() {
+                    self.copy(&text, false);
+                }
+                self.view.clear_selection();
+                return None;
+            }
+            self.view.clear_selection();
+            self.dirty = true;
+            if free && key.code == KeyCode::Esc {
+                return None;
+            }
+        }
         if self.picking.is_some() {
             self.pick_key(key);
             return None;
@@ -947,6 +1058,14 @@ impl App {
         if std::mem::take(&mut self.repaint) {
             term.invalidate();
         }
+        self.view.tick_edge(now);
+        if self
+            .copied
+            .as_ref()
+            .is_some_and(|&(_, _, until)| until <= now)
+        {
+            self.copied = None;
+        }
         if let Err(e) = self.render(term, now) {
             self.blind = Some(e);
             self.close();
@@ -1052,7 +1171,7 @@ impl App {
             .min(size.height);
         let top_height = size.height - bottom_height;
         self.view
-            .set_live(self.tail_lines(usize::from(size.width.max(1))));
+            .set_live(self.tail_rows(usize::from(size.width.max(1))));
         self.header_art(now);
         self.view.prepare(&self.cells, size.width, top_height);
         bottom.push(self.footer(usize::from(size.width)));
@@ -1064,6 +1183,11 @@ impl App {
             top_height + u16::try_from(input_top).unwrap_or(0) + input_cursor.y,
         );
         self.write_title(term.backend_mut())?;
+        // Copies for the terminal's clipboard, written with the frame:
+        // only the renderer writes escape sequences (ui-plan 7).
+        for sequence in std::mem::take(&mut self.osc52) {
+            term.backend_mut().write_all(sequence.as_bytes())?;
+        }
         let caret = (cursor.y < size.height && cursor.x < size.width).then_some(cursor);
         let (cells, view) = (&self.cells, &mut self.view);
         term.draw(|frame| {
@@ -1123,11 +1247,12 @@ impl App {
     }
 
     /// The transcript's live tail: what the turn is writing, drawn as the
-    /// cells it becomes will draw it, so moving up into them moves no row.
-    fn tail_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
+    /// cells it becomes will draw it, so moving up into them moves no row;
+    /// each row with how a copy reads it.
+    fn tail_rows(&self, width: usize) -> Vec<Row> {
+        let mut rows = Vec::new();
         let Some(turn) = &self.turn else {
-            return lines;
+            return rows;
         };
         if self.show_think && !turn.reasoning.trim().is_empty() {
             let live = Reasoning {
@@ -1135,15 +1260,15 @@ impl App {
                 took: None,
                 shown: true,
             };
-            lines.extend(live.rows(width, false).into_iter().map(|r| r.line));
+            rows.extend(live.rows(width, false));
         }
         let tail = &turn.answer[turn.committed..];
         if !tail.trim().is_empty() {
-            let rows = Cell::answer(tail, self.markdown).rows(width, false);
+            let answer = Cell::answer(tail, self.markdown).rows(width, false);
             // Going on from the answer's cell, the blank row its own cell
             // starts with is there only where the text has a blank line.
             let skip = turn.answer_cell.is_some() && !ends_blank(&turn.answer[..turn.committed]);
-            lines.extend(rows.into_iter().skip(usize::from(skip)).map(|r| r.line));
+            rows.extend(answer.into_iter().skip(usize::from(skip)));
         }
         let elapsed = turn.started.elapsed();
         let frame = (elapsed.as_millis() / SPINNER_FRAME.as_millis()) as usize % SPINNER.len();
@@ -1152,13 +1277,9 @@ impl App {
                 spinner: SPINNER[frame],
                 elapsed: started.elapsed(),
             };
-            lines.extend(
-                card.rows(width, false, Some(running))
-                    .into_iter()
-                    .map(|r| r.line),
-            );
+            rows.extend(card.rows(width, false, Some(running)));
         }
-        lines
+        rows
     }
 
     /// Messages waiting for the turn running to end, as Codex's
@@ -1222,6 +1343,10 @@ impl App {
             },
             rows_below: self.view.rows_below(),
             shell: self.composer.shell(),
+            copied: self
+                .copied
+                .as_ref()
+                .map(|(notice, failed, _)| (notice.as_str(), *failed)),
         };
         self.status.line(counts, width, Instant::now())
     }

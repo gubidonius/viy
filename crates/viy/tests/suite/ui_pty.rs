@@ -387,3 +387,67 @@ fn a_pasted_bang_is_a_message_and_runs_nothing() {
     assert!(!dir.path().join("ran.txt").exists());
     close(&pty, child);
 }
+
+/// A drag over the answer copies its text, and only its text (kb d150).
+/// With no desktop to reach (no DISPLAY, nor tmux or ssh), the copy goes
+/// to the terminal as OSC 52: the terminal's clipboard gets it once, and
+/// the footer says it was sent.
+#[test]
+fn a_drag_copies_the_answer_to_the_terminals_clipboard() {
+    use base64::Engine;
+    let answer = "the answer is forty-two\nand a second line";
+    let mock = one_turn(answer);
+    let dir = ScratchDir::new("ui-select").unwrap();
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = pty
+        .spawn(
+            Command::new(env!("CARGO_BIN_EXE_viy"))
+                .args(["dev", "chat", "--url", &mock.uri(), "--dir"])
+                .arg(dir.path())
+                .env("VLLM_API_KEY", "fake-key")
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .env_remove("SSH_TTY")
+                .env_remove("SSH_CONNECTION"),
+        )
+        .unwrap();
+    pty.wait_for("the input box", |s| {
+        s.alternate_screen() && s.contents().contains("› ")
+    });
+    send_and_answer(&pty, &mock, b"hello");
+    pty.wait_for("the whole answer", |s| {
+        s.contents().contains("and a second line")
+    });
+    let (first, last) = pty.with_screen(|parser| {
+        let rows = viy_testkit::screen::rows(parser.screen());
+        let at = |text: &str| rows.iter().position(|r| r.starts_with(text)).unwrap();
+        (at("the answer is"), at("and a second line"))
+    });
+    // SGR mouse reports, 1-based: press at the answer's first cell, drag
+    // through the rows, release on its last char.
+    let (top, bottom) = (first + 1, last + 1);
+    let end = "and a second line".len();
+    pty.send(format!("\x1b[<0;1;{top}M").as_bytes()).unwrap();
+    pty.send(format!("\x1b[<32;8;{top}M").as_bytes()).unwrap();
+    pty.send(format!("\x1b[<32;{end};{bottom}M").as_bytes())
+        .unwrap();
+    pty.send(format!("\x1b[<0;{end};{bottom}m").as_bytes())
+        .unwrap();
+    let chars = answer.chars().count();
+    pty.wait_for("the copy said", |s| {
+        s.contents()
+            .contains(&format!("sent {chars} chars to the terminal"))
+    });
+    let encoded = base64::engine::general_purpose::STANDARD.encode(answer);
+    pty.with_screen(|parser| {
+        let shown = dump(parser.screen());
+        assert_eq!(
+            foreign(parser),
+            [format!("clipboard copy \"c\" {encoded:?}")],
+            "{shown}"
+        );
+    });
+    close(&pty, child);
+}

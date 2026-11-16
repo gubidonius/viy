@@ -179,8 +179,14 @@ fn controls_in_the_text_are_drawn_visible() {
     assert_eq!(draw(&mut view, &[cell("a\x1b[2Jb")], 10, 1), ["a␛[2Jb"]);
 }
 
-fn live(rows: &[&str]) -> Vec<Line<'static>> {
-    rows.iter().map(|r| Line::from(r.to_string())).collect()
+fn live(rows: &[&str]) -> Vec<Row> {
+    rows.iter()
+        .map(|r| Row {
+            line: Line::from(r.to_string()),
+            key: (0, 0),
+            copy: CopyRule::default(),
+        })
+        .collect()
 }
 
 #[test]
@@ -243,4 +249,340 @@ fn read_back_into_the_tail_a_resize_keeps_its_row() {
     assert_eq!(draw(&mut view, &cells, 10, 2), ["b", "c"]);
     // The cell is two rows at 5 columns, not one: the tail's row stays.
     assert_eq!(draw(&mut view, &cells, 5, 2), ["b", "c"]);
+}
+
+// Selection (kb d150).
+
+const MESSAGE: &str = "explain how the tunnel guard restarts ssh\nthanks";
+
+/// `view` drawn into a `width` x `height` buffer.
+fn render(view: &mut TranscriptView, cells: &[Cell], width: u16, height: u16) -> Buffer {
+    let area = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(area);
+    view.render(cells, area, &mut buf);
+    buf
+}
+
+/// The reversed cells of screen row `y`, as `x` marks.
+fn reversed(buf: &Buffer, y: u16) -> String {
+    (0..buf.area.width)
+        .map(|x| {
+            if buf[(x, y)].modifier.contains(Modifier::REVERSED) {
+                'x'
+            } else {
+                '.'
+            }
+        })
+        .collect::<String>()
+        .trim_end_matches('.')
+        .to_string()
+}
+
+#[test]
+fn a_drag_selects_the_text_not_the_gutter_and_release_gives_it() {
+    let mut view = TranscriptView::default();
+    let cells = [Cell::user(MESSAGE)];
+    let now = Instant::now();
+    assert_eq!(
+        draw(&mut view, &cells, 24, 5),
+        [
+            "",
+            "you › explain how the",
+            "      tunnel guard",
+            "      restarts ssh",
+            "      thanks",
+        ]
+    );
+    // From the gutter of the first row to the end of `ssh`.
+    assert!(view.press(2, 1, false, now));
+    view.drag(10, 2);
+    view.drag(17, 3);
+    let buf = render(&mut view, &cells, 24, 5);
+    assert_eq!(reversed(&buf, 1), "......xxxxxxxxxxxxxxx");
+    assert_eq!(reversed(&buf, 2), "......xxxxxxxxxxxx");
+    assert_eq!(reversed(&buf, 3), "......xxxxxxxxxxxx");
+    assert_eq!(reversed(&buf, 4), "");
+    assert_eq!(
+        view.release(17, 3).as_deref(),
+        Some("explain how the tunnel guard restarts ssh")
+    );
+    // Released, it stays selected and drawn until something drops it.
+    assert!(view.has_selection());
+    // Dragged the other way, the same text.
+    view.clear_selection();
+    assert!(view.press(17, 3, false, now + Duration::from_secs(1)));
+    view.drag(6, 1);
+    assert_eq!(
+        view.release(6, 1).as_deref(),
+        Some("explain how the tunnel guard restarts ssh")
+    );
+}
+
+#[test]
+fn a_click_selects_nothing_and_drops_what_was_selected() {
+    let mut view = TranscriptView::default();
+    let cells = [Cell::user(MESSAGE)];
+    let now = Instant::now();
+    draw(&mut view, &cells, 24, 5);
+    view.press(6, 1, false, now);
+    view.drag(12, 1);
+    assert_eq!(view.release(12, 1).as_deref(), Some("explain"));
+    view.press(8, 2, false, now + Duration::from_secs(1));
+    assert_eq!(view.release(8, 2), None);
+    assert!(!view.has_selection());
+    // Off the rows (the blank space above a short transcript): no
+    // selection starts.
+    let mut short = TranscriptView::default();
+    draw(&mut short, &numbered(1), 10, 3);
+    assert!(!short.press(0, 0, false, now));
+    assert!(short.press(0, 2, false, now));
+}
+
+#[test]
+fn a_double_click_takes_a_word_and_a_triple_its_logical_line() {
+    let mut view = TranscriptView::default();
+    let cells = [Cell::user(MESSAGE)];
+    let now = Instant::now();
+    draw(&mut view, &cells, 24, 5);
+    view.press(8, 2, false, now);
+    view.release(8, 2);
+    view.press(8, 2, false, now + Duration::from_millis(100));
+    assert_eq!(view.release(8, 2).as_deref(), Some("tunnel"));
+    view.press(8, 2, false, now + Duration::from_millis(200));
+    assert_eq!(
+        view.release(8, 2).as_deref(),
+        Some("explain how the tunnel guard restarts ssh")
+    );
+    // Too slow, or elsewhere: a click again.
+    view.press(8, 2, false, now + Duration::from_secs(2));
+    assert_eq!(view.release(8, 2), None);
+}
+
+#[test]
+fn shift_click_moves_the_end_of_the_selection() {
+    let mut view = TranscriptView::default();
+    let cells = [Cell::user(MESSAGE)];
+    let now = Instant::now();
+    draw(&mut view, &cells, 24, 5);
+    view.press(6, 1, false, now);
+    view.drag(12, 1);
+    view.release(12, 1);
+    assert!(view.press(11, 4, true, now + Duration::from_secs(1)));
+    assert_eq!(
+        view.release(11, 4).as_deref(),
+        Some("explain how the tunnel guard restarts ssh\nthanks")
+    );
+}
+
+#[test]
+fn a_selection_holds_the_view_still_while_rows_arrive() {
+    let mut view = TranscriptView::default();
+    let now = Instant::now();
+    assert_eq!(
+        draw(&mut view, &numbered(10), 10, 3),
+        ["line 8", "line 9", "line 10"]
+    );
+    view.press(0, 1, false, now);
+    view.drag(5, 1);
+    assert_eq!(view.release(5, 1).as_deref(), Some("line 9"));
+    // New rows below do not move the text under the selection.
+    assert_eq!(
+        draw(&mut view, &numbered(12), 10, 3),
+        ["line 8", "line 9", "line 10"]
+    );
+    assert_eq!(view.selected_text().as_deref(), Some("line 9"));
+    assert_eq!(view.rows_below(), 2);
+    // Dropped, the view stays where it was read.
+    view.clear_selection();
+    assert_eq!(draw(&mut view, &numbered(12), 10, 3)[0], "line 8");
+}
+
+#[test]
+fn a_resize_or_ctrl_t_drops_the_selection() {
+    let mut view = TranscriptView::default();
+    let cells = [Cell::user(MESSAGE)];
+    let now = Instant::now();
+    draw(&mut view, &cells, 24, 5);
+    view.press(6, 1, false, now);
+    view.drag(12, 1);
+    view.release(12, 1);
+    draw(&mut view, &cells, 30, 5);
+    assert!(!view.has_selection());
+    draw(&mut view, &cells, 30, 5);
+    view.press(6, 1, false, now + Duration::from_secs(1));
+    view.drag(12, 1);
+    view.release(12, 1);
+    view.set_expanded(true);
+    assert!(!view.has_selection());
+}
+
+#[test]
+fn a_drag_held_at_the_top_scrolls_back_and_takes_the_selection_along() {
+    let mut view = TranscriptView::default();
+    let cells = numbered(10);
+    let now = Instant::now();
+    draw(&mut view, &cells, 10, 3);
+    view.press(6, 2, false, now);
+    // Along the row pressed: no scrolling.
+    view.drag(0, 2);
+    assert_eq!(view.next_edge_scroll(now), None);
+    view.drag(0, 0);
+    assert_eq!(view.next_edge_scroll(now), Some(now));
+    assert!(view.tick_edge(now));
+    assert!(!view.tick_edge(now + Duration::from_millis(10)));
+    assert!(view.tick_edge(now + EDGE_SCROLL));
+    assert_eq!(
+        draw(&mut view, &cells, 10, 3),
+        ["line 6", "line 7", "line 8"]
+    );
+    assert_eq!(
+        view.release(0, 0).as_deref(),
+        Some("line 6\nline 7\nline 8\nline 9\nline 10")
+    );
+    assert_eq!(view.next_edge_scroll(now), None);
+}
+
+#[test]
+fn the_live_tail_can_be_selected() {
+    let mut view = TranscriptView::default();
+    let cells = numbered(1);
+    view.set_live(live(&["live a", "live b"]));
+    let now = Instant::now();
+    assert_eq!(
+        draw(&mut view, &cells, 10, 3),
+        ["line 1", "live a", "live b"]
+    );
+    view.press(0, 0, false, now);
+    view.drag(5, 2);
+    assert_eq!(
+        view.release(5, 2).as_deref(),
+        Some("line 1\nlive a\nlive b")
+    );
+}
+
+#[test]
+fn text_changing_under_a_selection_drops_it() {
+    let mut view = TranscriptView::default();
+    let cells = numbered(1);
+    view.set_live(live(&["live a", "live b"]));
+    let now = Instant::now();
+    draw(&mut view, &cells, 10, 3);
+    view.press(0, 2, false, now);
+    view.drag(5, 2);
+    assert_eq!(view.release(5, 2).as_deref(), Some("live b"));
+    // Rows arriving below leave it.
+    view.set_live(live(&["live a", "live b", "live c"]));
+    draw(&mut view, &cells, 10, 3);
+    assert!(view.has_selection());
+    // Its row drawn anew with other text: dropped.
+    view.set_live(live(&["live a", "live B", "live c"]));
+    draw(&mut view, &cells, 10, 3);
+    assert!(!view.has_selection());
+    // A cell laid out again with other rows, the same.
+    let mut view = TranscriptView::default();
+    let mut cells = vec![cell("one"), cell("two")];
+    draw(&mut view, &cells, 10, 3);
+    view.press(0, 2, false, now + Duration::from_secs(1));
+    view.drag(2, 2);
+    assert_eq!(view.release(2, 2).as_deref(), Some("two"));
+    cells[0] = cell("one\nmore");
+    view.changed(0);
+    draw(&mut view, &cells, 10, 3);
+    assert!(!view.has_selection());
+}
+
+#[test]
+fn a_drag_over_nothing_a_copy_takes_selects_nothing() {
+    let mut view = TranscriptView::default();
+    let cells = [Cell::user(MESSAGE)];
+    let now = Instant::now();
+    draw(&mut view, &cells, 24, 5);
+    // Within the `you › ` gutter.
+    view.press(0, 1, false, now);
+    view.drag(4, 1);
+    assert!(!view.has_selection());
+    assert_eq!(view.release(4, 1), None);
+    assert!(!view.has_selection());
+}
+
+#[test]
+fn shift_click_at_an_edge_does_not_scroll() {
+    let mut view = TranscriptView::default();
+    let cells = numbered(10);
+    let now = Instant::now();
+    draw(&mut view, &cells, 10, 3);
+    view.press(0, 1, false, now);
+    view.drag(5, 1);
+    view.release(5, 1);
+    assert!(view.press(3, 2, true, now + Duration::from_secs(1)));
+    assert_eq!(view.next_edge_scroll(now), None);
+    assert!(!view.tick_edge(now + Duration::from_secs(1)));
+}
+
+#[test]
+fn a_drag_held_at_the_bottom_keeps_the_view_held_and_ends_under_the_pointer() {
+    let mut view = TranscriptView::default();
+    let mut cells = numbered(10);
+    let now = Instant::now();
+    draw(&mut view, &cells, 10, 3);
+    view.scroll_up(3);
+    assert_eq!(
+        draw(&mut view, &cells, 10, 3),
+        ["line 5", "line 6", "line 7"]
+    );
+    view.press(0, 0, false, now);
+    view.drag(3, 2);
+    assert!(view.tick_edge(now));
+    assert_eq!(
+        draw(&mut view, &cells, 10, 3),
+        ["line 6", "line 7", "line 8"]
+    );
+    // The end follows the pointer's cell, column 3 of the row under it.
+    assert_eq!(
+        view.selected_text().as_deref(),
+        Some("line 5\nline 6\nline 7\nline")
+    );
+    for n in 1..=3 {
+        view.tick_edge(now + EDGE_SCROLL * n);
+    }
+    assert_eq!(
+        draw(&mut view, &cells, 10, 3),
+        ["line 8", "line 9", "line 10"]
+    );
+    // At the end: nothing to scroll, no more frames asked for.
+    assert!(!view.tick_edge(now + EDGE_SCROLL * 4));
+    assert_eq!(view.next_edge_scroll(now + EDGE_SCROLL * 5), None);
+    // Still held: rows arriving do not move the text.
+    cells = numbered(12);
+    assert_eq!(
+        draw(&mut view, &cells, 10, 3),
+        ["line 8", "line 9", "line 10"]
+    );
+    assert!(!view.is_following());
+}
+
+#[test]
+fn a_short_transcript_keeps_its_place_while_a_selection_is_live() {
+    let mut view = TranscriptView::default();
+    let now = Instant::now();
+    assert_eq!(
+        draw(&mut view, &numbered(2), 10, 5),
+        ["", "", "", "line 1", "line 2"]
+    );
+    view.press(0, 3, false, now);
+    view.drag(5, 3);
+    assert_eq!(view.release(5, 3).as_deref(), Some("line 1"));
+    // New rows go below; `line 1` stays on the screen row it was on.
+    assert_eq!(
+        draw(&mut view, &numbered(4), 10, 5),
+        ["", "", "", "line 1", "line 2"]
+    );
+    assert_eq!(view.rows_below(), 2);
+    assert_eq!(view.selected_text().as_deref(), Some("line 1"));
+    // Dropped, it goes back to the bottom.
+    view.clear_selection();
+    assert_eq!(
+        draw(&mut view, &numbered(4), 10, 5),
+        ["", "line 1", "line 2", "line 3", "line 4"]
+    );
 }

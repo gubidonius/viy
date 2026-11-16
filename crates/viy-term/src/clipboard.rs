@@ -12,12 +12,15 @@
 //! middle-click, on a local X11 display only.
 //!
 //! The desktop's clipboard can block. One thread does every clipboard
-//! call; the UI never waits for it longer than [`BUDGET`], and while the
-//! thread is stuck a new request is refused as busy. The OSC 52 sequence
+//! call; the UI never waits for it longer than [`BUDGET`]. A thread that
+//! did not answer in time is left behind, its answer dropped when it
+//! comes, and the next request starts a new one, so a stuck X server
+//! costs one copy, not every copy after it. The OSC 52 sequence
 //! comes back to the UI, which writes it with its frames: only the
 //! renderer writes escape sequences (ui-plan 7), and this one is built
 //! here from constants, the text in base64.
 
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -249,7 +252,7 @@ impl Done {
         };
         Some(match result {
             Ok(Delivery::Copied) => format!("copied {what}"),
-            Ok(Delivery::Sent) => format!("sent {what} to the terminal's clipboard"),
+            Ok(Delivery::Sent) => format!("sent {what} to the terminal"),
             Err(error) => format!("not copied: {error}"),
         })
     }
@@ -266,6 +269,23 @@ pub enum Refused {
     Remote,
     /// The worker could not start, or stopped.
     Stopped(String),
+}
+
+impl Refused {
+    /// Why, in a few words.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Empty => "nothing selected",
+            Self::Busy => "the clipboard is busy",
+            Self::Remote => "not over ssh",
+            Self::Stopped(why) => why,
+        }
+    }
+
+    /// What the footer says of a copy refused.
+    pub fn copy_notice(&self) -> String {
+        format!("not copied: {}", self.reason())
+    }
 }
 
 enum Request {
@@ -287,17 +307,15 @@ struct Pending {
     ask: Ask,
     chars: usize,
     deadline: Instant,
-    /// Given up on: its answer is dropped when it comes.
-    expired: bool,
 }
 
-type Make = Box<dyn FnOnce() -> Box<dyn Backend> + Send>;
+type Make = Arc<dyn Fn() -> Box<dyn Backend> + Send + Sync>;
 
 /// The UI's side: requests go to the clipboard's thread, answers come
 /// back through [`Clipboard::done`].
 pub struct Clipboard {
     place: Place,
-    make: Option<Make>,
+    make: Make,
     requests: Option<std_mpsc::Sender<Request>>,
     answers_tx: mpsc::UnboundedSender<Done>,
     answers: mpsc::UnboundedReceiver<Done>,
@@ -314,12 +332,12 @@ impl Clipboard {
     }
 
     /// `make` builds the backend on the clipboard's thread, at the first
-    /// request.
-    pub fn with(place: Place, make: impl FnOnce() -> Box<dyn Backend> + Send + 'static) -> Self {
+    /// request and again for a thread started after one got stuck.
+    pub fn with(place: Place, make: impl Fn() -> Box<dyn Backend> + Send + Sync + 'static) -> Self {
         let (answers_tx, answers) = mpsc::unbounded_channel();
         Self {
             place,
-            make: Some(Box::new(make)),
+            make: Arc::new(make),
             requests: None,
             answers_tx,
             answers,
@@ -385,15 +403,15 @@ impl Clipboard {
             ask,
             chars,
             deadline: Instant::now() + BUDGET,
-            expired: false,
         });
         Ok(id)
     }
 
     fn start(&mut self) -> Result<(), Refused> {
-        let Some(make) = self.make.take() else {
+        if self.requests.is_some() {
             return Ok(());
-        };
+        }
+        let make = Arc::clone(&self.make);
         let (requests, incoming) = std_mpsc::channel::<Request>();
         let (finished_tx, finished) = std_mpsc::channel::<()>();
         let answers = self.answers_tx.clone();
@@ -451,23 +469,24 @@ impl Clipboard {
     /// Cancel-safe: it changes nothing until it returns.
     pub async fn done(&mut self) -> Done {
         loop {
-            let deadline = self.pending.filter(|p| !p.expired).map(|p| p.deadline);
+            let deadline = self.pending.map(|p| p.deadline);
             tokio::select! {
                 answer = self.answers.recv() => {
                     // A sender is kept here, so the channel never closes.
+                    // An answer to a request given up on is dropped.
                     let Some(answer) = answer else { continue };
-                    let Some(pending) = self.pending.filter(|p| p.id == answer.id()) else {
-                        continue;
-                    };
-                    self.pending = None;
-                    if !pending.expired {
+                    if self.pending.is_some_and(|p| p.id == answer.id()) {
+                        self.pending = None;
                         return answer;
                     }
                 }
                 () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
-                    if let Some(pending) = &mut self.pending {
-                        pending.expired = true;
-                        return timed_out(*pending);
+                    if let Some(pending) = self.pending.take() {
+                        // Left behind: its answer is dropped when it comes,
+                        // and the next request starts a new thread.
+                        self.requests = None;
+                        self.finished = None;
+                        return timed_out(pending);
                     }
                 }
             }

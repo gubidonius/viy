@@ -94,6 +94,7 @@ fn narrow_drops_the_least_important_first() {
         queued: 1,
         rows_below: 21,
         shell: None,
+        copied: None,
     };
     let wide = text(&s.line(counts, 200, now));
     assert_eq!(
