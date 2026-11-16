@@ -34,6 +34,7 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Span;
 
+use crate::copytext::CopyRule;
 use crate::latex::latex;
 use crate::wrap::text_width;
 use crate::wrap::wrap_rows;
@@ -46,11 +47,12 @@ const MIN_COLUMN: usize = 6;
 
 /// One drawn row and where it comes from: a key that grows down the
 /// rows, so a reading position survives a new width (the source offset of
-/// its line, then its offset in the line).
+/// its line, then its offset in the line), and how a copy reads it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub line: Line<'static>,
     pub key: (usize, usize),
+    pub copy: CopyRule,
 }
 
 fn options() -> Options {
@@ -314,6 +316,13 @@ struct Logical {
     key: usize,
     /// Cut between graphemes, not words.
     code: bool,
+    /// A code block's frame, which a copy leaves out.
+    frame: bool,
+    /// Cells at the start of `spans` that a copy leaves out: the four
+    /// spaces drawn before indented code.
+    lead: usize,
+    /// `first` holds a list item's marker.
+    marker: bool,
 }
 
 #[derive(Default)]
@@ -479,8 +488,7 @@ impl<'a> Writer<'a> {
                     } else {
                         format!("╭─ {lang}")
                     };
-                    self.inline(Span::styled(head, dim()));
-                    self.flush_line();
+                    self.frame(head);
                 }
                 self.code = Some((String::new(), start, fenced));
             }
@@ -726,15 +734,29 @@ impl<'a> Writer<'a> {
                     format!("    {line}")
                 };
                 self.new_line(true);
+                if let Some(logical) = &mut self.line
+                    && !fenced
+                {
+                    logical.lead = 4;
+                }
                 self.inline(Span::styled(line, code_style()));
                 self.flush_line();
             }
         }
         if fenced {
             self.at = offset;
-            self.inline(Span::styled("╰─", dim()));
-            self.flush_line();
+            self.frame("╰─".to_string());
         }
+    }
+
+    /// A row of a code block's frame.
+    fn frame(&mut self, text: String) {
+        self.new_line(false);
+        if let Some(line) = &mut self.line {
+            line.frame = true;
+        }
+        self.inline(Span::styled(text, dim()));
+        self.flush_line();
     }
 
     /// A block starts at `start`: the line before it ends, and a blank row
@@ -750,7 +772,8 @@ impl<'a> Writer<'a> {
                 .filter(|i| i.quote)
                 .flat_map(|i| i.rest.clone())
                 .collect();
-            self.push_row(Line::from(bars), (start, 0));
+            let copy = CopyRule::row(spans_width(&bars), None);
+            self.push_row(Line::from(bars), (start, 0), copy);
         }
     }
 
@@ -792,12 +815,14 @@ impl<'a> Writer<'a> {
         self.flush_line();
         let mut first = Vec::new();
         let mut rest = Vec::new();
+        let mut marker = false;
         for indent in &mut self.indents {
             if indent.used {
                 first.extend(indent.rest.iter().cloned());
             } else {
                 first.extend(indent.first.iter().cloned());
                 indent.used = true;
+                marker |= !indent.quote;
             }
             rest.extend(indent.rest.iter().cloned());
         }
@@ -807,6 +832,9 @@ impl<'a> Writer<'a> {
             spans: Vec::new(),
             key: self.at,
             code,
+            frame: false,
+            lead: 0,
+            marker,
         });
     }
 
@@ -821,42 +849,61 @@ impl<'a> Writer<'a> {
             return;
         };
         let room = self.width.saturating_sub(spans_width(&line.first)).max(1);
-        let pieces: Vec<(Vec<Span<'static>>, usize)> = if line.code {
+        // Each piece, where it starts in the line, and what a wrap took
+        // out before it (code is cut between graphemes: nothing).
+        let pieces: Vec<(Vec<Span<'static>>, usize, Option<usize>)> = if line.code {
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let style = line.spans.first().map(|s| s.style).unwrap_or_default();
             let mut offset = 0;
             wrap_rows(&Line::from(Span::styled(text, style)), room)
                 .into_iter()
-                .map(|(row, chars)| {
+                .enumerate()
+                .map(|(i, (row, chars))| {
                     let at = offset;
                     offset += chars;
-                    (row.spans, at)
+                    (row.spans, at, (i > 0).then_some(0))
                 })
                 .collect()
         } else {
             wrap_spans(&line.spans, room)
                 .into_iter()
-                .map(|row| (row.spans, row.start))
+                .map(|row| (row.spans, row.start, row.wrap))
                 .collect()
         };
-        for (i, (spans, at)) in pieces.into_iter().enumerate() {
+        for (i, (spans, at, wrap)) in pieces.into_iter().enumerate() {
+            // Prose keeps the list marker or quote bar of its first row;
+            // code is copied without its indents, so it pastes as written.
+            // The hanging indent of the rows a wrap made is never text. A
+            // frame is left out, but for an item's marker on it.
+            let decor = if i > 0 {
+                spans_width(&line.rest)
+            } else if line.code {
+                spans_width(&line.first) + line.lead
+            } else {
+                0
+            };
+            let copy = match (line.frame, i) {
+                (true, 0) if line.marker => CopyRule::upto(spans_width(&line.first)),
+                (true, _) => CopyRule::OMIT,
+                (false, _) => CopyRule::row(decor, wrap),
+            };
             let mut all = if i == 0 {
                 line.first.clone()
             } else {
                 line.rest.clone()
             };
             all.extend(spans);
-            self.push_row(Line::from(all), (line.key, at));
+            self.push_row(Line::from(all), (line.key, at), copy);
         }
     }
 
-    fn push_row(&mut self, line: Line<'static>, mut key: (usize, usize)) {
+    fn push_row(&mut self, line: Line<'static>, mut key: (usize, usize), copy: CopyRule) {
         if let Some(last) = self.rows.last()
             && key <= last.key
         {
             key = (last.key.0, last.key.1 + 1);
         }
-        self.rows.push(Row { line, key });
+        self.rows.push(Row { line, key, copy });
     }
 
     /// A finished table: boxed, or as records when it can't fit.
@@ -876,19 +923,26 @@ impl<'a> Writer<'a> {
         let (lines, boxed) = table_lines(table.head, table.body, &table.aligns, width);
         let mut n = 0;
         for line in lines {
-            // A box fits by construction; a record wraps like prose.
+            // A box fits by construction; a record wraps like prose, and a
+            // copy joins its rows again without their indent.
             let rows = if boxed {
-                vec![line.spans]
+                vec![(line.spans, None)]
             } else {
                 wrap_spans(&line.spans, width)
                     .into_iter()
-                    .map(|r| r.spans)
+                    .map(|r| (r.spans, r.wrap))
                     .collect()
             };
-            for spans in rows {
+            for (spans, wrap) in rows {
+                let decor = if wrap.is_some() {
+                    spans_width(&rest)
+                } else {
+                    0
+                };
+                let copy = CopyRule::row(decor, wrap);
                 let mut all = if n == 0 { first.clone() } else { rest.clone() };
                 all.extend(spans);
-                self.push_row(Line::from(all), (table.start, n));
+                self.push_row(Line::from(all), (table.start, n), copy);
                 n += 1;
             }
         }

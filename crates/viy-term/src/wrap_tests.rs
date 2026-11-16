@@ -157,3 +157,36 @@ fn columns_and_positions_map_both_ways() {
     assert_eq!(row_of(&rows, 5), 0);
     assert_eq!(row_of(&rows, 6), 1);
 }
+
+#[test]
+fn span_rows_say_what_a_wrap_took_out() {
+    let wraps = |text: &str, width| -> Vec<(String, Option<usize>)> {
+        wrap_spans(&[Span::raw(text.to_string())], width)
+            .into_iter()
+            .map(|r| {
+                (
+                    r.spans.iter().map(|s| s.content.to_string()).collect(),
+                    r.wrap,
+                )
+            })
+            .collect()
+    };
+    // The spaces at a word break, two kept as two.
+    assert_eq!(
+        wraps("one two  three", 7),
+        [
+            ("one two".to_string(), None),
+            ("three".to_string(), Some(2)),
+        ]
+    );
+    // A word cut by the width: nothing between.
+    assert_eq!(
+        wraps("abcdefgh", 5),
+        [("abcde".to_string(), None), ("fgh".to_string(), Some(0)),]
+    );
+    // A newline starts a line, not a wrap.
+    assert_eq!(
+        wraps("ab\ncd", 10),
+        [("ab".to_string(), None), ("cd".to_string(), None)]
+    );
+}

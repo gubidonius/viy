@@ -7,6 +7,7 @@
 pub mod app;
 pub mod cells;
 pub mod composer;
+pub mod copytext;
 pub mod footer;
 pub mod frame;
 pub mod header;

@@ -22,6 +22,7 @@ use viy_protocol::NoticeLevel;
 use viy_protocol::ToolCallEndEvent;
 use viy_protocol::ToolCallStatus;
 
+use crate::copytext::CopyRule;
 use crate::markdown;
 use crate::markdown::Row;
 use crate::wrap::text_width;
@@ -33,6 +34,8 @@ use crate::wrap::wrap_spans;
 pub const TOOL_TAIL: usize = 3;
 /// The gutter of your messages.
 const YOU: &str = "you › ";
+/// The label of a reasoning trace drawn whole.
+const THINKING: &str = "[thinking] ";
 
 /// What goes before a cell's first row and before the others.
 #[derive(Debug, Clone, PartialEq)]
@@ -173,9 +176,13 @@ impl Cell {
                     .map(|(i, line)| Row {
                         line,
                         key: (i + 1, 0),
+                        copy: CopyRule::OMIT,
                     })
                     .collect();
-                rows.push(blank_row());
+                rows.push(Row {
+                    copy: CopyRule::OMIT,
+                    ..blank_row()
+                });
                 rows
             }
         }
@@ -186,10 +193,12 @@ fn blank_row() -> Row {
     Row {
         line: Line::default(),
         key: (0, 0),
+        copy: CopyRule::default(),
     }
 }
 
 /// `lines` word-wrapped behind `gutter`; keys are (line + 1, byte offset).
+/// A copy leaves the gutter out and joins the rows a wrap made.
 fn lines_rows(
     lines: &[Line<'static>],
     gutter: Option<&Gutter>,
@@ -212,10 +221,12 @@ fn lines_rows(
                     g.rest.clone()
                 });
             }
+            let decor = spans.iter().map(|s| text_width(&s.content)).sum();
             spans.extend(row.spans);
             rows.push(Row {
                 line: Line::from(spans).style(line.style),
                 key: (i + 1, row.start),
+                copy: CopyRule::row(decor, row.wrap),
             });
         }
     }
@@ -226,8 +237,8 @@ fn answer_rows(source: &str, markdown: bool, width: usize) -> Vec<Row> {
     let mut rows = vec![blank_row()];
     if markdown {
         rows.extend(markdown::render(source, width).into_iter().map(|row| Row {
-            line: row.line,
             key: (row.key.0 + 1, row.key.1),
+            ..row
         }));
     } else {
         let lines: Vec<Line<'static>> = source
@@ -241,6 +252,8 @@ fn answer_rows(source: &str, markdown: bool, width: usize) -> Vec<Row> {
 }
 
 impl Reasoning {
+    /// The trace behind `[thinking] `, or one line saying the model
+    /// thought; a copy takes the trace without its label, and not the line.
     pub fn rows(&self, width: usize, expanded: bool) -> Vec<Row> {
         if (self.shown || expanded) && !self.text.trim().is_empty() {
             let style = Style::new().add_modifier(Modifier::DIM | Modifier::ITALIC);
@@ -252,13 +265,18 @@ impl Reasoning {
                 .map(|(i, l)| {
                     let mut spans = Vec::new();
                     if i == 0 {
-                        spans.push("[thinking] ".dim());
+                        spans.push(THINKING.dim());
                     }
                     spans.push(Span::styled(l.to_string(), style));
                     Line::from(spans)
                 })
                 .collect();
-            return lines_rows(&lines, None, true, width);
+            let mut rows = lines_rows(&lines, None, true, width);
+            // Row 0 is the blank row; the label starts row 1.
+            if let Some(first) = rows.get_mut(1) {
+                first.copy.decor = text_width(THINKING);
+            }
+            return rows;
         }
         let took = self
             .took
@@ -269,7 +287,11 @@ impl Reasoning {
         } else {
             format!("thought{took} · Ctrl-T shows it")
         };
-        lines_rows(&[Line::from(text.dim().italic())], None, false, width)
+        let mut rows = lines_rows(&[Line::from(text.dim().italic())], None, false, width);
+        for row in &mut rows {
+            row.copy = CopyRule::OMIT;
+        }
+        rows
     }
 }
 
@@ -308,7 +330,7 @@ impl ToolCard {
     /// [`TOOL_TAIL`] lines, or all of them when `expanded`. Keys are the
     /// row numbers.
     pub fn rows(&self, width: usize, expanded: bool, running: Option<Running<'_>>) -> Vec<Row> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut lines: Vec<(Line<'static>, CopyRule)> = Vec::new();
         let (marker, meta) = match (running, &self.end) {
             (Some(run), _) => (
                 run.spinner.to_string().magenta(),
@@ -330,10 +352,11 @@ impl ToolCard {
         if !meta.is_empty() && head_width + 2 + meta_width <= width {
             head.push(Span::raw(" ".repeat(width - head_width - meta_width)));
             head.push(meta.dim());
+            // It fits one row; a copy stops before the padding.
             lines.extend(
                 wrap_spans(&head, width)
                     .into_iter()
-                    .map(|r| Line::from(r.spans)),
+                    .map(|r| (Line::from(r.spans), CopyRule::upto(head_width))),
             );
         } else {
             if !meta.is_empty() {
@@ -349,21 +372,28 @@ impl ToolCard {
                 } else {
                     vec![Span::raw("    ")]
                 };
+                let decor = spans.iter().map(|s| text_width(&s.content)).sum();
+                let copy = CopyRule::row(decor, row.wrap);
                 spans.extend(row.spans);
-                lines.push(Line::from(spans));
+                lines.push((Line::from(spans), copy));
             }
         }
         lines.extend(self.output_lines(width, expanded && running.is_none()));
         lines
             .into_iter()
             .enumerate()
-            .map(|(n, line)| Row { line, key: (n, 0) })
+            .map(|(n, (line, copy))| Row {
+                line,
+                key: (n, 0),
+                copy,
+            })
             .collect()
     }
 
     /// The output under the header: `  └ ` before the first row, cut
-    /// between graphemes (logs and code keep their columns).
-    fn output_lines(&self, width: usize, all: bool) -> Vec<Line<'static>> {
+    /// between graphemes (logs and code keep their columns). A copy takes
+    /// the output without the prefix, nor the "+N lines" hint.
+    fn output_lines(&self, width: usize, all: bool) -> Vec<(Line<'static>, CopyRule)> {
         let text = self.output.trim_end_matches('\n');
         if text.is_empty() {
             return Vec::new();
@@ -375,25 +405,33 @@ impl ToolCard {
             TOOL_TAIL.min(lines.len())
         };
         let hidden = lines.len() - shown;
-        let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut rows: Vec<(Line<'static>, CopyRule)> = Vec::new();
         if hidden > 0 {
-            rows.push(Line::from(
-                format!("… +{hidden} lines (Ctrl-T shows all)").dim(),
+            rows.push((
+                Line::from(format!("… +{hidden} lines (Ctrl-T shows all)").dim()),
+                CopyRule::OMIT,
             ));
         }
         let room = width.saturating_sub(4).max(1);
         for line in &lines[hidden..] {
-            for (row, _) in wrap_rows(&Line::from(line.to_string().dim()), room) {
-                rows.push(row);
+            for (k, (row, _)) in wrap_rows(&Line::from(line.to_string().dim()), room)
+                .into_iter()
+                .enumerate()
+            {
+                rows.push((row, CopyRule::row(0, (k > 0).then_some(0))));
             }
         }
         rows.into_iter()
             .enumerate()
-            .map(|(i, row)| {
+            .map(|(i, (row, copy))| {
                 let prefix = if i == 0 { "  └ " } else { "    " };
                 let mut spans = vec![prefix.dim()];
                 spans.extend(row.spans);
-                Line::from(spans)
+                let copy = CopyRule {
+                    decor: text_width(prefix),
+                    ..copy
+                };
+                (Line::from(spans), copy)
             })
             .collect()
     }

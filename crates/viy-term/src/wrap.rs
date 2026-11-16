@@ -242,6 +242,11 @@ pub struct SpanRow {
     pub start: usize,
     /// Cells it takes.
     pub width: usize,
+    /// `Some` when the row goes on with the line of the row above, with
+    /// how many spaces the wrap dropped between them (0 where a word was
+    /// cut); `None` for a line's first row. A copy joins them again
+    /// ([`crate::copytext`]).
+    pub wrap: Option<usize>,
 }
 
 /// Word-wraps the styled `spans` of one line into rows at most `width`
@@ -258,19 +263,33 @@ pub fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<SpanRow> {
         at += span.content.len();
         ends.push(at);
     }
+    // The spaces the row before dropped at its end, if a wrap cut it.
+    let mut dropped: Option<usize> = None;
     word_wrap(&text, width)
         .into_iter()
         .map(|row| {
             let mut cells = row.cells;
-            cells.retain(|c| c.column + c.width <= width);
+            // Cells past the width come last: their columns only grow.
+            let mut kept = cells
+                .iter()
+                .take_while(|c| c.column + c.width <= width)
+                .count();
             if !row.ends_line {
-                while cells
-                    .last()
-                    .is_some_and(|c| c.drawn.chars().all(|ch| ch == ' '))
-                {
-                    cells.pop();
+                while kept > 0 && cells[kept - 1].drawn.chars().all(|ch| ch == ' ') {
+                    kept -= 1;
                 }
             }
+            let wrap = std::mem::replace(
+                &mut dropped,
+                (!row.ends_line).then(|| {
+                    cells[kept..]
+                        .iter()
+                        .flat_map(|c| c.drawn.chars())
+                        .filter(|&ch| ch == ' ')
+                        .count()
+                }),
+            );
+            cells.truncate(kept);
             let width = cells.last().map_or(0, |c| c.column + c.width);
             let mut out: Vec<Span<'static>> = Vec::new();
             let mut current = usize::MAX;
@@ -289,6 +308,7 @@ pub fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<SpanRow> {
                 spans: out,
                 start: row.range.start,
                 width,
+                wrap,
             }
         })
         .collect()
