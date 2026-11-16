@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod cells;
+pub mod clipboard;
 pub mod composer;
 pub mod copytext;
 pub mod footer;

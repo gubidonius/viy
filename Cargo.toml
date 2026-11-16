@@ -39,6 +39,9 @@ viy-tools = { path = "crates/viy-tools", version = "0.3.0" }
 # External crates are added when a work package first needs one, each version
 # recorded as a fact (ROADMAP phase 0).
 # preserve_order: object keys keep their order, as in Python dicts (kb d011).
+# The chat's clipboard, Codex's crate and version (kb d150): X11 only, so
+# without the image data and the Wayland data-control backend.
+arboard = { version = "3.6.1", default-features = false }
 # The endpoint key: Codex mints secrets with rand's OsRng and base64
 # (secrets/src/local.rs).
 base64 = "0.22.1"
