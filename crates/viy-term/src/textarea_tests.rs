@@ -174,3 +174,67 @@ fn up_and_down_move_by_screen_row_keeping_the_column() {
     assert!(!area.move_down(9));
     assert_eq!(area.cursor(), area.text().len());
 }
+
+#[test]
+fn a_selection_is_replaced_by_typing_and_taken_by_backspace_or_cut() {
+    let mut t = TextArea::default();
+    t.set_text("hello wide world");
+    t.select(6, 10);
+    assert_eq!(t.selected(), Some("wide"));
+    t.insert_char('W');
+    assert_eq!(t.text(), "hello W world");
+    assert_eq!(t.selection(), None);
+    t.select(13, 8);
+    assert_eq!(t.selected(), Some("world"));
+    t.backspace();
+    assert_eq!(t.text(), "hello W ");
+    t.select(0, 5);
+    assert_eq!(t.take_selection().as_deref(), Some("hello"));
+    assert_eq!(t.text(), " W ");
+    // A move drops it, as does any other edit.
+    t.select(0, 2);
+    t.move_left();
+    assert_eq!(t.selection(), None);
+    // A paste replaces it, its newlines kept.
+    t.set_text("ab");
+    t.select(0, 2);
+    t.insert_str("x\r\ny");
+    assert_eq!(t.text(), "x\ny");
+}
+
+#[test]
+fn rows_map_back_to_text_and_a_selection_to_cells() {
+    let mut t = TextArea::default();
+    t.set_text("one two three four");
+    assert_eq!(t.layout(9).0, ["one two ", "three ", "four"]);
+    assert_eq!(t.pos_at(9, 1, 2), 10);
+    assert_eq!(t.pos_at(9, 5, 0), t.text().len());
+    assert_eq!(t.word_around(10), 8..13);
+    t.select(4, 13);
+    assert_eq!(t.selected(), Some("two three"));
+    assert_eq!(t.selected_cells(9), [(0, 4, 8), (1, 0, 5)]);
+    // A selection never cuts a grapheme.
+    t.set_text("e\u{301}x");
+    t.select(1, 4);
+    assert_eq!(t.selected(), Some("e\u{301}x"));
+}
+
+#[test]
+fn a_click_selects_nothing_and_a_row_move_drops_a_selection() {
+    let mut t = TextArea::default();
+    t.set_text("first line\nsecond line\nthird line");
+    t.layout(40);
+    // A click: the cursor moves, nothing is selected.
+    t.select(14, 14);
+    assert_eq!(t.selection(), None);
+    assert!(t.move_up(40));
+    assert_eq!(t.selection(), None);
+    t.select(12, 18);
+    assert!(t.move_down(40));
+    assert_eq!(t.selection(), None);
+    t.insert_char('x');
+    assert_eq!(
+        t.text().len(),
+        "first line\nsecond line\nthird line".len() + 1
+    );
+}

@@ -79,6 +79,7 @@ use crate::tabtitle;
 use crate::terminal::Terminal;
 use crate::transcript::Cell;
 use crate::transcript::TranscriptView;
+use crate::transcript::click_count;
 use crate::tui::Tui;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -208,6 +209,16 @@ pub struct App {
     /// OSC 52 sequences to write with the next frame: copies that went to
     /// the terminal's clipboard.
     osc52: Vec<String>,
+    /// The clipboard read a Ctrl+V, right-click or middle-click asked for;
+    /// a key or a paste before it comes cancels it.
+    pasting: Option<u64>,
+    /// Where the input box's rows were drawn: the screen row of the first
+    /// shown, which of its rows that is, and how many show.
+    input_at: (u16, usize, usize),
+    /// The left button went down in the input box.
+    input_drag: bool,
+    /// The last press in the input box: when, where, how many clicks.
+    input_click: Option<(Instant, u16, u16, u8)>,
 }
 
 /// How long the footer says what was copied.
@@ -228,6 +239,14 @@ fn is_copy_key(key: KeyEvent) -> bool {
     }
 }
 
+/// Ctrl and `letter`, not Alt (Ctrl+X cuts the input box's selection,
+/// Ctrl+V pastes the clipboard's text, kb d150).
+fn is_ctrl(key: KeyEvent, letter: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&letter))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
 impl App {
     /// The chat's screen; what is sent goes into `history`.
     pub fn new(ops: mpsc::UnboundedSender<Op>, history: History) -> Self {
@@ -235,6 +254,10 @@ impl App {
             clipboard: Clipboard::new(),
             copied: None,
             osc52: Vec::new(),
+            pasting: None,
+            input_at: (0, 0, 0),
+            input_drag: false,
+            input_click: None,
             ops,
             cells: Vec::new(),
             view: TranscriptView::default(),
@@ -330,24 +353,70 @@ impl App {
                     }
                     None => input_open = false,
                 },
-                done = self.clipboard.done() => self.copy_done(done),
+                done = self.clipboard.done() => self.clipboard_done(done),
                 () = sleep_until(frame), if frame.is_some() => self.draw(term),
             }
         }
     }
 
-    /// A copy came back: the footer says so, and one that went to the
-    /// terminal is written with the next frame.
-    fn copy_done(&mut self, done: Done) {
-        if let Done::Copy {
-            result, terminal, ..
-        } = &done
-        {
-            self.osc52.extend(terminal.clone());
-            if let Some(notice) = done.notice() {
-                self.copied = Some((notice, result.is_err(), Instant::now() + COPIED_SHOWN));
+    /// The clipboard answered. A copy: the footer says so, and one that
+    /// went to the terminal is written with the next frame. A read: its
+    /// text goes in as a paste, unless something was typed since.
+    fn clipboard_done(&mut self, done: Done) {
+        match &done {
+            Done::Copy {
+                result, terminal, ..
+            } => {
+                self.osc52.extend(terminal.clone());
+                if let Some(notice) = done.notice() {
+                    self.copied = Some((notice, result.is_err(), Instant::now() + COPIED_SHOWN));
+                }
             }
-            self.dirty = true;
+            Done::Read { id, result } => {
+                if self.pasting != Some(*id) {
+                    return;
+                }
+                match result {
+                    Ok(text) if !text.is_empty() => self.paste(text),
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.copied = Some((
+                            format!("not pasted: {error}"),
+                            true,
+                            Instant::now() + COPIED_SHOWN,
+                        ));
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Asks the clipboard for `selection`'s text, to paste when it comes.
+    fn start_paste(&mut self, selection: crate::clipboard::Selection) {
+        match self.clipboard.read(selection) {
+            Ok(id) => self.pasting = Some(id),
+            Err(refused) => {
+                self.copied = Some((
+                    format!("not pasted: {}", refused.reason()),
+                    true,
+                    Instant::now() + COPIED_SHOWN,
+                ));
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Text pasted: a bracketed paste, or the clipboard's for Ctrl+V and
+    /// the mouse. A secret in front takes it, no character reaching the
+    /// input box; otherwise it goes into the input box as one block whose
+    /// newlines never send, and counts as typing for a question box.
+    fn paste(&mut self, text: &str) {
+        self.view.clear_selection();
+        self.pasting = None;
+        if !self.questions.paste(text, Instant::now()) {
+            self.questions.typed(Instant::now());
+            self.composer.paste(text);
         }
     }
 
@@ -586,14 +655,7 @@ impl App {
                 return self.key(key, Instant::now());
             }
             Input::Key(_) => {}
-            Input::Paste(text) => {
-                self.view.clear_selection();
-                // A secret takes the paste; no character of it reaches the input box.
-                if !self.questions.paste(&text, Instant::now()) {
-                    self.questions.typed(Instant::now());
-                    self.composer.paste(&text);
-                }
-            }
+            Input::Paste(text) => self.paste(&text),
             Input::Mouse(mouse) => self.mouse(mouse),
             Input::Resize(width, height) => term.resize(Size::new(width, height)),
             Input::Terminate => self.close(),
@@ -606,35 +668,98 @@ impl App {
     }
 
     /// The mouse (kb d150): the wheel scrolls; the left button selects in
-    /// the transcript, Shift extending, and a release copies what it
-    /// selected. A press anywhere else drops the selection. The mouse
-    /// never reaches a question box, nor counts as typing.
+    /// the transcript (Shift extending) or in the input box (where a press
+    /// moves the cursor), and a release copies what it selected. A press
+    /// anywhere else drops the selections. The right button pastes the
+    /// clipboard, the middle one X11's PRIMARY where it is local (Codex's
+    /// Linux pastes), not while the rewind pick is open. The mouse never
+    /// answers a question box; the text a paste brings goes in as any
+    /// paste does, behind a box and restarting its guard (F37).
     fn mouse(&mut self, mouse: MouseEvent) {
         let now = Instant::now();
+        let (column, row) = (mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp => self.view.scroll_up(WHEEL_ROWS),
             MouseEventKind::ScrollDown => self.view.scroll_down(WHEEL_ROWS),
             MouseEventKind::Down(MouseButton::Left) => {
                 let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
-                if !self.view.press(mouse.column, mouse.row, shift, now) {
+                // A release that never came (outside the window) ends here.
+                self.input_drag = false;
+                if let Some((at, cell)) = self.input_cell(column, row, false) {
                     self.view.clear_selection();
+                    let clicks = click_count(&mut self.input_click, column, row, now);
+                    self.composer.press(at, cell, clicks);
+                    self.input_drag = true;
+                } else if self.view.press(column, row, shift, now) {
+                    self.composer.clear_selection();
+                } else {
+                    self.view.clear_selection();
+                    self.composer.clear_selection();
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) => self.view.drag(mouse.column, mouse.row),
-            MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(text) = self.view.release(mouse.column, mouse.row) {
+            MouseEventKind::Drag(MouseButton::Left) if self.input_drag => {
+                if let Some((at, cell)) = self.input_cell(column, row, true) {
+                    self.composer.drag(at, cell);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.view.drag(column, row),
+            MouseEventKind::Up(MouseButton::Left) if self.input_drag => {
+                self.input_drag = false;
+                if let Some((at, cell)) = self.input_cell(column, row, true) {
+                    self.composer.drag(at, cell);
+                }
+                if let Some(text) = self.composer.selected_text().map(str::to_string) {
                     self.copy(&text, true);
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = self.view.release(column, row) {
+                    self.copy(&text, true);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) if self.picking.is_none() => {
+                self.start_paste(crate::clipboard::Selection::Clipboard);
+            }
+            MouseEventKind::Down(MouseButton::Middle)
+                if self.picking.is_none() && self.clipboard.place().primary() =>
+            {
+                self.start_paste(crate::clipboard::Selection::Primary);
             }
             _ => return,
         }
         self.dirty = true;
     }
 
+    /// The input box's row and column under screen cell `column`, `row`
+    /// as last drawn; with `clamp`, the nearest when outside it.
+    fn input_cell(&self, column: u16, row: u16, clamp: bool) -> Option<(usize, usize)> {
+        let (top, first, count) = self.input_at;
+        if count == 0 {
+            return None;
+        }
+        let column = usize::from(column.saturating_sub(2));
+        let offset = i64::from(row) - i64::from(top);
+        let count_i = i64::try_from(count).unwrap_or(i64::MAX);
+        if (0..count_i).contains(&offset) {
+            return Some((first + usize::try_from(offset).unwrap_or(0), column));
+        }
+        if !clamp {
+            return None;
+        }
+        Some(if offset < 0 {
+            (first, 0)
+        } else {
+            (first + count - 1, usize::MAX)
+        })
+    }
+
     /// Takes a key pressed at `now` (the input box tells a keystroke paste
     /// from typing by the time between keys).
     fn key(&mut self, key: KeyEvent, now: Instant) -> Option<Flow> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // A key typed before a clipboard read comes back cancels the paste
+        // (Codex's right-click paste): typed text is never replaced.
+        self.pasting = None;
         // A selection (kb d150): with nothing in front of it, the copy key
         // copies it, without stopping, clearing or closing anything, and
         // Esc drops it. Any other key drops it and does what it does; a
@@ -658,6 +783,39 @@ impl App {
             if free && key.code == KeyCode::Esc {
                 return None;
             }
+        }
+        // The input box's selection: the copy key copies it and keeps the
+        // draft, Ctrl+X cuts it, Esc drops it; typing, Backspace, Delete
+        // and a paste replace it, other keys drop it.
+        let free = self.questions.front().is_none() && self.picking.is_none();
+        if free && self.composer.selected_text().is_some() {
+            let cut = is_ctrl(key, 'x');
+            if is_copy_key(key) || cut {
+                // While another request runs (the release's copy carries
+                // this text) nothing is copied, cut or dropped.
+                if self.clipboard.busy() {
+                    return None;
+                }
+                let text = if cut {
+                    self.composer.cut()
+                } else {
+                    let text = self.composer.selected_text().map(str::to_string);
+                    self.composer.clear_selection();
+                    text
+                };
+                if let Some(text) = text {
+                    self.copy(&text, false);
+                }
+                return None;
+            }
+            if key.code == KeyCode::Esc {
+                self.composer.clear_selection();
+                return None;
+            }
+        }
+        if is_ctrl(key, 'v') && self.picking.is_none() {
+            self.start_paste(crate::clipboard::Selection::Clipboard);
+            return None;
         }
         if self.picking.is_some() {
             self.pick_key(key);
@@ -1128,9 +1286,11 @@ impl App {
         // Codex's composer scrolls, so the footer stays on screen (a pasted
         // 268 KB message pushed it off, seen live 2026-07-18).
         let cap = room.saturating_sub(1).max(1);
+        let mut first_input = 0;
         if input_rows.len() > cap {
             let at = usize::from(input_cursor.y);
             let start = (at + 1).saturating_sub(cap).min(input_rows.len() - cap);
+            first_input = start;
             input_rows.drain(..start);
             input_rows.truncate(cap);
             input_cursor.y = u16::try_from(at - start).unwrap_or(0);
@@ -1161,6 +1321,7 @@ impl App {
             Some(Shell::Private) => "!!".magenta().bold(),
             None => "› ".cyan(),
         };
+        let input_count = input_rows.len();
         for (i, row) in input_rows.into_iter().enumerate() {
             let prefix = if i == 0 { prompt.clone() } else { "  ".into() };
             bottom.push(Line::from(vec![prefix, row.into()]));
@@ -1189,10 +1350,28 @@ impl App {
             term.backend_mut().write_all(sequence.as_bytes())?;
         }
         let caret = (cursor.y < size.height && cursor.x < size.width).then_some(cursor);
+        let input_y = top_height + u16::try_from(input_top).unwrap_or(0);
+        self.input_at = (input_y, first_input, input_count);
+        let selected = self.composer.selected_cells();
         let (cells, view) = (&self.cells, &mut self.view);
         term.draw(|frame| {
             view.render(cells, top, frame.buffer_mut());
             frame.render_widget(Paragraph::new(bottom), live_area);
+            // The input box's selection, reversed.
+            for (row, from, to) in selected {
+                let Some(shown) = row.checked_sub(first_input).filter(|&r| r < input_count) else {
+                    continue;
+                };
+                let y = input_y + u16::try_from(shown).unwrap_or(u16::MAX);
+                for x in from..to {
+                    let Some(x) = u16::try_from(x).ok().and_then(|x| x.checked_add(2)) else {
+                        break;
+                    };
+                    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                        cell.modifier.insert(Modifier::REVERSED);
+                    }
+                }
+            }
             if let Some(at) = caret {
                 frame.buffer_mut()[at].set_style(
                     Style::new().add_modifier(Modifier::REVERSED | Modifier::SLOW_BLINK),

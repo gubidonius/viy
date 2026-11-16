@@ -3,6 +3,9 @@
 //! keep the byte ranges they show (cached per width), moves by grapheme,
 //! word, line and screen row with a remembered column, and one kill buffer
 //! for Ctrl-K, Ctrl-U and the word deletions, which Ctrl-Y yanks back.
+//! A mouse selection (kb d150) runs from an anchor to the cursor: typing,
+//! Backspace, Delete and a paste replace it, a move or another edit drops
+//! it (Codex's textarea `mouse_selection`).
 //!
 //! The text is kept as typed or pasted, and sent so; what is drawn goes
 //! through the sanitizer (ui-plan 7, kb d076): a pasted escape shows as
@@ -29,6 +32,8 @@ pub struct TextArea {
     preferred: Option<usize>,
     /// What the last kill took.
     killed: String,
+    /// The other end of a mouse selection, the cursor being this one.
+    anchor: Option<usize>,
     /// The rows for the last width laid out.
     rows: RefCell<Option<(usize, Vec<TextRow>)>>,
 }
@@ -88,9 +93,11 @@ impl TextArea {
         std::mem::take(&mut self.text)
     }
 
-    /// Inserts typed or pasted text at the cursor; a paste's `\r\n` and `\r`
-    /// become newlines and never submit.
+    /// Inserts typed or pasted text at the cursor, in place of the
+    /// selection; a paste's `\r\n` and `\r` become newlines and never
+    /// submit.
     pub fn insert_str(&mut self, text: &str) {
+        self.take_selection();
         let text = normalize_newlines(text);
         self.text.insert_str(self.cursor, &text);
         self.cursor += text.len();
@@ -98,17 +105,24 @@ impl TextArea {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.take_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
         self.changed();
     }
 
     pub fn backspace(&mut self) {
+        if self.take_selection().is_some() {
+            return;
+        }
         let start = self.prev_boundary(self.cursor);
         self.remove(start..self.cursor);
     }
 
     pub fn delete(&mut self) {
+        if self.take_selection().is_some() {
+            return;
+        }
         let end = self.next_boundary(self.cursor);
         self.remove(self.cursor..end);
     }
@@ -250,6 +264,7 @@ impl TextArea {
             Some(pos) => {
                 self.cursor = pos;
                 self.preferred = Some(column);
+                self.anchor = None;
                 true
             }
             None => {
@@ -262,6 +277,7 @@ impl TextArea {
     fn move_to(&mut self, pos: usize) {
         self.cursor = pos;
         self.preferred = None;
+        self.anchor = None;
     }
 
     fn remove(&mut self, range: std::ops::Range<usize>) {
@@ -280,7 +296,100 @@ impl TextArea {
 
     fn changed(&mut self) {
         self.preferred = None;
+        self.anchor = None;
         *self.rows.get_mut() = None;
+    }
+
+    /// The selected bytes, if any are.
+    pub fn selection(&self) -> Option<std::ops::Range<usize>> {
+        let anchor = self.anchor.filter(|&a| a != self.cursor)?;
+        Some(anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    pub fn selected(&self) -> Option<&str> {
+        self.selection().map(|range| &self.text[range])
+    }
+
+    /// Selects from `anchor` to `cursor`, both put on the grapheme they
+    /// are in, the cursor at `cursor`; the same place for both selects
+    /// nothing and only moves the cursor.
+    pub fn select(&mut self, anchor: usize, cursor: usize) {
+        self.cursor = self.snap(cursor);
+        let anchor = self.snap(anchor);
+        self.anchor = (anchor != self.cursor).then_some(anchor);
+        self.preferred = None;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// Removes the selection and returns it (Ctrl+X, or what typing
+    /// replaces).
+    pub fn take_selection(&mut self) -> Option<String> {
+        let range = self.selection()?;
+        let taken = self.text[range.clone()].to_string();
+        self.remove(range);
+        Some(taken)
+    }
+
+    /// The byte offset drawn at `column` of row `row` at `width`; below
+    /// the last row, the end of the text.
+    pub fn pos_at(&self, width: u16, row: usize, column: usize) -> usize {
+        let rows = self.rows(usize::from(width.max(1)));
+        rows.get(row).map_or(self.text.len(), |r| r.pos_at(column))
+    }
+
+    /// The word (by Unicode's word bounds, a run of spaces counting as
+    /// one) and the line around `pos`, for a double and a triple click.
+    pub fn word_around(&self, pos: usize) -> std::ops::Range<usize> {
+        // Words never cross a line: only the line is looked at.
+        let start = self.line_start(pos);
+        self.text[start..self.line_end(pos)]
+            .split_word_bound_indices()
+            .map(|(at, word)| start + at..start + at + word.len())
+            .find(|range| range.contains(&pos))
+            .unwrap_or(pos..pos)
+    }
+
+    pub fn line_around(&self, pos: usize) -> std::ops::Range<usize> {
+        self.line_start(pos)..self.line_end(pos)
+    }
+
+    /// The cells the selection takes in each row at `width`: the row,
+    /// and its first and last column, the end not included.
+    pub fn selected_cells(&self, width: u16) -> Vec<(usize, usize, usize)> {
+        let Some(selection) = self.selection() else {
+            return Vec::new();
+        };
+        let rows = self.rows(usize::from(width.max(1)));
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.range.start < selection.end && row.range.end > selection.start)
+            .filter_map(|(n, row)| {
+                let mut cells = row
+                    .cells
+                    .iter()
+                    .filter(|c| c.range.start >= selection.start && c.range.end <= selection.end);
+                let first = cells.next()?;
+                let last = cells.next_back().unwrap_or(first);
+                Some((n, first.column, last.column + last.width))
+            })
+            .collect()
+    }
+
+    /// The start of the grapheme `pos` is in (`pos` on a char boundary),
+    /// found from the end of that char backwards, not from the text's
+    /// start.
+    fn snap(&self, pos: usize) -> usize {
+        let pos = pos.min(self.text.len());
+        let Some(c) = self.text[pos..].chars().next() else {
+            return pos;
+        };
+        self.text[..pos + c.len_utf8()]
+            .grapheme_indices(true)
+            .next_back()
+            .map_or(0, |(i, _)| i)
     }
 
     fn prev_boundary(&self, pos: usize) -> usize {

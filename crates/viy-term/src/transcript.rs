@@ -34,6 +34,24 @@ const MULTI_CLICK: Duration = Duration::from_millis(400);
 /// How often a drag held at the top or bottom edge scrolls a row.
 pub const EDGE_SCROLL: Duration = Duration::from_millis(50);
 
+/// Counts a press at `column`, `row` given the last (Codex's
+/// `click_count`): a second and third on the same cell within
+/// [`MULTI_CLICK`] are a double and a triple click, then it starts over.
+pub fn click_count(
+    last: &mut Option<(Instant, u16, u16, u8)>,
+    column: u16,
+    row: u16,
+    now: Instant,
+) -> u8 {
+    let clicks = last
+        .filter(|&(at, x, y, _)| {
+            now.saturating_duration_since(at) < MULTI_CLICK && x == column && y == row
+        })
+        .map_or(1, |(_, _, _, n)| n % 3 + 1);
+    *last = Some((now, column, row, clicks));
+    clicks
+}
+
 /// What the mouse has picked in the transcript (kb d150), in its rows:
 /// counted down the whole transcript, the live tail last, so rows that
 /// arrive below never move it. A resize, Ctrl-T or a new transcript
@@ -573,16 +591,9 @@ impl TranscriptView {
         hasher.finish()
     }
 
-    /// Counts a press at `column`, `row` (Codex's `click_count`).
+    /// Counts a press at `column`, `row`.
     fn clicks(&mut self, column: u16, row: u16, now: Instant) -> u8 {
-        let clicks = self
-            .last_click
-            .filter(|&(at, x, y, _)| {
-                now.saturating_duration_since(at) < MULTI_CLICK && x == column && y == row
-            })
-            .map_or(1, |(_, _, _, n)| n % 3 + 1);
-        self.last_click = Some((now, column, row, clicks));
-        clicks
+        click_count(&mut self.last_click, column, row, now)
     }
 
     /// Stops following the end while a selection is live, so new rows do

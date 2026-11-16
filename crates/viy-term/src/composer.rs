@@ -108,6 +108,9 @@ pub struct Composer {
     dismissed: Option<String>,
     /// The width the input was last laid out at, for Up and Down.
     width: usize,
+    /// What the last press picked (a point, a word, a line): a drag
+    /// keeps it and runs from its far end.
+    pressed: (usize, usize),
     /// Shell mode, and when the `!` that set it was typed, until the key
     /// after it shows it was typed by a person.
     shell: Option<Shell>,
@@ -204,6 +207,58 @@ impl Composer {
     pub fn layout(&mut self, width: u16) -> (Vec<String>, ratatui::layout::Position) {
         self.width = usize::from(width.max(1));
         self.area.layout(width)
+    }
+
+    /// A left press on row `row`, column `column` of the input as last
+    /// laid out (kb d150): the cursor goes there; a second or third click
+    /// selects the word or the line there (Codex's composer mouse).
+    pub fn press(&mut self, row: usize, column: usize, clicks: u8) {
+        let pos = self.area.pos_at(self.laid_width(), row, column);
+        let range = match clicks {
+            2 => self.area.word_around(pos),
+            3 => self.area.line_around(pos),
+            _ => pos..pos,
+        };
+        self.pressed = (range.start, range.end);
+        self.area.select(range.start, range.end);
+    }
+
+    /// The pointer moved to row `row`, column `column` with the button
+    /// down: the selection runs from what the press picked to there.
+    pub fn drag(&mut self, row: usize, column: usize) {
+        let pos = self.area.pos_at(self.laid_width(), row, column);
+        let (start, end) = self.pressed;
+        if pos < start {
+            self.area.select(end, pos);
+        } else if pos > end {
+            self.area.select(start, pos);
+        } else {
+            self.area.select(start, end);
+        }
+    }
+
+    /// The selected text, if any is.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.area.selected()
+    }
+
+    /// Removes the selected text and returns it (Ctrl+X).
+    pub fn cut(&mut self) -> Option<String> {
+        self.area.take_selection()
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.area.clear_selection();
+    }
+
+    /// The selection's cells in the rows last laid out: row, first and
+    /// last column, the end not included.
+    pub fn selected_cells(&self) -> Vec<(usize, usize, usize)> {
+        self.area.selected_cells(self.laid_width())
+    }
+
+    fn laid_width(&self) -> u16 {
+        u16::try_from(self.width).unwrap_or(u16::MAX)
     }
 
     /// Takes one key, at `now`.

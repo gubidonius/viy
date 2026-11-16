@@ -451,3 +451,90 @@ fn a_drag_copies_the_answer_to_the_terminals_clipboard() {
     });
     close(&pty, child);
 }
+
+/// By hand, with Xvfb and xclip, on a private X display (`:97`, so the
+/// desktop's own clipboard is never touched): Ctrl+V pastes the
+/// clipboard's text into the input box as a paste (its newline kept, sent
+/// unchanged by Enter), and a drag over the answer puts its text on that
+/// display's clipboard (kb d150, WP 9.14).
+#[test]
+#[ignore = "needs Xvfb and xclip"]
+fn on_a_private_x_display_ctrl_v_pastes_and_a_drag_copies() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let display = ":97";
+    let mut xvfb = Command::new("Xvfb")
+        .args([display, "-nolisten", "tcp"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let xclip = |args: &[&str]| {
+        let mut command = Command::new("xclip");
+        command.args(args).env("DISPLAY", display);
+        command
+    };
+    let mut put = xclip(&["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    put.stdin
+        .take()
+        .unwrap()
+        .write_all(b"pasted line one\nline two")
+        .unwrap();
+    put.wait().unwrap();
+
+    let mock = one_turn("the answer");
+    let dir = ScratchDir::new("ui-x11").unwrap();
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = pty
+        .spawn(
+            Command::new(env!("CARGO_BIN_EXE_viy"))
+                .args(["dev", "chat", "--url", &mock.uri(), "--dir"])
+                .arg(dir.path())
+                .env("VLLM_API_KEY", "fake-key")
+                .env("DISPLAY", display)
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .env_remove("SSH_TTY")
+                .env_remove("SSH_CONNECTION"),
+        )
+        .unwrap();
+    pty.wait_for("the input box", |s| {
+        s.alternate_screen() && s.contents().contains("› ")
+    });
+    // Ctrl+V.
+    pty.send(b"\x16").unwrap();
+    pty.wait_for("the paste in the input box", |s| {
+        s.contents().contains("› pasted line one")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.wait_for("the answer", |s| s.contents().contains("the answer"));
+    assert_eq!(sent(&mock).as_deref(), Some("pasted line one\nline two"));
+
+    let row = pty.with_screen(|parser| {
+        let rows = viy_testkit::screen::rows(parser.screen());
+        rows.iter()
+            .position(|r| r.starts_with("the answer"))
+            .unwrap()
+            + 1
+    });
+    pty.send(format!("\x1b[<0;1;{row}M").as_bytes()).unwrap();
+    pty.send(format!("\x1b[<32;6;{row}M").as_bytes()).unwrap();
+    pty.send(format!("\x1b[<0;10;{row}m").as_bytes()).unwrap();
+    pty.wait_for("the copy said", |s| {
+        s.contents().contains("copied 10 chars")
+    });
+    let out = xclip(&["-o", "-selection", "clipboard"]).output().unwrap();
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "the answer");
+    close(&pty, child);
+    // SIGTERM, so Xvfb removes its lock file.
+    let _ = Command::new("kill")
+        .args(["-TERM", &xvfb.id().to_string()])
+        .status();
+    let _ = xvfb.wait();
+}
