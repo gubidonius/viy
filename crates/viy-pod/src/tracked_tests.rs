@@ -5,6 +5,7 @@ use serde_json::json;
 use viy_testkit::fixtures;
 use viy_testkit::http::FakeHttp;
 use viy_testkit::http::Reply;
+use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 
 use super::*;
@@ -58,7 +59,7 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
             fs::write(paths.pod_state_file(), text).unwrap();
         }
         let cfg = config(case);
-        let http = Arc::new(FakeHttp::new(replies(case)));
+        let http = Arc::new(V1::new(Arc::new(FakeHttp::new(replies(case)))));
         let mut said = Vec::new();
         let outcome = match case["call"].as_str().unwrap() {
             "resolve_pod" => {
@@ -90,7 +91,8 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
         assert_eq!(json!(sent), case["sent"], "{name}: requests");
         assert_eq!(json!(said), case["said"], "{name}: notices");
         match outcome {
-            Ok(value) => assert_eq!(value, case["ok"], "{name}"),
+            // rpctl's pod as far as v2 still says it (kb d151).
+            Ok(value) => assert_eq!(value, as_v2_tells_it(&case["ok"]), "{name}"),
             Err(e) => {
                 assert_eq!(
                     canonical_error(&e.to_string()),
@@ -159,7 +161,7 @@ async fn an_answer_without_an_id_never_clears_the_cache() {
             None => Reply::answer(404, "{}"),
         }];
         replies.extend(list.map(|l| Reply::answer(200, l.to_string())));
-        let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new(replies)));
+        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new(replies)))));
         let mut cfg = Config::defaults();
         cfg.set("POD_NAME", "qwen-pod");
         let pod = resolve(&rp, &paths, &cfg, |_| {}).await.unwrap();
@@ -205,7 +207,7 @@ async fn adopt(get: Reply, list: Option<Value>) -> (Option<Value>, PodState, Pat
     .unwrap();
     let mut replies = vec![get];
     replies.extend(list.map(|l| Reply::answer(200, l.to_string())));
-    let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new(replies)));
+    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new(replies)))));
     let mut cfg = Config::defaults();
     cfg.set("POD_NAME", "p");
     let found = resolve(&rp, &paths, &cfg, |_| {}).await.unwrap();
@@ -255,4 +257,12 @@ async fn a_terminated_cached_pod_counts_as_another() {
     let pods = json!([{"id": "new", "name": "p", "desiredStatus": "EXITED"}]);
     let (_, state, _, _dir) = adopt(Reply::answer(200, gone.to_string()), Some(pods)).await;
     assert_eq!(state.get(key::TUNNEL_ONLY), None);
+}
+
+/// A pod rpctl returned, as viy reads RunPod's v2 answer for it.
+fn as_v2_tells_it(pod: &Value) -> Value {
+    match pod {
+        Value::Object(_) => crate::wire::pod(viy_testkit::runpod_v1::v2_pod(pod.clone())),
+        other => other.clone(),
+    }
 }

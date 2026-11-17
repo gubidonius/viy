@@ -4,7 +4,9 @@
 //! case's replies are played back in order; viy must send the same
 //! requests, ask the same questions, say the same notices and leave the
 //! same files. Named tests are rpctl's tests/test_regions.py, each on its
-//! case.
+//! case. The script is rpctl's, in RunPod's REST v1, played to viy's v2
+//! client by `runpod_v1::V1`, which also tells viy's requests back as v1
+//! ones (kb d151).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -25,6 +27,8 @@ use viy_testkit::exec::Reply as Run;
 use viy_testkit::fixtures;
 use viy_testkit::http::FakeHttp;
 use viy_testkit::http::Reply;
+use viy_testkit::runpod_v1;
+use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 use viy_testkit::time::FakeTime;
 
@@ -41,7 +45,7 @@ const API_KEY: &str = "rpa_SYNTHETICKEY0000";
 fn as_viy(text: &str) -> String {
     ["up", "reap", "backup", "is up"]
         .iter()
-        .fold(text.to_string(), |t, w| {
+        .fold(runpod_v1::v2_paths(text), |t, w| {
             t.replace(&format!("rp {w}"), &format!("viy {w}"))
         })
 }
@@ -119,7 +123,7 @@ fn rows(file: &Path) -> Value {
 struct Replayed {
     _dir: ScratchDir,
     paths: Paths,
-    http: Arc<FakeHttp>,
+    http: Arc<V1>,
     said: Vec<Value>,
     asked: Vec<Value>,
     outcome: Value,
@@ -259,7 +263,12 @@ async fn run_case(case: &Value) -> Replayed {
         }
     }
     let cfg = config(case);
-    let fake = Arc::new(FakeHttp::new(replies(case)));
+    let owned = |gpus: Vec<&str>| -> Vec<String> { gpus.into_iter().map(str::to_string).collect() };
+    let groups = match viy_config::config::gpu_tiers(&cfg) {
+        Some((preferred, others)) => vec![owned(preferred), owned(others)],
+        None => vec![owned(viy_config::config::gpu_type_list(&cfg))],
+    };
+    let fake = Arc::new(V1::new(Arc::new(FakeHttp::new(replies(case)))).asking_together(groups));
     let http: Arc<dyn HttpClient> = fake.clone();
     let time = FakeTime::at(DateTime::from_timestamp(NOW, 0).unwrap());
     let exec = FakeExec::new([Run::StandIn(Command::new("true"))]);
@@ -1206,16 +1215,20 @@ async fn with_no_preferred_type_anywhere_the_move_goes_where_another_type_is_fre
         (200, POD),
     ];
     let r = preferring(&replies, json!([true, true]), "EU-RO-1").await;
+    let asks = r.asks();
     assert_eq!(
-        r.asks(),
+        asks[..4],
         [
             ask("EUR-IS-1", A100, 2),
             ask("US-MO-1", A100, 2),
             ask("EUR-IS-1", RTX, 5),
             ask("US-MO-1", RTX, 5),
-            ask("EU-RO-1", A100, 7),
         ]
     );
+    // The move asks for every type, and the first is placed: as v2 asks
+    // one type per request (kb d151), told as v1 that is the first type's
+    // group.
+    assert_eq!(asks[4..], [ask("EU-RO-1", A100, 2)]);
     assert!(
         r.asked[1][0]
             .as_str()
@@ -1363,8 +1376,18 @@ async fn a_region_without_the_backups_storage_tier_is_dropped_and_the_rest_go_on
             .into_iter()
             .filter(|c| c.contains("volumes") && !c.starts_with("GET"))
             .collect::<Vec<_>>(),
-        ["POST /v2/network-volumes", "POST /v2/network-volumes"]
+        ["POST /v1/networkvolumes", "POST /v1/networkvolumes"]
     );
+    let asked_tier = r
+        .http
+        .sent()
+        .iter()
+        .filter(|q| q.method == Method::POST && q.url.ends_with("/networkvolumes"))
+        .all(|q| {
+            serde_json::from_slice::<Value>(q.body.as_deref().unwrap()).unwrap()["type"]
+                == "STANDARD"
+        });
+    assert!(asked_tier);
     assert_eq!(r.creates().last().unwrap().0, "EU-RO-1");
     assert!(r.backups().get("new2").is_some());
 }

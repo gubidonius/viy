@@ -1,6 +1,8 @@
 //! The pod commands against a scripted RunPod and vLLM (RouteHttp), on
-//! paused time. Every config sets its own VLLM_PORT and TUNNEL_LOCAL_PORT,
-//! so `down`'s sweep for stray forwards can never match a real tunnel.
+//! paused time. RunPod is scripted as rpctl's tests script it, in REST v1,
+//! behind `runpod_v1::V1`, so the requests read as rpctl's (kb d151).
+//! Every config sets its own VLLM_PORT and TUNNEL_LOCAL_PORT, so `down`'s
+//! sweep for stray forwards can never match a real tunnel.
 
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -14,6 +16,7 @@ use viy_testkit::exec::Reply as Run;
 use viy_testkit::http::Piece;
 use viy_testkit::http::Reply;
 use viy_testkit::http::RouteHttp;
+use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 use viy_testkit::sshd::free_port;
 use viy_testkit::time::FakeTime;
@@ -82,7 +85,7 @@ struct Home {
     time: FakeTime,
     exec: FakeExec,
     http: Arc<dyn HttpClient>,
-    api: Arc<RouteHttp>,
+    api: Arc<V1>,
 }
 
 impl Home {
@@ -108,7 +111,7 @@ impl Home {
             cfg.set(k, v);
         }
         cfg.set("TUNNEL_LOCAL_PORT", &free_port().unwrap().to_string());
-        let api = Arc::new(RouteHttp::new(answer));
+        let api = Arc::new(V1::new(Arc::new(RouteHttp::new(answer))));
         Self {
             _dir: dir,
             paths,
@@ -708,7 +711,8 @@ async fn status_shows_the_pod_and_whether_vllm_answers() {
             json_reply(json!({
                 "id": "pod111", "name": "qwen-pod", "desiredStatus": "RUNNING",
                 "costPerHr": "1.89", "gpuCount": 1, "lastStartedAt": "2026-07-16T09:00:00Z",
-                "gpu": {"displayName": "A100 SXM"}, "machine": {"dataCenterId": "EUR-IS-1"},
+                // v2 names no display name (kb d151), only the type.
+                "gpu": {"id": "NVIDIA A100-SXM4-80GB"}, "machine": {"dataCenterId": "EUR-IS-1"},
             }))
         }
     });
@@ -723,7 +727,7 @@ async fn status_shows_the_pod_and_whether_vllm_answers() {
             "  id:        pod111",
             "  name:      qwen-pod",
             "  state:     RUNNING",
-            "  gpu:       A100 SXM x1",
+            "  gpu:       NVIDIA A100-SXM4-80GB x1",
             "  region:    EUR-IS-1",
             "  cost:      $1.89/hr",
             "  started:   2026-07-16T09:00:00Z",

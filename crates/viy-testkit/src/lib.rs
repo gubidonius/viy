@@ -2,6 +2,7 @@
 //! at the pinned commit (behind the `oracle` feature), the fixture loader, the
 //! temp-XDG guard that keeps tests away from real state, config fixture
 //! cases laid out on disk, scripted HTTP and process backends and a clock,
+//! RunPod's retired REST v1 played to viy's v2 client (`runpod_v1`),
 //! an sshd of the tests' own, the scripted model server and the scenarios
 //! it serves, readable snapshots of the model context
 //! (docs/implementation-plan.md 3.2-3.6), and the UI harness: the
@@ -22,6 +23,7 @@ pub mod mock_llm;
 pub mod oracle;
 pub mod pty;
 pub mod rp_names;
+pub mod runpod_v1;
 pub mod scenario;
 pub mod scratch;
 pub mod screen;

@@ -14,6 +14,7 @@ use viy_config::Config;
 use viy_config::Paths;
 use viy_testkit::http::FakeHttp;
 use viy_testkit::http::Reply;
+use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 use viy_testkit::sshd::LocalSshd;
 use viy_testkit::sshd::SshdExec;
@@ -178,7 +179,9 @@ async fn a_checked_first_contact_pins_the_key_and_the_tunnel_reaches_vllm() {
     let fingerprint = bench.sshd.host_fingerprint().unwrap();
     let rp = RunPod::new(
         API_KEY,
-        Arc::new(FakeHttp::new([bench.boot_log(&fingerprint)])),
+        Arc::new(V1::new(Arc::new(FakeHttp::new([
+            bench.boot_log(&fingerprint)
+        ])))),
     );
     let port = bench.sshd.port;
 
@@ -275,7 +278,10 @@ async fn a_checked_first_contact_pins_the_key_and_the_tunnel_reaches_vllm() {
 async fn a_key_the_boot_log_disowns_is_not_pinned_and_no_tunnel_starts() {
     let bench = Bench::new();
     let other = "SHA256:Synthetic9999SomeoneElsesKeyFingerprint99999";
-    let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new([bench.boot_log(other)])));
+    let rp = RunPod::new(
+        API_KEY,
+        Arc::new(V1::new(Arc::new(FakeHttp::new([bench.boot_log(other)])))),
+    );
     let port = bench.sshd.port;
     assert!(
         !start(
@@ -313,7 +319,7 @@ async fn a_changed_host_key_is_refused_and_explained() {
         "rpctl-qwen-pod ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n",
     )
     .unwrap();
-    let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new([])));
+    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([])))));
     let port = bench.sshd.port;
     assert!(
         !start(
@@ -364,7 +370,10 @@ async fn dead_tunnel_is_restarted_then_given_up() {
     let bench = Bench::new();
     bench.pin();
     let ssh = bench.ssh();
-    let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new([bench.pod(), bench.pod()])));
+    let rp = RunPod::new(
+        API_KEY,
+        Arc::new(V1::new(Arc::new(FakeHttp::new([bench.pod(), bench.pod()])))),
+    );
     let started = start(
         &ssh,
         &rp,
@@ -439,7 +448,7 @@ async fn live_tunnel_is_left_alone() {
     let bench = Bench::new();
     bench.pin();
     let ssh = bench.ssh();
-    let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new([])));
+    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([])))));
     let started = start(
         &ssh,
         &rp,
@@ -468,7 +477,9 @@ async fn a_restart_that_fails_ends_the_wait() {
     let ssh = bench.ssh();
     let rp = RunPod::new(
         API_KEY,
-        Arc::new(FakeHttp::new([Reply::answer(503, "down")])),
+        Arc::new(V1::new(Arc::new(FakeHttp::new([Reply::answer(
+            503, "down",
+        )])))),
     );
     // Recorded, but dead; and the local port taken by someone else.
     state::save(&bench.paths, [(key::TUNNEL_PID, json!(99_999_999))]).unwrap();
@@ -524,7 +535,10 @@ async fn the_foreground_tunnel_reconnects_and_closes_on_interrupt() {
     let bench = Bench::new();
     bench.pin();
     let ssh = bench.ssh();
-    let rp = RunPod::new(API_KEY, Arc::new(FakeHttp::new([bench.pod()])));
+    let rp = RunPod::new(
+        API_KEY,
+        Arc::new(V1::new(Arc::new(FakeHttp::new([bench.pod()])))),
+    );
     let (interrupt, interrupted) = tokio::sync::oneshot::channel::<()>();
     let mut say = bench.say();
     let tunnel = foreground(
@@ -619,7 +633,12 @@ async fn the_command_stops_reports_and_refuses_a_second_tunnel() {
     );
 
     let pods = [bench.pod(), bench.pod()];
-    let connect = || Ok(RunPod::new(API_KEY, Arc::new(FakeHttp::new(pods))));
+    let connect = || {
+        Ok(RunPod::new(
+            API_KEY,
+            Arc::new(V1::new(Arc::new(FakeHttp::new(pods)))),
+        ))
+    };
     command(
         &ssh,
         Action::Background,

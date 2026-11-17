@@ -1008,7 +1008,9 @@ async fn capture_vllm_log(
         .filter(|row| row.get("boot_id").and_then(Value::as_str) != Some(boot_id))
         .filter_map(|row| records.read(row.get("boot_id")?.as_str()?))
         .find_map(|other| other.get("host").filter(|h| truthy_host(h)).cloned());
-    if let Some(other) = previous {
+    // RunPod's v2 API names no host (kb d151): two unknown hosts are not
+    // the same one.
+    if let Some(other) = previous.filter(|_| !machine.is_null()) {
         let same = other.get("machine_id").unwrap_or(&Value::Null) == &machine;
         host.insert("same_machine_as_previous_boot".into(), json!(same));
     }

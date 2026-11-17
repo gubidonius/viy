@@ -1,4 +1,4 @@
-//! The pod: RunPod REST and GraphQL, pod tracking by `POD_NAME`, the boot
+//! The pod: RunPod REST (v2, read as v1) and GraphQL, pod tracking by `POD_NAME`, the boot
 //! script and create-pod body built byte for byte like rpctl's, the embedded
 //! `startup.py`, the SSH tunnel with its pinned host key, readiness waits, the
 //! boot report, regions and backup, the network volume, idle stamp, reap and
@@ -23,6 +23,7 @@ pub mod state;
 pub mod tracked;
 pub mod tunnel;
 pub mod wait;
+mod wire;
 
 /// A regex written into the code; one that does not compile is a bug.
 fn compile_regex(pattern: &str) -> regex::Regex {

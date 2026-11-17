@@ -8,6 +8,8 @@ use viy_testkit::fixtures;
 use viy_testkit::http::FakeHttp;
 use viy_testkit::http::Piece;
 use viy_testkit::http::Reply;
+use viy_testkit::runpod_v1;
+use viy_testkit::runpod_v1::V1;
 
 use super::*;
 
@@ -151,7 +153,11 @@ fn check_request(name: &str, sent: &Request, rp_sent: &Value) {
         .as_deref()
         .map(|b| canonical(std::str::from_utf8(b).unwrap()).unwrap());
     let rp_body = rp_sent["body"].as_str().map(|b| canonical(b).unwrap());
-    assert_eq!(body, rp_body, "{name}: body");
+    // A pod's v2 body has other fields than these synthetic v1 ones;
+    // wire_tests pin what viy sends.
+    if !(sent.method == Method::POST && sent.url.ends_with("/v1/pods")) {
+        assert_eq!(body, rp_body, "{name}: body");
+    }
     let (connect, read) = match &rp_sent["timeout"] {
         Value::Array(pair) => (pair[0].as_u64().unwrap(), pair[1].as_u64().unwrap()),
         one => (one.as_u64().unwrap(), one.as_u64().unwrap()),
@@ -166,11 +172,12 @@ fn check_request(name: &str, sent: &Request, rp_sent: &Value) {
 /// rp's message where `requests` named an exception class, viy's where it
 /// names its own error kind (module docs).
 fn viy_message(name: &str, rp_message: &str) -> String {
+    let rp_message = &runpod_v1::v2_paths(rp_message);
     match name {
         "transport_failure_is_transient" => {
             "GET /pods/pod111 -> connection failed: synthetic: connection refused".into()
         }
-        "read_timeout_is_transient" => "GET /networkvolumes -> timeout".into(),
+        "read_timeout_is_transient" => "GET /network-volumes -> timeout".into(),
         "graphql_transport_failure" => {
             "GraphQL -> connection failed: synthetic: connection refused".into()
         }
@@ -187,7 +194,24 @@ fn viy_message(name: &str, rp_message: &str) -> String {
         "graphql_http_429_json" => {
             format!("{rp_message}\nRunPod's rate limit: it takes requests again in 1m 0s.")
         }
-        _ => rp_message.into(),
+        _ => rp_message.clone(),
+    }
+}
+
+/// What rpctl returned, as far as RunPod's v2 API still says it: the
+/// script's answer as v2 gives it, read back as viy reads v2.
+fn as_v2_tells_it(call: &str, rp_ok: &Value) -> Value {
+    let pod = |p: &Value| crate::wire::pod(runpod_v1::v2_pod(p.clone()));
+    let volume = |v: &Value| crate::wire::volume(runpod_v1::v2_volume(v.clone()));
+    let each = |rows: &Value, one: &dyn Fn(&Value) -> Value| {
+        json!(rows.as_array().unwrap().iter().map(one).collect::<Vec<_>>())
+    };
+    match call {
+        "list_pods" => each(rp_ok, &pod),
+        "get_pod" | "create_pod" if !rp_ok.is_null() => pod(rp_ok),
+        "list_volumes" => each(rp_ok, &volume),
+        "get_volume" | "create_volume" if !rp_ok.is_null() => volume(rp_ok),
+        _ => rp_ok.clone(),
     }
 }
 
@@ -231,7 +255,7 @@ async fn each_call_sends_and_reads_what_rpctls_does() {
             );
             continue;
         }
-        let http = Arc::new(FakeHttp::new([reply(&case["reply"])]));
+        let http = Arc::new(V1::new(Arc::new(FakeHttp::new([reply(&case["reply"])]))));
         let rp = RunPod::new(API_KEY, http.clone());
         let outcome = call(&rp, call_spec).await;
 
@@ -247,8 +271,9 @@ async fn each_call_sends_and_reads_what_rpctls_does() {
                     case.get("error").is_none(),
                     "{name}: rp failed, viy did not"
                 );
-                if !viy_discards_the_result(call_spec[0].as_str().unwrap()) {
-                    assert_eq!(value, case["ok"], "{name}");
+                let called = call_spec[0].as_str().unwrap();
+                if !viy_discards_the_result(called) {
+                    assert_eq!(value, as_v2_tells_it(called, &case["ok"]), "{name}");
                 }
             }
             Err(error) => check_error(name, &error, case),
@@ -412,7 +437,7 @@ async fn bodiless_calls_other_than_get_declare_a_zero_length() {
         Reply::answer(200, "[]"),
     ]));
     let rp = RunPod::new(API_KEY, http.clone());
-    rp.stop_pod("pod111").await.unwrap();
+    rp.delete_pod("pod111").await.unwrap();
     rp.delete_volume("vol222").await.unwrap();
     rp.list_pods().await.unwrap();
     let sent = http.sent();
@@ -464,7 +489,7 @@ async fn client_tag_off_sends_rps_user_agent() {
 
 /// RunPod's answers of 2026-07-30 (kb d139).
 #[tokio::test]
-async fn a_volume_with_a_tier_is_made_through_v2_and_reads_as_v1s() {
+async fn a_volume_with_a_tier_asks_for_it_and_reads_as_v1s() {
     let made = r#"{"dataCenter":"EU-RO-1","id":"vol9","name":"w-backup","size":100,"tags":[],"type":"STANDARD"}"#;
     let refused = r#"{"detail":"Standard storage is not available in data center \"AP-IN-1\".","status":400,"title":"Bad Request"}"#;
     let http = Arc::new(FakeHttp::new([
@@ -491,6 +516,224 @@ async fn a_volume_with_a_tier_is_made_through_v2_and_reads_as_v1s() {
         .await
         .unwrap_err();
     assert!(crate::regions::is_tier_unavailable(&error), "{error}");
+}
+
+// ---- RunPod's REST v2 on the wire (kb d151) ------------------------------
+
+/// What the requests sent were, as `METHOD url` and their JSON bodies.
+fn requests(http: &FakeHttp) -> Vec<(String, Value)> {
+    http.sent()
+        .iter()
+        .map(|r| {
+            let body = r
+                .body
+                .as_deref()
+                .map_or(Value::Null, |b| serde_json::from_slice(b).unwrap());
+            (format!("{} {}", r.method, r.url), body)
+        })
+        .collect()
+}
+
+fn create_body(types: &[&str]) -> Value {
+    json!({"name": "qwen-pod", "imageName": "img", "gpuCount": 1, "gpuTypeIds": types,
+           "dataCenterIds": ["EUR-IS-1"], "networkVolumeId": "vol222",
+           "volumeMountPath": "/workspace"})
+}
+
+/// RunPod's v2 capacity refusal, as reported on 2026-07-07 (kb f151).
+const NO_CAPACITY: &str = r#"{"detail": "There are no longer any instances available with the requested specifications. Please refresh and try again.", "status": 400, "title": "Bad Request"}"#;
+const NO_ACCESS: &str = r#"{"title": "Forbidden", "status": 403, "detail": "access denied"}"#;
+
+#[tokio::test]
+async fn a_pod_is_asked_for_one_gpu_type_at_a_time_until_one_is_placed() {
+    let http = Arc::new(FakeHttp::new([
+        Reply::answer(400, NO_CAPACITY),
+        Reply::answer(403, NO_ACCESS),
+        Reply::answer(
+            201,
+            r#"{"id": "pod111", "status": "PROVISIONING", "cost": 1.19}"#,
+        ),
+    ]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    let pod = rp.create_pod(create_body(&["A", "B", "C", "D"])).await;
+    assert_eq!(
+        pod,
+        Ok(Some(
+            json!({"id": "pod111", "desiredStatus": "RUNNING", "costPerHr": 1.19})
+        ))
+    );
+    let sent = requests(&http);
+    let asked: Vec<(&str, &Value)> = sent
+        .iter()
+        .map(|(call, body)| (call.as_str(), &body["gpu"]["id"]))
+        .collect();
+    let post = "POST https://api.runpod.io/v2/pods";
+    assert_eq!(
+        asked,
+        [
+            (post, &json!("A")),
+            (post, &json!("B")),
+            (post, &json!("C"))
+        ]
+    );
+    assert_eq!(
+        sent[0].1,
+        json!({"name": "qwen-pod", "image": "img", "gpu": {"id": "A", "count": 1},
+               "dataCenterIds": ["EUR-IS-1"],
+               "mounts": {"network": [{"volumeId": "vol222", "path": "/workspace"}]}})
+    );
+}
+
+#[tokio::test]
+async fn every_type_refused_answers_with_the_capacity_refusal_for_failover() {
+    let http = Arc::new(FakeHttp::new([
+        Reply::answer(400, NO_CAPACITY),
+        Reply::answer(403, NO_ACCESS),
+    ]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    let error = rp.create_pod(create_body(&["A", "B"])).await.unwrap_err();
+    assert_eq!(error.status_code(), Some(400));
+    assert!(crate::regions::is_capacity_error(&error), "{error}");
+    assert!(
+        error.to_string().starts_with("POST /pods -> HTTP 400\n"),
+        "{error}"
+    );
+
+    let http = Arc::new(FakeHttp::new([Reply::answer(403, NO_ACCESS)]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    let error = rp.create_pod(create_body(&["A"])).await.unwrap_err();
+    assert_eq!(error.status_code(), Some(403));
+}
+
+#[tokio::test]
+async fn a_refusal_not_about_capacity_ends_the_search() {
+    for status in [400, 402, 422, 500] {
+        let refused = r#"{"title": "Refused", "status": 0, "detail": "synthetic"}"#;
+        let http = Arc::new(FakeHttp::new([Reply::answer(status, refused)]));
+        let rp = RunPod::new(API_KEY, http.clone());
+        let error = rp.create_pod(create_body(&["A", "B"])).await.unwrap_err();
+        assert_eq!(error.status_code(), Some(status));
+        assert_eq!(http.sent().len(), 1, "{status}");
+    }
+}
+
+/// rpctl's own create body, built from viy's defaults, fits under v2's
+/// request limit of 102400 bytes (api.runpod.io/v2/openapi.json, 413).
+#[test]
+fn the_real_create_requests_fit_v2s_size_limit() {
+    let mut cfg = viy_config::Config::defaults();
+    // A real token's length, dashed so the secret scanner passes it.
+    cfg.set("HF_TOKEN", "hf_SYNTHETIC-TOKEN-00000000000000000");
+    cfg.set(
+        "RUNPOD_WATCHDOG_API_KEY",
+        "rpa_SYNTHETICWATCHDOG000000000000",
+    );
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISYNTHETICSYNTHETICSYNTHETICSYNTHETIC x";
+    let body = crate::boot::build_pod_body(&cfg, "sk-SYNTHETIC", "vol222", Some(key)).unwrap();
+    for request in crate::wire::pod_requests(&body) {
+        let size = request.to_string().len();
+        assert!(size < 102_400, "{size} bytes");
+    }
+}
+
+#[tokio::test]
+async fn stop_and_start_are_actions_and_one_already_done_counts() {
+    let http = Arc::new(FakeHttp::new([
+        Reply::answer(200, r#"{"id": "pod111", "status": "EXITED"}"#),
+        Reply::answer(
+            409,
+            r#"{"title": "Conflict", "status": 409, "detail": "not allowed"}"#,
+        ),
+        Reply::answer(200, r#"{"id": "pod111", "status": "EXITED"}"#),
+        Reply::answer(
+            409,
+            r#"{"title": "Conflict", "status": 409, "detail": "not allowed"}"#,
+        ),
+        Reply::answer(200, r#"{"id": "pod111", "status": "STARTING"}"#),
+        Reply::answer(
+            409,
+            r#"{"title": "Conflict", "status": 409, "detail": "not allowed"}"#,
+        ),
+        Reply::answer(200, r#"{"id": "pod111", "status": "STARTING"}"#),
+    ]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    assert_eq!(rp.stop_pod("pod111").await, Ok(()));
+    // Stopped already, as in RunPod's console.
+    assert_eq!(rp.stop_pod("pod111").await, Ok(()));
+    // Starting already.
+    assert_eq!(rp.start_pod("pod111").await, Ok(()));
+    // Starting, so not stopped.
+    let error = rp.stop_pod("pod111").await.unwrap_err();
+    assert_eq!(error.status_code(), Some(409));
+    assert!(
+        error
+            .to_string()
+            .starts_with("POST /pods/pod111/action -> HTTP 409\n"),
+        "{error}"
+    );
+    let action = |body: &str| {
+        (
+            "POST https://api.runpod.io/v2/pods/pod111/action".to_string(),
+            json!({"action": body}),
+        )
+    };
+    let get = || {
+        (
+            "GET https://api.runpod.io/v2/pods/pod111".to_string(),
+            Value::Null,
+        )
+    };
+    assert_eq!(
+        requests(&http),
+        [
+            action("stop"),
+            action("stop"),
+            get(),
+            action("start"),
+            get(),
+            action("stop"),
+            get(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn lists_follow_their_pages() {
+    let http = Arc::new(FakeHttp::new([
+        Reply::answer(
+            200,
+            r#"{"pods": [{"id": "a", "status": "RUNNING"}], "pagination": {"nextCursor": "c/1=", "hasNextPage": true}}"#,
+        ),
+        Reply::answer(
+            200,
+            r#"{"pods": [{"id": "b", "status": "EXITED"}], "pagination": {"nextCursor": null, "hasNextPage": false}}"#,
+        ),
+        Reply::answer(
+            200,
+            r#"{"networkVolumes": [{"id": "v", "name": "w", "size": 100, "dataCenter": "EU-RO-1"}], "pagination": {"nextCursor": null, "hasNextPage": false}}"#,
+        ),
+    ]));
+    let rp = RunPod::new(API_KEY, http.clone());
+    assert_eq!(
+        rp.list_pods().await.unwrap(),
+        [
+            json!({"id": "a", "desiredStatus": "RUNNING"}),
+            json!({"id": "b", "desiredStatus": "EXITED"})
+        ]
+    );
+    assert_eq!(
+        rp.list_volumes().await.unwrap(),
+        [json!({"id": "v", "name": "w", "size": 100, "dataCenterId": "EU-RO-1"})]
+    );
+    let urls: Vec<String> = http.sent().into_iter().map(|r| r.url).collect();
+    assert_eq!(
+        urls,
+        [
+            "https://api.runpod.io/v2/pods",
+            "https://api.runpod.io/v2/pods?cursor=c%2F1%3D",
+            "https://api.runpod.io/v2/network-volumes",
+        ]
+    );
 }
 
 // ---- RunPod's rate limit (kb d140) ---------------------------------------

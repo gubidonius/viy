@@ -15,6 +15,7 @@ use viy_testkit::exec::FakeExec;
 use viy_testkit::exec::Reply as Run;
 use viy_testkit::http::Reply;
 use viy_testkit::http::RouteHttp;
+use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 use viy_testkit::sshd::free_port;
 use viy_testkit::time::FakeTime;
@@ -251,7 +252,7 @@ struct Home {
     time: FakeTime,
     exec: FakeExec,
     http: Arc<dyn HttpClient>,
-    api: Arc<RouteHttp>,
+    api: Arc<V1>,
 }
 
 impl Home {
@@ -270,7 +271,7 @@ impl Home {
             cfg.set(k, v);
         }
         cfg.set("TUNNEL_LOCAL_PORT", &free_port().unwrap().to_string());
-        let api = Arc::new(RouteHttp::new(world));
+        let api = Arc::new(V1::new(Arc::new(RouteHttp::new(world))));
         Self {
             _dir: dir,
             paths,

@@ -179,6 +179,11 @@ impl Response {
         self
     }
 
+    /// Every header, names in lower case, in the order they came.
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
     /// The first value of the header `name`, whatever its case.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers

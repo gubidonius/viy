@@ -24,6 +24,7 @@ use viy_testkit::exec::FakeExec;
 use viy_testkit::exec::Reply as Ran;
 use viy_testkit::http::Reply;
 use viy_testkit::http::RouteHttp;
+use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 use viy_testkit::sshd::free_port;
 
@@ -34,7 +35,7 @@ const PROXY: &str = "https://pod111-18999.proxy.runpod.net";
 struct Rig {
     _dir: ScratchDir,
     paths: Paths,
-    api: Arc<RouteHttp>,
+    api: Arc<V1>,
     turns: Arc<ChatTurns>,
     engine: Engine,
 }
@@ -72,7 +73,8 @@ fn rig(
     let project = dir.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
     let cfg = config();
-    let api = Arc::new(RouteHttp::new(answer));
+    // RunPod scripted in v1, as rpctl's tests have it (kb d151).
+    let api = Arc::new(V1::new(Arc::new(RouteHttp::new(answer))));
     let http: Arc<dyn HttpClient> = api.clone();
     let chat = crate::dev::chat(&cfg, "", Arc::clone(&http), &paths, &project, true).unwrap();
     let server = PodServer::new(Parts {

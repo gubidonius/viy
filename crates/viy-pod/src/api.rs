@@ -1,7 +1,10 @@
-//! RunPod's APIs: REST (`rest.runpod.io/v1`) for pods and network volumes,
-//! GraphQL for the GPU stock, and the v2 platform log stream, readable
-//! before ssh is. rpctl's `api.py`; what is sent and what comes back are
-//! pinned by the pod/api fixture.
+//! RunPod's APIs: REST v2 (`api.runpod.io/v2`) for pods and network
+//! volumes, GraphQL for the GPU stock, and the v2 platform log stream,
+//! readable before ssh is. rpctl's `api.py`, which spoke REST v1
+//! (`rest.runpod.io/v1`) until RunPod retired it on 2026-08-02 (kb f150):
+//! viy speaks v2 on the wire and hands its callers v1's shapes, translated
+//! in [`crate::wire`] (kb d151). The pod/api fixture pins the rest: the
+//! errors, their text and what counts as gone.
 //!
 //! The safety invariant (rpctl docs/architecture.md 4): never confuse "API
 //! unreachable" with "pod gone". Every failure is a [`RunPodError`]:
@@ -48,11 +51,14 @@ use viy_http::Method;
 use viy_http::Request;
 use viy_http::user_agent;
 
-pub const BASE: &str = "https://rest.runpod.io/v1";
+use crate::regions::is_capacity_error;
+use crate::wire;
+
+pub const BASE: &str = "https://api.runpod.io/v2";
 pub const GRAPHQL: &str = "https://api.runpod.io/graphql";
-const LOGS: &str = "https://api.runpod.io/v2/pods";
-/// RunPod's v2 REST API: the one whose volume creation takes a storage tier.
-const V2: &str = "https://api.runpod.io/v2";
+/// Pages a list may take before viy stops following its cursor: RunPod
+/// pages 1000 rows at a time.
+const MAX_PAGES: usize = 100;
 
 /// How long [`RunPod::pod_logs`] reads when its caller has no budget of its
 /// own: the stream never closes.
@@ -261,18 +267,7 @@ impl RunPod {
         path: &str,
         body: Option<Value>,
     ) -> Result<Option<Value>, RunPodError> {
-        self.rest_at(BASE, method, path, body).await
-    }
-
-    /// [`RunPod::rest`] against `base`.
-    async fn rest_at(
-        &self,
-        base: &str,
-        method: Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Option<Value>, RunPodError> {
-        let mut request = self.request(method.clone(), format!("{base}{path}"));
+        let mut request = self.request(method.clone(), format!("{BASE}{path}"));
         if let Some(body) = body {
             request = request.body(body.to_string());
         }
@@ -297,6 +292,51 @@ impl RunPod {
         Ok(serde_json::from_slice(&bytes)
             .ok()
             .filter(|value: &Value| !value.is_null()))
+    }
+
+    /// Every row of the v2 list at `path`, following its pages; each row
+    /// as `shape` makes it.
+    async fn list(
+        &self,
+        path: &str,
+        key: &str,
+        shape: fn(Value) -> Value,
+    ) -> Result<Vec<Value>, RunPodError> {
+        let mut rows = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let page_path = match &cursor {
+                None => path.to_string(),
+                Some(cursor) => format!("{path}?cursor={}", wire::query_value(cursor)),
+            };
+            let (page, next) = wire::page(self.rest(Method::GET, &page_path, None).await?, key);
+            rows.extend(page.into_iter().map(shape));
+            if next.is_none() || next == cursor {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(rows)
+    }
+
+    /// Asks RunPod to `action` the pod (`start`, `stop`). RunPod refuses an
+    /// action the pod's state does not allow with 409; v1 took a start or
+    /// stop the pod was already through, so a pod found as `done` (v1's
+    /// `desiredStatus`) counts as acted on.
+    async fn act(&self, pod_id: &str, action: &str, done: &str) -> Result<(), RunPodError> {
+        let path = format!("/pods/{pod_id}/action");
+        match self
+            .rest(Method::POST, &path, Some(json!({ "action": action })))
+            .await
+        {
+            Err(error) if error.status_code == Some(409) => match self.get_pod(pod_id).await {
+                Ok(Some(pod)) if pod.get("desiredStatus").and_then(Value::as_str) == Some(done) => {
+                    Ok(())
+                }
+                _ => Err(error),
+            },
+            result => result.map(drop),
+        }
     }
 
     async fn fetch(&self, request: Request) -> Result<(u16, Vec<u8>), Unsent> {
@@ -419,19 +459,21 @@ impl RunPod {
 
     // ---- network volumes ------------------------------------------------
 
+    /// Every network volume, as v1 showed them (`dataCenterId`).
     pub async fn list_volumes(&self) -> Result<Vec<Value>, RunPodError> {
-        Ok(rows(self.rest(Method::GET, "/networkvolumes", None).await?))
-    }
-
-    pub async fn get_volume(&self, volume_id: &str) -> Result<Option<Value>, RunPodError> {
-        self.rest(Method::GET, &format!("/networkvolumes/{volume_id}"), None)
+        self.list("/network-volumes", "networkVolumes", wire::volume)
             .await
     }
 
+    pub async fn get_volume(&self, volume_id: &str) -> Result<Option<Value>, RunPodError> {
+        let volume = self
+            .rest(Method::GET, &format!("/network-volumes/{volume_id}"), None)
+            .await?;
+        Ok(volume.map(wire::volume))
+    }
+
     /// A new volume. With no `tier` RunPod takes the data center's default
-    /// storage tier; `STANDARD` or `HIGH_PERFORMANCE` asks for that one,
-    /// through the v2 API (v1 refuses the field), whose answer gets v1's
-    /// `dataCenterId`.
+    /// storage tier; `STANDARD` or `HIGH_PERFORMANCE` asks for that one.
     pub async fn create_volume(
         &self,
         name: &str,
@@ -439,28 +481,20 @@ impl RunPod {
         data_center_id: &str,
         tier: Option<&str>,
     ) -> Result<Option<Value>, RunPodError> {
-        let Some(tier) = tier else {
-            let body = json!({ "name": name, "size": size_gb, "dataCenterId": data_center_id });
-            return self.rest(Method::POST, "/networkvolumes", Some(body)).await;
-        };
-        let body =
-            json!({ "name": name, "size": size_gb, "dataCenter": data_center_id, "type": tier });
-        let mut volume = self
-            .rest_at(V2, Method::POST, "/network-volumes", Some(body))
-            .await?;
-        if let Some(fields) = volume.as_mut().and_then(Value::as_object_mut)
-            && !fields.contains_key("dataCenterId")
-            && let Some(region) = fields.get("dataCenter").cloned()
-        {
-            fields.insert("dataCenterId".to_string(), region);
+        let mut body = json!({ "name": name, "size": size_gb, "dataCenter": data_center_id });
+        if let Some(tier) = tier {
+            body["type"] = json!(tier);
         }
-        Ok(volume)
+        let volume = self
+            .rest(Method::POST, "/network-volumes", Some(body))
+            .await?;
+        Ok(volume.map(wire::volume))
     }
 
     pub async fn delete_volume(&self, volume_id: &str) -> Result<(), RunPodError> {
         self.rest(
             Method::DELETE,
-            &format!("/networkvolumes/{volume_id}"),
+            &format!("/network-volumes/{volume_id}"),
             None,
         )
         .await
@@ -469,35 +503,56 @@ impl RunPod {
 
     // ---- pods -----------------------------------------------------------
 
+    /// Every pod, as v1 showed them ([`crate::wire::pod`]). A listed pod
+    /// carries no SSH mapping; [`RunPod::get_pod`]'s does.
     pub async fn list_pods(&self) -> Result<Vec<Value>, RunPodError> {
-        Ok(rows(self.rest(Method::GET, "/pods", None).await?))
+        self.list("/pods", "pods", wire::pod).await
     }
 
-    /// The pod, or `None` when RunPod says 404 (or answers with no body).
+    /// The pod as v1 showed it, or `None` when RunPod says 404 (or answers
+    /// with no body).
     pub async fn get_pod(&self, pod_id: &str) -> Result<Option<Value>, RunPodError> {
         match self
             .rest(Method::GET, &format!("/pods/{pod_id}"), None)
             .await
         {
             Err(error) if error.status_code == Some(404) => Ok(None),
-            result => result,
+            result => result.map(|pod| pod.map(wire::pod)),
         }
     }
 
+    /// A pod from rpctl's v1 create body ([`crate::boot::build_pod_body`]):
+    /// one v2 request per GPU type of its `gpuTypeIds`, in order, until one
+    /// is placed. A type refused for capacity (400) or not open to this
+    /// account (403) passes to the next, as RunPod's v2 guide has it; any
+    /// other refusal ends the search. With every type refused, the error is
+    /// the last capacity refusal, so that failover reads it as v1's one
+    /// "no instances" answer, else the last refusal.
     pub async fn create_pod(&self, body: Value) -> Result<Option<Value>, RunPodError> {
-        self.rest(Method::POST, "/pods", Some(body)).await
+        let mut refusal: Option<RunPodError> = None;
+        // Never empty: a body without types is still one request.
+        for request in wire::pod_requests(&body) {
+            let error = match self.rest(Method::POST, "/pods", Some(request)).await {
+                Ok(pod) => return Ok(pod.map(wire::pod)),
+                Err(error) => error,
+            };
+            let full = is_capacity_error(&error);
+            if !full && error.status_code != Some(403) {
+                return Err(error);
+            }
+            if full || !refusal.as_ref().is_some_and(is_capacity_error) {
+                refusal = Some(error);
+            }
+        }
+        refusal.map_or(Ok(None), Err)
     }
 
     pub async fn stop_pod(&self, pod_id: &str) -> Result<(), RunPodError> {
-        self.rest(Method::POST, &format!("/pods/{pod_id}/stop"), None)
-            .await
-            .map(drop)
+        self.act(pod_id, "stop", "EXITED").await
     }
 
     pub async fn start_pod(&self, pod_id: &str) -> Result<(), RunPodError> {
-        self.rest(Method::POST, &format!("/pods/{pod_id}/start"), None)
-            .await
-            .map(drop)
+        self.act(pod_id, "start", "RUNNING").await
     }
 
     pub async fn delete_pod(&self, pod_id: &str) -> Result<(), RunPodError> {
@@ -521,7 +576,10 @@ impl RunPod {
         let start = Instant::now();
         let deadline = start.checked_add(budget).unwrap_or(start + FAR_FUTURE);
         let request = self
-            .request(Method::GET, format!("{LOGS}/{pod_id}/logs?tail={tail}"))
+            .request(
+                Method::GET,
+                format!("{BASE}/pods/{pod_id}/logs?tail={tail}"),
+            )
             .timeouts(LOG_CONNECT_TIMEOUT, LOG_READ_TIMEOUT);
         let unavailable = |error: HttpError| {
             RunPodError::new(format!("Platform logs unavailable ({error})"), None)
@@ -593,7 +651,7 @@ pub fn proxy_url(pod_id: &str, port: impl fmt::Display) -> String {
     format!("https://{pod_id}-{port}.proxy.runpod.net")
 }
 
-/// A list RunPod answers, bare or as `{"data": [...]}`; anything else is
+/// A list GraphQL answers, bare or as `{"data": [...]}`; anything else is
 /// no rows.
 fn rows(value: Option<Value>) -> Vec<Value> {
     match value {
