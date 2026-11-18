@@ -117,6 +117,22 @@ fn ctrl_j_alt_enter_and_a_trailing_backslash_add_a_line() {
     );
 }
 
+/// Shift+Enter adds a line, as Codex's `insert_newline` keys, where the
+/// terminal reports the Shift (kb d153); a popup open or not.
+#[test]
+fn shift_enter_adds_a_line() {
+    let mut t = typist();
+    t.type_text("one");
+    assert_eq!(t.mods(KeyCode::Enter, KeyModifiers::SHIFT), Action::None);
+    t.type_text("two");
+    assert_eq!(t.key(KeyCode::Enter), Action::Submit("one\ntwo".into()));
+    // With the slash popup open it adds a line too, not the choice.
+    t.type_text("/he");
+    assert!(!t.composer.popup().is_empty());
+    assert_eq!(t.mods(KeyCode::Enter, KeyModifiers::SHIFT), Action::None);
+    assert_eq!(t.composer.text(), "/he\n");
+}
+
 /// `test_paste.py`: a bracketed paste is one block, its newlines (sent as
 /// `\r`) kept, and only a real Enter sends it.
 #[test]

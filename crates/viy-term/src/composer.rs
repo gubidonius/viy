@@ -7,7 +7,8 @@
 //! in `\` insert a newline (rpctl kb f087); a bracketed paste arrives as one
 //! block whose newlines never send (`test_paste.py`); a sent line is
 //! trimmed, as rp's `_read_input(...).strip()`; Shift+Tab steps the chat
-//! mode. A terminal without bracketed paste types a paste as keys: Enter
+//! mode. Shift+Enter inserts a newline too, as Codex's, where the terminal
+//! tells it from Enter (kb d153). A terminal without bracketed paste types a paste as keys: Enter
 //! within 120 ms of a burst of keys under 8 ms apart is a newline, not a
 //! send (Codex's direct-insert path; no person types that fast).
 //!
@@ -265,6 +266,7 @@ impl Composer {
     pub fn key(&mut self, key: KeyEvent, now: Instant) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         // The key after a `!`: sooner than anyone types, it is a paste.
         if let Some(at) = self.shell_typed.take()
             && now.saturating_duration_since(at) <= BURST_CHAR_INTERVAL
@@ -304,7 +306,9 @@ impl Composer {
         let popup = self.popup();
         let action = match key.code {
             KeyCode::Enter if !alt && self.burst.enter_is_newline(now) => self.newline(),
-            KeyCode::Enter if alt => self.newline(),
+            // Shift+Enter only where the terminal tells it from Enter (the
+            // kitty keyboard protocol, [`crate::tui`]; kb d153).
+            KeyCode::Enter if alt || shift => self.newline(),
             KeyCode::Enter if self.area.text().ends_with('\\') => {
                 let text = self.area.text();
                 let kept = text[..text.len() - 1].to_string();

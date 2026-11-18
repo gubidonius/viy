@@ -49,7 +49,7 @@ fn send(f: &mut Fixture, line: &str) {
 
 #[test]
 fn rewind_picks_your_message_in_the_transcript() {
-    let mut f = fixture(40, 14);
+    let mut f = fixture(40, 16);
     three_turns(&mut f);
     send(&mut f, "/rewind");
     assert_eq!(f.ops(), []);
@@ -57,12 +57,17 @@ fn rewind_picks_your_message_in_the_transcript() {
     assert!(!reversed(&mut f, "two"));
     let screen = f.screen();
     assert!(
-        screen.iter().any(|r| r.starts_with("rewind: ↑↓ choose")),
+        screen.iter().any(|r| r.starts_with("rewind: ↑↓/←→ choose")),
         "{screen:?}"
     );
     f.key(KeyCode::Up);
     assert!(reversed(&mut f, "two"));
     assert!(!reversed(&mut f, "three"));
+    // Left and Right step as Codex's browsing does (kb d156).
+    f.key(KeyCode::Right);
+    assert!(reversed(&mut f, "three"));
+    f.key(KeyCode::Left);
+    assert!(reversed(&mut f, "two"));
     f.key(KeyCode::Home);
     assert!(reversed(&mut f, "one"));
     f.key(KeyCode::Down);
@@ -92,23 +97,38 @@ fn rewind_picks_your_message_in_the_transcript() {
 fn esc_twice_at_an_empty_idle_prompt_opens_the_pick_and_esc_leaves_it() {
     let mut f = fixture(40, 14);
     three_turns(&mut f);
+    let footer = |f: &mut Fixture| f.screen().last().cloned().unwrap_or_default();
+    let idle = footer(&mut f);
     f.key(KeyCode::Esc);
+    // Codex's hint while the second Esc would open the pick (kb d156).
+    assert_eq!(footer(&mut f), "Esc again to edit previous message");
     f.key(KeyCode::Char('x'));
+    assert_eq!(footer(&mut f), idle);
     f.key(KeyCode::Backspace);
     f.key(KeyCode::Esc);
     assert!(!reversed(&mut f, "three"), "a key between the two Escs");
     f.key(KeyCode::Esc);
     assert!(reversed(&mut f, "three"));
+    assert_eq!(footer(&mut f), idle);
     f.key(KeyCode::Up);
     f.key(KeyCode::Esc);
     assert!(!reversed(&mut f, "two"));
     assert!(!reversed(&mut f, "three"));
     assert_eq!(f.ops(), []);
-    // Not while a turn runs.
+    // Not while a turn runs: there Esc stops the turn.
     f.app.event(started("four"));
     f.key(KeyCode::Esc);
     f.key(KeyCode::Esc);
     assert!(!reversed(&mut f, "three"));
+    assert_eq!(f.ops(), [Op::Interrupt, Op::Interrupt]);
+}
+
+#[test]
+fn a_first_esc_with_no_message_to_pick_shows_no_hint() {
+    let mut f = fixture(40, 8);
+    let idle = f.screen().last().cloned().unwrap_or_default();
+    f.key(KeyCode::Esc);
+    assert_eq!(f.screen().last().cloned().unwrap_or_default(), idle);
 }
 
 #[test]
@@ -134,11 +154,16 @@ fn rewind_with_nothing_to_pick_asks_the_chat() {
 
 #[test]
 fn new_draws_an_empty_transcript() {
-    let mut f = fixture(30, 8);
+    let mut f = fixture(30, 10);
     three_turns(&mut f);
     f.app.event(rewritten(RewriteReason::New, vec![]));
     f.app.event(notice("new chat"));
-    assert_eq!(f.screen(), ["", "", "", "", "", "new chat", "› ▮", ""]);
+    let rule = rule(30);
+    let rule = rule.as_str();
+    assert_eq!(
+        f.screen(),
+        ["", "", "", "", "", "new chat", rule, EMPTY, rule, ""]
+    );
 }
 
 #[test]
@@ -181,7 +206,7 @@ fn a_resumed_chat_is_drawn_whole() {
 
 #[test]
 fn a_compaction_keeps_the_transcript_and_adds_a_marker() {
-    let mut f = fixture(70, 16);
+    let mut f = fixture(70, 18);
     three_turns(&mut f);
     f.app
         .event(EventMsg::ContextCompacted(ContextCompactedEvent {

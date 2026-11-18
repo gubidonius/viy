@@ -1,6 +1,7 @@
 //! The terminal's default colours, asked once at start (OSC 10 and 11, as
-//! Codex's `terminal_probe` does), for art that blends into whatever the
-//! terminal shows: the header's ghost (`header.rs`).
+//! Codex's `terminal_probe` does), for what blends into whatever the
+//! terminal shows: the header's ghost (`header.rs`), and the input box's
+//! dotted rules and placeholder ([`faint`]).
 //!
 //! The question goes out right after raw mode is on and before the chat
 //! reads any input: OSC 10 (foreground), OSC 11 (background), then DA1,
@@ -10,6 +11,10 @@
 
 use std::sync::OnceLock;
 use std::time::Duration;
+
+use ratatui::style::Color;
+
+use crate::header::Colors;
 
 pub type Rgb = (u8, u8, u8);
 
@@ -28,6 +33,33 @@ pub struct DefaultColors {
 /// What [`probe`] found, if it ran and the terminal answered.
 pub fn default_colors() -> Option<DefaultColors> {
     COLORS.get().copied().flatten()
+}
+
+/// Ink at `opacity` (0-1): the terminal's foreground thinned into its
+/// background, as Codex tints its composer from the background the
+/// terminal reported (`codex-rs/tui/src/style.rs`), so it sits back on a
+/// dark theme and a light one alike. Without 24-bit colour (`COLORTERM`),
+/// or when the terminal did not say its colours, the palette's own faint
+/// ink, bright black.
+pub fn faint(opacity: f32) -> Color {
+    match default_colors() {
+        Some(colors) if Colors::detect() == Colors::True => {
+            let (r, g, b) = thinned(colors, opacity);
+            Color::Rgb(r, g, b)
+        }
+        _ => Color::DarkGray,
+    }
+}
+
+/// `opacity` of the way from the background to the foreground.
+pub(crate) fn thinned(colors: DefaultColors, opacity: f32) -> Rgb {
+    let mix =
+        |bg: u8, fg: u8| (f32::from(bg) + (f32::from(fg) - f32::from(bg)) * opacity).round() as u8;
+    (
+        mix(colors.bg.0, colors.fg.0),
+        mix(colors.bg.1, colors.fg.1),
+        mix(colors.bg.2, colors.fg.2),
+    )
 }
 
 /// Asks the terminal once; later calls do nothing. Needs raw mode.

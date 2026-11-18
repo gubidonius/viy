@@ -162,8 +162,9 @@ fn foreign(parser: &vt100::Parser<viy_testkit::screen::Recorder>) -> Vec<String>
         .collect()
 }
 
-/// The tab titles viy wrote, in order, and the bytes without them and
-/// without the title stack.
+/// The tab titles viy wrote, in order, and the bytes without them,
+/// without the title stack, the colour question and the kitty keyboard
+/// flags' push and pop (kb d153).
 fn own_titles(bytes: &[u8]) -> (Vec<String>, Vec<u8>) {
     let text = String::from_utf8_lossy(bytes).into_owned();
     let mut titles = Vec::new();
@@ -178,7 +179,9 @@ fn own_titles(bytes: &[u8]) -> (Vec<String>, Vec<u8>) {
     let rest = rest
         .replace("\x1b[22;0t", "")
         .replace("\x1b[23;0t", "")
-        .replacen(viy_term::palette::QUESTION, "", 1);
+        .replacen(viy_term::palette::QUESTION, "", 1)
+        .replace("\x1b[>5u", "")
+        .replace("\x1b[<1u", "");
     (titles, rest.into_bytes())
 }
 

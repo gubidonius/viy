@@ -60,14 +60,14 @@ fn a_box_is_drawn_above_the_input_and_answered_once_seen() {
     assert_eq!(
         screen[3..],
         [
-            "⠋ waiting · 0 s · Ctrl-C stops",
+            "⠋ waiting · 0 s · Esc stops",
             "┌ network access ────────────────────────────────┐",
             "│   wants the network: pip install httpx         │",
             "│   run it with network access? [y/N/a=always]   │",
             "│ [y] yes   [n] no (default)   [a] always        │",
             "│ [⇧Tab] mode                                    │",
             "└────────────────────────────────────────────────┘",
-            "› ▮",
+            EMPTY,
             "",
         ],
         "{screen:?}"
@@ -81,14 +81,15 @@ fn a_box_is_drawn_above_the_input_and_answered_once_seen() {
             answer: Answer::Always
         }]
     );
+    // The box gone, the rules are back under the activity line.
     let screen = f.screen();
     assert_eq!(
-        screen[6..10],
+        screen[4..8],
         [
             "you › install httpx",
             "  wants the network: pip install httpx",
             "  run it with network access? [y/N/a=always] a",
-            "⠋ waiting · 0 s · Ctrl-C stops",
+            "⠋ waiting · 0 s · Esc stops",
         ],
         "{screen:?}"
     );
@@ -163,7 +164,7 @@ fn a_key_before_the_guard_goes_to_the_input_box() {
     f.screen();
     f.key(KeyCode::Char('y'));
     assert_eq!(f.ops(), []);
-    assert_eq!(f.screen()[8], "› y▮");
+    assert_eq!(f.screen()[7], "› y▮");
     // Still typing: each key starts the guard again.
     f.key_after(Duration::from_millis(290), KeyCode::Char('e'));
     f.key_after(Duration::from_millis(290), KeyCode::Char('s'));
@@ -324,7 +325,7 @@ fn ctrl_c_before_the_box_is_drawn_stops_the_turn() {
     }));
     let screen = f.screen();
     assert_eq!(
-        screen[6..8],
+        screen[4..6],
         ["  run it? [y/N]", "■ interrupted"],
         "{screen:?}"
     );
@@ -488,6 +489,22 @@ fn keys_before_the_guard_are_dropped_not_typed_into_the_draft() {
     f.key(KeyCode::Char('7'));
     f.key(KeyCode::Enter);
     assert_eq!(secrets(&f.ops()), [("q1".into(), Some("7".into()))]);
+}
+
+/// A box in front takes the Esc, as Codex's modals do, and a y/N/a box
+/// keeps rp's keys: Esc neither answers it nor stops the turn (Esc stops
+/// a turn only with nothing in front, kb d156).
+#[test]
+fn esc_at_a_box_neither_answers_it_nor_stops_the_turn() {
+    let mut f = fixture(50, 12);
+    f.app.event(started("install httpx"));
+    ask(&mut f, "q1", network());
+    f.screen();
+    f.wait();
+    f.key(KeyCode::Esc);
+    assert_eq!(f.ops(), []);
+    let screen = f.screen().join("\n");
+    assert!(screen.contains("run it with network access?"), "{screen}");
 }
 
 #[test]

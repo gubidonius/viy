@@ -36,6 +36,7 @@ use ratatui::backend::Backend;
 use ratatui::layout::Position;
 use ratatui::layout::Rect;
 use ratatui::layout::Size;
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Stylize;
@@ -93,6 +94,19 @@ const WHEEL_ROWS: usize = 3;
 
 /// Queued messages shown above the input at most.
 const QUEUED_ROWS: usize = 3;
+
+/// The rules above and below the input box: one Braille dot a cell, at
+/// the cell's middle (Gregory's pick from mockups, kb d152).
+const RULE_DOT: char = '⠂';
+/// What the empty input box shows (Gregory's words, kb d152).
+const PLACEHOLDER: &str = "Send word below..";
+/// How strongly the rules and the placeholder show: this much of the
+/// terminal's foreground over its background ([`crate::palette::faint`]).
+const INPUT_INK: f32 = 0.26;
+/// The caret: a steady see-through block, as iTerm2's, the terminal's
+/// foreground blended this far into its background behind the letter it
+/// is on (kb d155).
+const CARET_INK: f32 = 0.55;
 
 /// What reaches the app from the terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,7 +182,9 @@ pub struct App {
     art_gone: f32,
     /// While the art dissolves or comes back: when it last moved.
     art_moved: Option<Instant>,
-    /// Esc was pressed at an empty, idle prompt: a second opens the pick.
+    /// Esc was pressed at an empty, idle prompt: a second opens the pick,
+    /// and the footer says so while there is a message to pick (Codex's
+    /// "esc again to edit previous message", kb d156).
     esc_primed: bool,
     /// The engine's statuses, for the footer and the tab title.
     status: Status,
@@ -185,7 +201,7 @@ pub struct App {
     limiter: FrameLimiter,
     last_frame: Option<Instant>,
     /// Where the caret was drawn in the last frame, if anywhere. viy draws
-    /// its own caret (a blinking reversed block) and keeps the terminal's
+    /// its own caret (a see-through block, kb d155) and keeps the terminal's
     /// cursor hidden at the top left: a terminal made shorter scrolls its
     /// screen up to keep its cursor in view before viy repaints (GNOME
     /// Terminal's VTE does), so with the cursor in the input box at the
@@ -835,6 +851,19 @@ impl App {
             }
             return None;
         }
+        // Esc stops the turn running, as Codex's interrupt key (kb d156):
+        // a draft stays; a question box in front, or the slash popup,
+        // takes the Esc instead.
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && (self.turn.is_some() || !self.queued.is_empty())
+            && self.questions.front().is_none()
+            && self.composer.popup().is_empty()
+            && !self.closing
+        {
+            let _ = self.ops.send(Op::Interrupt);
+            return None;
+        }
         if !secret_front && self.closing && key.code == KeyCode::Char('c') && ctrl {
             // A second Ctrl-C while closing: leave now.
             return Some(Flow::Exit);
@@ -1035,9 +1064,10 @@ impl App {
         }
     }
 
-    /// A key during the pick: Up and Down move between your messages,
-    /// Home and End to the first and last, Enter goes back to before the
-    /// chosen one, Esc and Ctrl-C leave it as it was.
+    /// A key during the pick: Up and Down, or Left and Right as in Codex's
+    /// browsing (kb d156), move between your messages, Home and End to the
+    /// first and last, Enter goes back to before the chosen one, Esc and
+    /// Ctrl-C leave it as it was.
     fn pick_key(&mut self, key: KeyEvent) {
         let Some(k) = self.picking else {
             return;
@@ -1045,8 +1075,8 @@ impl App {
         let last = self.points.len().saturating_sub(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Up => self.choose(k.saturating_sub(1)),
-            KeyCode::Down => self.choose((k + 1).min(last)),
+            KeyCode::Up | KeyCode::Left => self.choose(k.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Right => self.choose((k + 1).min(last)),
             KeyCode::Home => self.choose(0),
             KeyCode::End => self.choose(last),
             KeyCode::Enter => {
@@ -1314,17 +1344,36 @@ impl App {
         }
         live.extend(question);
         live.extend(tail);
-        let input_top = live.len();
+        // The input box sits between two dotted rules (kb d152), in rows
+        // nothing else wants: they give way before any other row.
+        let ruled = live.len() + fixed + 2 <= room;
+        let ink = crate::palette::faint(INPUT_INK);
+        let rule = Line::from(RULE_DOT.to_string().repeat(usize::from(size.width)).fg(ink));
         let mut bottom = live;
+        if ruled {
+            bottom.push(rule.clone());
+        }
+        let input_top = bottom.len();
         let prompt = match self.composer.shell() {
             Some(Shell::Shared) => "! ".red().bold(),
             Some(Shell::Private) => "!!".magenta().bold(),
             None => "› ".cyan(),
         };
+        // Not in shell mode: what goes in there is a command, not words.
+        let placeholder = self.composer.is_empty() && self.composer.shell().is_none();
         let input_count = input_rows.len();
         for (i, row) in input_rows.into_iter().enumerate() {
             let prefix = if i == 0 { prompt.clone() } else { "  ".into() };
-            bottom.push(Line::from(vec![prefix, row.into()]));
+            let text = if placeholder {
+                let shown: String = PLACEHOLDER.chars().take(usize::from(width - 2)).collect();
+                shown.fg(ink)
+            } else {
+                row.into()
+            };
+            bottom.push(Line::from(vec![prefix, text]));
+        }
+        if ruled {
+            bottom.push(rule);
         }
         let bottom_rows = bottom.len() + 1;
         let bottom_height = u16::try_from(bottom_rows)
@@ -1353,6 +1402,7 @@ impl App {
         let input_y = top_height + u16::try_from(input_top).unwrap_or(0);
         self.input_at = (input_y, first_input, input_count);
         let selected = self.composer.selected_cells();
+        let caret_ink = crate::palette::faint(CARET_INK);
         let (cells, view) = (&self.cells, &mut self.view);
         term.draw(|frame| {
             view.render(cells, top, frame.buffer_mut());
@@ -1373,9 +1423,18 @@ impl App {
                 }
             }
             if let Some(at) = caret {
-                frame.buffer_mut()[at].set_style(
-                    Style::new().add_modifier(Modifier::REVERSED | Modifier::SLOW_BLINK),
-                );
+                // The letter under the block keeps its own ink; on the
+                // placeholder's first letter, the terminal's own, not the
+                // placeholder's faint one. A selection's reversal gives
+                // way, so the block shows there too.
+                let block = Style::new().bg(caret_ink);
+                let cell = &mut frame.buffer_mut()[at];
+                cell.modifier.remove(Modifier::REVERSED);
+                cell.set_style(if placeholder {
+                    block.fg(Color::Reset)
+                } else {
+                    block
+                });
             }
         })?;
         self.caret = caret;
@@ -1389,8 +1448,8 @@ impl App {
     fn activity_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         if self.picking.is_some() {
-            let hint = "rewind: ↑↓ choose your message · Enter goes back to before it, to edit \
-                        and send again · Esc leaves it";
+            let hint = "rewind: ↑↓/←→ choose your message · Enter goes back to before it, to \
+                        edit and send again · Esc leaves it";
             lines.push(Line::from(
                 hint.chars().take(width).collect::<String>().cyan(),
             ));
@@ -1416,7 +1475,7 @@ impl App {
         if turn.tokens > 0 {
             activity.push_str(&format!("{} tok · ", turn.tokens));
         }
-        activity.push_str(&format!("{:.0} s · Ctrl-C stops", elapsed.as_secs_f32()));
+        activity.push_str(&format!("{:.0} s · Esc stops", elapsed.as_secs_f32()));
         lines.push(Line::from(vec![
             SPINNER[frame].magenta(),
             " ".into(),
@@ -1513,6 +1572,11 @@ impl App {
     }
 
     fn footer(&self, width: usize) -> Line<'static> {
+        // After a first Esc at an empty, idle prompt (Codex's footer hint).
+        if self.esc_primed && !self.points.is_empty() {
+            let hint = "Esc again to edit previous message";
+            return Line::from(hint.chars().take(width).collect::<String>().dim());
+        }
         let counts = Counts {
             questions: self.questions.waiting(),
             queued: if self.turn.is_some() {

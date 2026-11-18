@@ -2,8 +2,11 @@
 //! raw mode, so Ctrl-C and Ctrl-Z are keys; the alternate screen, so the
 //! shell's screen and history come back untouched (kb d038), with line wrap
 //! off on it (see [`set_modes`]); bracketed
-//! paste; mouse capture for the wheel unless tmux has `mouse off`; and,
-//! when the chat sets the tab title, the shell's title saved on xterm's
+//! paste; mouse capture for the wheel unless tmux has `mouse off`; the
+//! kitty keyboard protocol's first and third flags, as Codex's
+//! `keyboard_modes.rs`, so a terminal that has it tells Shift+Enter from
+//! Enter (kb d153; one without it ignores the request); and, when the chat
+//! sets the tab title, the shell's title saved on xterm's
 //! title stack (rpctl `termtitle.py`).
 //!
 //! Every exit path gives the terminal back: [`restore`] runs from
@@ -25,6 +28,9 @@ use crossterm::event::DisableBracketedPaste;
 use crossterm::event::DisableMouseCapture;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::EnableMouseCapture;
+use crossterm::event::KeyboardEnhancementFlags;
+use crossterm::event::PopKeyboardEnhancementFlags;
+use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::execute;
 use crossterm::terminal::DisableLineWrap;
 use crossterm::terminal::EnableLineWrap;
@@ -46,6 +52,7 @@ static RAW: AtomicBool = AtomicBool::new(false);
 static SCREEN: AtomicBool = AtomicBool::new(false);
 static NOWRAP: AtomicBool = AtomicBool::new(false);
 static PASTE: AtomicBool = AtomicBool::new(false);
+static KEYS: AtomicBool = AtomicBool::new(false);
 static MOUSE: AtomicBool = AtomicBool::new(false);
 static TITLE: AtomicBool = AtomicBool::new(false);
 
@@ -141,6 +148,16 @@ fn set_modes(mouse: bool) -> io::Result<()> {
     execute!(out, DisableLineWrap)?;
     PASTE.store(true, Ordering::SeqCst);
     execute!(out, EnableBracketedPaste)?;
+    // Codex's flags less its event types (key releases): escape codes
+    // without ambiguity, and the alternate keys.
+    KEYS.store(true, Ordering::SeqCst);
+    execute!(
+        out,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    )?;
     if mouse {
         MOUSE.store(true, Ordering::SeqCst);
         execute!(out, EnableMouseCapture)?;
@@ -155,8 +172,8 @@ fn push_title() -> io::Result<()> {
     out.flush()
 }
 
-/// Gives the shell its terminal back: its title, mouse and paste modes
-/// off, line wrap on, the main screen with the cursor shown, raw mode off. Each mode is undone only if
+/// Gives the shell its terminal back: its title, mouse, keyboard and
+/// paste modes off, line wrap on, the main screen with the cursor shown, raw mode off. Each mode is undone only if
 /// it is on, so this may run twice (the panic hook, then the drop). The
 /// first error is returned after every step has been tried.
 pub fn restore() -> io::Result<()> {
@@ -175,6 +192,9 @@ pub fn restore() -> io::Result<()> {
     }
     if MOUSE.swap(false, Ordering::SeqCst) {
         step(execute!(out, DisableMouseCapture));
+    }
+    if KEYS.swap(false, Ordering::SeqCst) {
+        step(execute!(out, PopKeyboardEnhancementFlags));
     }
     if PASTE.swap(false, Ordering::SeqCst) {
         step(execute!(out, DisableBracketedPaste));

@@ -26,6 +26,15 @@ struct Fixture {
     clock: Instant,
 }
 
+/// An empty input box as [`Fixture::screen`] shows it: the placeholder,
+/// the caret on its first letter (kb d152).
+const EMPTY: &str = "› ▮end word below..";
+
+/// The dotted rule above and below the input box, `width` cells wide.
+fn rule(width: usize) -> String {
+    "⠂".repeat(width)
+}
+
 fn fixture(width: u16, height: u16) -> Fixture {
     let (tx, ops) = mpsc::unbounded_channel();
     Fixture {
@@ -130,35 +139,81 @@ fn numbered(f: &mut Fixture, n: usize) {
 }
 
 #[test]
-fn an_idle_chat_is_the_input_and_the_footer() {
+fn an_idle_chat_is_the_input_between_two_rules_and_the_footer() {
+    let mut f = fixture(30, 7);
+    let rule = rule(30);
+    let rule = rule.as_str();
+    assert_eq!(f.screen(), ["", "", "", rule, EMPTY, rule, ""]);
+    // Too short for them, the rules give way before any other row.
     let mut f = fixture(30, 5);
-    assert_eq!(f.screen(), ["", "", "", "› ▮", ""]);
+    assert_eq!(f.screen(), ["", "", "", EMPTY, ""]);
+}
+
+/// The empty box shows its placeholder and the rules in faint ink, the
+/// caret in the terminal's own; typing hides the placeholder, emptying
+/// the box brings it back, and shell mode has none (kb d152).
+#[test]
+fn the_placeholder_shows_while_the_box_is_empty() {
+    let mut f = fixture(30, 7);
+    assert_eq!(f.screen()[4], EMPTY);
+    let screen = f.term.backend().vt100().screen();
+    // No colours from the terminal under test: bright black.
+    let faint = vt100::Color::Idx(8);
+    assert_eq!(screen.cell(3, 0).unwrap().fgcolor(), faint);
+    assert_eq!(screen.cell(4, 3).unwrap().fgcolor(), faint);
+    assert_eq!(screen.cell(5, 29).unwrap().fgcolor(), faint);
+    let caret = screen.cell(4, 2).unwrap();
+    assert_eq!(caret.bgcolor(), faint);
+    assert_eq!(caret.fgcolor(), vt100::Color::Default);
+    f.type_text("hi");
+    assert_eq!(f.screen()[4], "› hi▮");
+    f.key(KeyCode::Backspace);
+    f.key(KeyCode::Backspace);
+    assert_eq!(f.screen()[4], EMPTY);
+    f.type_text("!");
+    assert_eq!(f.screen()[4], "! ▮");
 }
 
 /// The terminal's cursor stays hidden at the top left, where a terminal
 /// made shorter has nothing to scroll up for (GNOME Terminal scrolls its
 /// screen to keep the cursor in view before viy repaints); the input box
-/// shows viy's own caret, a blinking reversed block.
+/// shows viy's own caret, a steady see-through block: the letter under it
+/// in its own ink on the faint background, no blink (kb d155).
 #[test]
 fn the_caret_is_drawn_and_the_cursor_waits_at_the_top_left() {
     let mut f = fixture(30, 5);
-    assert_eq!(f.screen(), ["", "", "", "› ▮", ""]);
+    assert_eq!(f.screen(), ["", "", "", EMPTY, ""]);
     let screen = f.term.backend().vt100().screen();
     assert!(screen.hide_cursor());
     assert_eq!(screen.cursor_position(), (0, 0));
     let caret = screen.cell(3, 2).unwrap();
-    assert!(caret.inverse());
+    assert_eq!(caret.bgcolor(), vt100::Color::Idx(8));
+    assert!(!caret.inverse());
+    // No blink (SGR 5), which vt100 records as a sequence it lacks.
+    let events = &f.term.backend().vt100().callbacks().events;
+    assert!(!events.iter().any(|e| e == "csi [[5]] m"), "{events:?}");
+    f.type_text("ab");
+    f.key(KeyCode::Left);
+    assert_eq!(f.screen()[3], "› a▮");
+    let screen = f.term.backend().vt100().screen();
+    let on_b = screen.cell(3, 3).unwrap();
+    assert_eq!(on_b.contents(), "b");
+    assert_eq!(on_b.bgcolor(), vt100::Color::Idx(8));
+    assert_eq!(on_b.fgcolor(), vt100::Color::Default);
+    assert!(!on_b.inverse());
+    f.key(KeyCode::Backspace);
+    f.key(KeyCode::Delete);
     f.term.backend_mut().resize(30, 4);
     f.input(Input::Resize(30, 4));
-    assert_eq!(f.screen(), ["", "", "› ▮", ""]);
+    assert_eq!(f.screen(), ["", "", EMPTY, ""]);
     assert_eq!(f.term.backend().vt100().screen().cursor_position(), (0, 0));
 }
 
 #[test]
 fn enter_sends_the_line_and_the_turn_shows_it() {
-    let mut f = fixture(40, 6);
+    let mut f = fixture(40, 8);
     f.type_text("hello");
-    assert_eq!(f.screen()[4], "› hello▮");
+    assert_eq!(f.screen()[5], "› hello▮");
     f.key(KeyCode::Enter);
     assert_eq!(
         f.ops(),
@@ -170,7 +225,8 @@ fn enter_sends_the_line_and_the_turn_shows_it() {
     let screen = f.screen();
     assert_eq!(screen[..3], ["", "", "you › hello"]);
     assert!(screen[3].starts_with("⠋ waiting · 0 s"), "{screen:?}");
-    assert_eq!(screen[4..], ["› ▮", ""]);
+    let rule = rule(40);
+    assert_eq!(screen[4..], [rule.as_str(), EMPTY, &rule, ""]);
 }
 
 #[test]
@@ -218,7 +274,7 @@ fn a_paste_is_inserted_and_never_sends() {
 
 #[test]
 fn finished_blocks_move_up_and_the_open_one_streams_below() {
-    let mut f = fixture(40, 11);
+    let mut f = fixture(40, 13);
     f.app.event(started("explain"));
     f.app.event(delta("First **para"));
     f.app.event(delta("graph**.\n\nSecond "));
@@ -239,7 +295,8 @@ fn finished_blocks_move_up_and_the_open_one_streams_below() {
         ]
     );
     assert!(screen[8].contains("writing ·"), "{screen:?}");
-    assert_eq!(screen[9..], ["› ▮", ""]);
+    let rule = rule(40);
+    assert_eq!(screen[9..], [rule.as_str(), EMPTY, &rule, ""]);
     f.app.event(delta("one.\nmore"));
     let screen = f.screen();
     let streamed = [
@@ -257,12 +314,12 @@ fn finished_blocks_move_up_and_the_open_one_streams_below() {
     f.app.event(complete());
     let screen = f.screen();
     assert_eq!(screen[2..9], streamed);
-    assert_eq!(screen[9..], ["› ▮", ""]);
+    assert_eq!(screen[9..], [rule.as_str(), EMPTY, &rule, ""]);
 }
 
 #[test]
 fn a_blank_line_inside_a_code_fence_keeps_the_block_live() {
-    let mut f = fixture(40, 12);
+    let mut f = fixture(40, 14);
     f.app.event(started("code"));
     f.app.event(delta("```\nfn a() {}\n\nfn b() {}\n"));
     let screen = f.screen();
@@ -301,7 +358,7 @@ fn a_blank_line_inside_a_code_fence_keeps_the_block_live() {
 
 #[test]
 fn notices_and_failures_go_to_the_transcript() {
-    let mut f = fixture(40, 6);
+    let mut f = fixture(40, 8);
     f.app.event(started("hi"));
     f.app.event(notice("[context: 3% of 262k]"));
     f.app.event(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -317,7 +374,9 @@ fn notices_and_failures_go_to_the_transcript() {
             "you › hi",
             "[context: 3% of 262k]",
             "✗ the request failed",
-            "› ▮",
+            &rule(40),
+            EMPTY,
+            &rule(40),
             ""
         ]
     );
@@ -325,7 +384,7 @@ fn notices_and_failures_go_to_the_transcript() {
 
 #[test]
 fn ctrl_c_interrupts_a_turn_then_clears_the_input_then_closes() {
-    let mut f = fixture(40, 6);
+    let mut f = fixture(40, 8);
     f.app.event(started("hi"));
     f.app.event(delta("partial"));
     assert_eq!(f.ctrl('c'), None);
@@ -338,10 +397,14 @@ fn ctrl_c_interrupts_a_turn_then_clears_the_input_then_closes() {
     f.type_text("draft");
     f.ctrl('c');
     assert_eq!(f.ops(), []);
-    assert_eq!(f.screen()[4], "› ▮");
+    assert_eq!(f.screen()[5], EMPTY);
     f.ctrl('c');
     assert_eq!(f.ops(), [Op::Shutdown]);
-    assert_eq!(f.screen()[3..], ["closing the chat…", "› ▮", ""]);
+    let rule = rule(40);
+    assert_eq!(
+        f.screen()[3..],
+        ["closing the chat…", &rule, EMPTY, &rule, ""]
+    );
     // A second Ctrl-C while closing leaves at once.
     assert_eq!(f.ctrl('c'), Some(Flow::Exit));
 }
@@ -355,6 +418,36 @@ fn ctrl_d_closes_only_at_an_empty_idle_prompt() {
     f.key(KeyCode::Backspace);
     f.ctrl('d');
     assert_eq!(f.ops(), [Op::Shutdown]);
+}
+
+/// Esc stops the turn running, as Codex's interrupt key, and keeps the
+/// draft; the slash popup takes an Esc first (kb d156).
+#[test]
+fn esc_stops_the_turn_running_and_keeps_the_draft() {
+    let mut f = fixture(40, 8);
+    f.app.event(started("one"));
+    let screen = f.screen();
+    assert!(
+        screen.iter().any(|r| r.ends_with("0 s · Esc stops")),
+        "{screen:?}"
+    );
+    f.type_text("draft");
+    f.key(KeyCode::Esc);
+    assert_eq!(f.ops(), [Op::Interrupt]);
+    assert_eq!(f.app.composer.text(), "draft");
+    f.app.composer.clear();
+    f.type_text("/he");
+    assert!(!f.app.composer.popup().is_empty());
+    f.key(KeyCode::Esc);
+    assert_eq!(f.ops(), []);
+    assert!(f.app.composer.popup().is_empty());
+    f.key(KeyCode::Esc);
+    assert_eq!(f.ops(), [Op::Interrupt]);
+    // Idle, Esc stops nothing.
+    f.app.event(complete());
+    f.app.composer.clear();
+    f.key(KeyCode::Esc);
+    assert_eq!(f.ops(), []);
 }
 
 #[test]
@@ -383,11 +476,15 @@ fn lines_sent_during_a_turn_are_shown_queued() {
 
 #[test]
 fn page_keys_and_the_wheel_scroll_the_transcript() {
-    let mut f = fixture(30, 6);
+    let mut f = fixture(30, 8);
     numbered(&mut f, 20);
+    let rule = rule(30);
+    let rule = rule.as_str();
     assert_eq!(
         f.screen(),
-        ["line 17", "line 18", "line 19", "line 20", "› ▮", ""]
+        [
+            "line 17", "line 18", "line 19", "line 20", rule, EMPTY, rule, ""
+        ]
     );
     f.key(KeyCode::PageUp);
     assert_eq!(
@@ -397,7 +494,9 @@ fn page_keys_and_the_wheel_scroll_the_transcript() {
             "line 15",
             "line 16",
             "line 17",
-            "› ▮",
+            rule,
+            EMPTY,
+            rule,
             "↓ 3 rows (End)"
         ]
     );
@@ -410,17 +509,19 @@ fn page_keys_and_the_wheel_scroll_the_transcript() {
     assert_eq!(f.screen()[0], "line 11");
     // Rows arriving while scrolled back leave the view where it is.
     f.app.event(notice("line 21"));
-    assert_eq!(f.screen()[5], "↓ 7 rows (End)");
+    assert_eq!(f.screen()[7], "↓ 7 rows (End)");
     f.key(KeyCode::End);
     assert_eq!(
         f.screen(),
-        ["line 18", "line 19", "line 20", "line 21", "› ▮", ""]
+        [
+            "line 18", "line 19", "line 20", "line 21", rule, EMPTY, rule, ""
+        ]
     );
 }
 
 #[test]
 fn a_rewritten_history_is_drawn_from_its_items() {
-    let mut f = fixture(30, 7);
+    let mut f = fixture(30, 9);
     numbered(&mut f, 3);
     f.app
         .event(EventMsg::HistoryRewritten(HistoryRewrittenEvent {
@@ -439,7 +540,9 @@ fn a_rewritten_history_is_drawn_from_its_items() {
             "thought · Ctrl-T shows it",
             "",
             "a",
-            "› ▮",
+            &rule(30),
+            EMPTY,
+            &rule(30),
             ""
         ]
     );
@@ -479,7 +582,7 @@ fn reasoning_and_running_tools_scroll_with_the_transcript() {
     use viy_protocol::ToolCallBeginEvent;
     use viy_protocol::ToolCallOutputDeltaEvent;
 
-    let mut f = fixture(40, 7);
+    let mut f = fixture(40, 9);
     numbered(&mut f, 3);
     f.app.event(started("go"));
     f.app.event(EventMsg::ReasoningContentDelta(DeltaEvent {
@@ -570,7 +673,7 @@ async fn a_resize_reflows_in_one_frame_without_clearing() {
     };
     let (flow, ()) = tokio::join!(f.app.run(&mut f.term, &mut input, &mut events), driver);
     assert_eq!(flow.unwrap(), Flow::Exit);
-    assert_eq!(f.rows(), ["", "aaaa bbbb", "cccc dddd", "› ▮", ""]);
+    assert_eq!(f.rows(), ["", "aaaa bbbb", "cccc dddd", "› ▮end wor", ""]);
     let written = &f.term.backend().written()[before..];
     assert_eq!(
         written.windows(8).filter(|w| w == b"\x1b[?2026h").count(),
@@ -611,7 +714,7 @@ async fn sigterm_closes_the_chat_once_the_engine_has_saved_it() {
     let (flow, ()) = tokio::join!(f.app.run(&mut f.term, &mut input, &mut events), driver);
     assert_eq!(flow.unwrap(), Flow::Exit);
     assert_eq!(f.ops(), [Op::Shutdown]);
-    assert_eq!(f.rows(), ["", "", "closing the chat…", "› ▮", ""]);
+    assert_eq!(f.rows(), ["", "", "closing the chat…", EMPTY, ""]);
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -643,14 +746,14 @@ mod selection;
 /// choice, and its values follow.
 #[test]
 fn the_slash_popup_is_drawn_above_the_input() {
-    let mut f = fixture(60, 8);
+    let mut f = fixture(60, 10);
     f.type_text("/ef");
     let screen = f.screen();
     assert_eq!(
         screen[5], "  /effort [xhigh|medium|low]  how hard the model thinks",
         "{screen:?}"
     );
-    assert_eq!(screen[6], "› /ef▮");
+    assert_eq!(screen[7], "› /ef▮");
     f.key(KeyCode::Tab);
     let screen = f.screen();
     assert_eq!(
@@ -662,7 +765,7 @@ fn the_slash_popup_is_drawn_above_the_input() {
         ],
         "{screen:?}"
     );
-    assert_eq!(screen[6], "› /effort ▮");
+    assert_eq!(screen[7], "› /effort ▮");
 }
 
 /// Shift+Tab asks the engine for the next mode; the mode it names shows
@@ -763,7 +866,7 @@ fn a_whole_turn(f: &mut Fixture) {
 
 #[test]
 fn a_whole_turn_folded() {
-    let mut f = fixture(48, 22);
+    let mut f = fixture(48, 24);
     a_whole_turn(&mut f);
     insta::assert_snapshot!(f.screen().join("\n"));
 }

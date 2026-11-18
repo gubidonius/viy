@@ -90,6 +90,16 @@ fn assert_title_given_back(bytes: &[u8]) {
     assert!(last(tabtitle::POP) > last("\x1b]0;"));
 }
 
+/// The kitty keyboard flags (kb d153) pushed as often as popped, the
+/// popping last: a shell must not get Ctrl-C as an escape code.
+fn assert_keys_given_back(bytes: &[u8]) {
+    let count = |seq: &[u8]| bytes.windows(seq.len()).filter(|w| *w == seq).count();
+    let last = |seq: &[u8]| bytes.windows(seq.len()).rposition(|w| w == seq);
+    assert!(count(b"\x1b[>5u") > 0, "never pushed");
+    assert_eq!(count(b"\x1b[>5u"), count(b"\x1b[<1u"));
+    assert!(last(b"\x1b[<1u") > last(b"\x1b[>5u"));
+}
+
 /// Line wrap is off while viy has the screen and on again after: a frame
 /// laid out for a wider window must not wrap, and scroll the screen, when
 /// the window narrows under it (kb d093).
@@ -116,6 +126,7 @@ fn a_panic_gives_the_terminal_back_before_its_message() {
     assert_given_back(parser.screen());
     assert_title_given_back(&bytes);
     assert_wrap_given_back(&bytes);
+    assert_keys_given_back(&bytes);
     assert!(parser.screen().contents().contains("forced panic"));
     assert!(pty.cooked());
 }
@@ -131,6 +142,7 @@ fn a_normal_exit_gives_the_terminal_back() {
     assert_given_back(parser.screen());
     assert_title_given_back(&bytes);
     assert_wrap_given_back(&bytes);
+    assert_keys_given_back(&bytes);
     // The exit line is the one thing written to the shell's screen.
     assert!(parser.screen().contents().contains("the exit line"));
     assert!(pty.cooked());
@@ -158,6 +170,7 @@ fn ctrl_z_gives_the_terminal_back_while_stopped_and_takes_it_again() {
         assert!(contains(&bytes, b"viy frame"));
         assert_given_back(emulate(&bytes).screen());
         assert_title_given_back(&bytes);
+        assert_keys_given_back(&bytes);
         assert!(pty.cooked());
     }
     // SAFETY: a plain signal to the child this test started.
@@ -170,8 +183,10 @@ fn ctrl_z_gives_the_terminal_back_while_stopped_and_takes_it_again() {
     assert!(contains(resumed, b"\x1b[?1049h"), "{resumed:?}");
     assert!(contains(resumed, b"after resume"), "{resumed:?}");
     assert!(contains(resumed, tabtitle::PUSH.as_bytes()), "{resumed:?}");
+    assert!(contains(resumed, b"\x1b[>5u"), "{resumed:?}");
     assert_given_back(emulate(&bytes).screen());
     assert_title_given_back(&bytes);
+    assert_keys_given_back(&bytes);
     assert!(pty.cooked());
 }
 
