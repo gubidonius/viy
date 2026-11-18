@@ -11,7 +11,7 @@
 //! once the summaries pass COMPACT_CONSOLIDATE_AT). Elision before each
 //! turn comes first of all:
 //!
-//! Tool output is most of a chat's history (75% in Gregory's saved chats,
+//! Tool output is most of a chat's history (75% in the author's saved chats,
 //! rpctl's comment; 81-93% of real chats, rpctl kb f101) and rarely needed
 //! once its turn is over: the model can run the tool again. Once the
 //! history passes TOOL_ELIDE_THRESHOLD of the prompt budget, the tool

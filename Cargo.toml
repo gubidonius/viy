@@ -21,7 +21,7 @@ rust-version = "1.97.1"
 # Published to crates.io from the public copy (target/publish/viy), where
 # LICENSE and README.md sit at the root (kb d104).
 license-file = "LICENSE"
-repository = "https://github.com/GregoryBolshakov/viy"
+repository = "https://github.com/gubidonius/viy"
 
 [workspace.dependencies]
 # Internal

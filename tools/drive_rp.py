@@ -7,7 +7,7 @@
 rpctl comes from the pinned snapshot (target/rpctl-ref/<commit>/), never the
 live checkout. The chat runs in a child `python3 -I` with HOME, every XDG_*
 directory and the working directory in a fresh temporary tree, and a minimal
-environment, so it never reaches Gregory's config, state or pod: the
+environment, so it never reaches the user's config, state or pod: the
 last_activity it touches while streaming is the temporary one. The
 workspace is built from the scenario's "workspace" files; the config is
 rpctl's DEFAULTS plus the scenario's "config".

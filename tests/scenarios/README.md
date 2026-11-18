@@ -2,7 +2,7 @@
 
 Scripted chats for the request-parity harness (implementation plan 3.4).
 **All synthetic**: none is built from a real chat. If a scenario needs a real
-chat's shape, Gregory provides a mock one.
+chat's shape, the author provides a mock one.
 
 Per scenario `<name>`:
 

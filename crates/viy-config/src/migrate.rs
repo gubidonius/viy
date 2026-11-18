@@ -4,7 +4,7 @@
 //! kept. Sessions, the toolbox and the per-project input history are copied
 //! at cutover (`viy migrate --finish`, ROADMAP phase 8, kb d135), with
 //! [`copy_new`] and [`copy_tree_new`], so viy holds no stale copies of
-//! chats rp is still writing (Gregory, 2026-07-14).
+//! chats rp is still writing (the author, 2026-07-14).
 //!
 //! Each copy is written to a new file beside the target, mode 0600 (kb
 //! d040), and linked into place, which fails if the target appeared in the

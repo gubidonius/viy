@@ -20,7 +20,7 @@ prints one JSON value. Actions:
 Run by viy-agent's sessions tests with `--features oracle` (implementation
 plan WP 3.5: "a chat from rp resumes in viy and back"). HOME and XDG_* point
 into a fresh temporary directory before rpctl is imported, so nothing
-reaches Gregory's real config or chats; only `dir` is written.
+reaches the user's real config or chats; only `dir` is written.
 """
 import json
 import pathlib

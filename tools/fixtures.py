@@ -15,7 +15,7 @@ Pure functions go through the oracle (tools/oracle.py). Generators for code
 that reads files, such as config layering, run each case in its own
 `python3 -I` process with HOME, XDG_* and the working directory in a fresh
 temporary tree and a minimal environment, so module-level paths are computed
-from the case and nothing reaches Gregory's real config. All inputs are
+from the case and nothing reaches the user's real config. All inputs are
 synthetic. Implementation plan 3.3.
 """
 import json
@@ -1153,7 +1153,7 @@ def gen_pod_resolve(snap):
 # body's dockerStartCmd, the script once more, as BOOT_SCRIPT_MARKER. The
 # generator checks that both stand for exactly that text. Values are
 # synthetic; the "live" case has the keys rpctl kb f019-f022 found in
-# Gregory's config, with those public numbers.
+# the author's config, with those public numbers.
 STARTUP_MARKER = "<startup.py>"
 BOOT_SCRIPT_MARKER = "<boot_script>"
 BOOT_KEY = "sk-SYNTHETICENDPOINT"

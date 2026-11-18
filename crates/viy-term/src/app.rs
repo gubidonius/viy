@@ -96,9 +96,9 @@ const WHEEL_ROWS: usize = 3;
 const QUEUED_ROWS: usize = 3;
 
 /// The rules above and below the input box: one Braille dot a cell, at
-/// the cell's middle (Gregory's pick from mockups, kb d152).
+/// the cell's middle (the author's pick from mockups, kb d152).
 const RULE_DOT: char = '⠂';
-/// What the empty input box shows (Gregory's words, kb d152).
+/// What the empty input box shows (the author's words, kb d152).
 const PLACEHOLDER: &str = "Send word below..";
 /// How strongly the rules and the placeholder show: this much of the
 /// terminal's foreground over its background ([`crate::palette::faint`]).

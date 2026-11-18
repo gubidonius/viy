@@ -6,7 +6,7 @@
 #
 # git archive reads rpctl's repository without writing to it (a worktree would
 # add metadata there). Result and run folders are left out: some of them hold
-# replays of Gregory's chats (CLAUDE.md, "Gregory's chats are off limits").
+# replays of the user's real chats, which are off limits (CLAUDE.md).
 set -eu
 cd "$(git rev-parse --show-toplevel)"
 REF=../Qwen3.8-27B-abliterated-setup

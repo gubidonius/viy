@@ -22,8 +22,8 @@ fn no_answer_is_no_colour() {
 
 #[test]
 fn faint_ink_is_the_foreground_thinned_into_the_background() {
-    // GNOME Terminal's Yaru dark theme: the colour of the mockup Gregory
-    // picked (kb d152).
+    // GNOME Terminal's Yaru dark theme: the colour of the mockup the
+    // author picked (kb d152).
     let aubergine = DefaultColors {
         fg: (0xff, 0xff, 0xff),
         bg: (0x30, 0x0a, 0x24),

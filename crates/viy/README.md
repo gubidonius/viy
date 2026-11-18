@@ -4,7 +4,7 @@ A Rust harness for abliterated models, treats them as hostile, but keeps them
 useful.
 
 The GitHub page tells the lore behind the name much better:
-<https://github.com/GregoryBolshakov/viy>
+<https://github.com/gubidonius/viy>
 
 ## Install
 

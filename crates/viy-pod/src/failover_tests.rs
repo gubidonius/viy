@@ -1090,7 +1090,7 @@ async fn another_type_in_the_primary_beats_one_in_the_backup() {
     assert!(r.volume_calls().is_empty());
 }
 
-/// Gregory's case of 2026-08-01: no A100 in EUR-IS-1, no A100 host at all
+/// The author's case of 2026-08-01: no A100 in EUR-IS-1, no A100 host at all
 /// in the backup's region, one free elsewhere.
 #[tokio::test(start_paused = true)]
 async fn the_backup_moves_to_a_preferred_type_before_the_other_types_are_tried() {

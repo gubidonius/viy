@@ -47,7 +47,7 @@ pub static MODES: [Mode; 2] = [
         auto_yes: &[],
     },
     // Writes to code that runs outside the sandbox and unsandboxed commands
-    // still ask (Gregory, 2026-07-11); internet-facing questions joined the
+    // still ask (the author, 2026-07-11); internet-facing questions joined the
     // yes list on 2026-07-13, commands on /ssh servers on 2026-07-16.
     Mode {
         name: "auto-yes",

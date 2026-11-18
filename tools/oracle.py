@@ -24,7 +24,7 @@ JSON carries what it can. Other values are tagged, in both directions:
 rpctl is imported from target/rpctl-ref/<commit>/ (tools/refsnap.sh), never
 the live checkout. Before the import, HOME, every XDG_* directory and the
 working directory point into a fresh temporary directory, so rpctl's
-import-time paths never reach Gregory's real config or state. Each call gets
+import-time paths never reach the user's real config or state. Each call gets
 an empty stdin (an input() raises EOFError) and its stdout and stderr are
 captured into the answer. Implementation plan 3.2.
 """
