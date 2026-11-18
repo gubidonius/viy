@@ -10,7 +10,7 @@ useful.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/GregoryBolshakov/viy/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/gubidonius/viy/main/install.sh | sh
 ```
 
 Or, if you already have Rust 1.97.1 or newer:
