@@ -118,8 +118,16 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // what it will place), keep retrying them, the primary and the old backup
     // for this many minutes; the first one to take the pod wins. 0 = one try.
     ("FAILOVER_RETRY_MIN", "15"),
-    // rp reap deletes a backup volume no pod has used for this long; 0 keeps it.
-    ("BACKUP_IDLE_DAYS", "30"),
+    // viy reap deletes a backup volume no pod has used for this long; 0 keeps
+    // it (rp's 30, kb d178).
+    ("BACKUP_IDLE_DAYS", "7"),
+    // viy reap deletes the primary volume (NETWORK_VOLUME_ID) no pod has
+    // served from for this many days, its stopped pod first; 0 keeps it.
+    // The next viy up then makes a new volume and downloads the weights
+    // again: about 262 s from pod creation to vLLM ready, once (kb d178).
+    // Empty: 30, but kept under ENGINE=strata, whose first boot on a new
+    // volume takes about 10 min.
+    ("PRIMARY_IDLE_DAYS", ""),
     // The storage tier of a backup volume viy makes: STANDARD ($0.07/GB a
     // month), so a region that has only HIGH_PERFORMANCE ($0.14/GB) is not
     // used for the backup. Empty takes each region's own default tier

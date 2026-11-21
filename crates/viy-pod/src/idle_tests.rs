@@ -671,10 +671,7 @@ async fn a_failed_backup_check_does_not_stop_the_reap() {
     let (result, told) = home.reap(false).await;
     result.unwrap();
     let texts = told.texts();
-    assert!(
-        texts[0].starts_with("backup volume check failed: "),
-        "{texts:?}"
-    );
+    assert!(texts[0].starts_with("volume check failed: "), "{texts:?}");
     assert_eq!(texts[1], "idle 0 min");
 }
 
@@ -1045,4 +1042,323 @@ mod oracle {
             }
         }
     }
+}
+
+// ------------------------------------------------- volume lifetimes (9.3)
+
+/// RunPod with `pods` listed and the volumes `volumes` (v1 shapes), every
+/// request kept in order; deletes take things away.
+fn lifetimes_world(
+    pods: Vec<Value>,
+    volumes: Vec<Value>,
+) -> impl Fn(&viy_http::Request) -> Reply + Send + Sync + 'static {
+    let pods = Mutex::new(pods);
+    let volumes = Mutex::new(volumes);
+    move |r| {
+        let url = r.url.as_str();
+        let last = url.rsplit('/').next().unwrap_or_default().to_string();
+        let mut pods = pods.lock().unwrap();
+        let mut volumes = volumes.lock().unwrap();
+        if url.contains("/networkvolumes/") {
+            if r.method == Method::DELETE {
+                volumes.retain(|v| v["id"] != last.as_str());
+                return Reply::answer(200, "");
+            }
+            return match volumes.iter().find(|v| v["id"] == last.as_str()) {
+                Some(v) => Reply::answer(200, v.to_string()),
+                None => Reply::answer(404, "{}"),
+            };
+        }
+        if url.ends_with("/v1/pods") {
+            return Reply::answer(200, json!(*pods).to_string());
+        }
+        if r.method == Method::DELETE {
+            pods.retain(|p| p["id"] != last.as_str());
+            return Reply::answer(200, "{}");
+        }
+        panic!("unexpected {} {url}", r.method)
+    }
+}
+
+fn primary_record(home: &Home, last_used: f64, idle_days: f64) {
+    std::fs::create_dir_all(home.paths.pod_state_dir()).unwrap();
+    std::fs::write(
+        home.paths.primary_volumes_file(),
+        json!({"vol222": {"name": "qwen38-weights", "region": "EUR-IS-1", "pod_name": "qwen-pod",
+                          "idle_days": idle_days, "last_used": last_used}})
+        .to_string(),
+    )
+    .unwrap();
+}
+
+fn primary_volume() -> Value {
+    json!({"id": "vol222", "name": "qwen38-weights", "size": 100, "dataCenterId": "EUR-IS-1"})
+}
+
+async fn expire_now(home: &Home) -> (Vec<String>, Vec<String>) {
+    let rp = commands::connect(&home.env(), &home.cfg).unwrap();
+    let mut said = Vec::new();
+    let gone = regions::expire(&rp, &home.paths, &home.cfg, NOW, &mut |s| said.push(s))
+        .await
+        .unwrap();
+    (
+        gone.iter()
+            .map(|v| crate::api::shown(v.get("id")))
+            .collect(),
+        said,
+    )
+}
+
+fn primaries(home: &Home) -> Value {
+    std::fs::read_to_string(home.paths.primary_volumes_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// A pod serving from the profile's own volume starts its countdown, with
+/// the profile's PRIMARY_IDLE_DAYS; a backup or another volume does not.
+#[test]
+fn only_the_profiles_primary_is_noted() {
+    let home = Home::new(|_| panic!("no request"));
+    let mut cfg = home.cfg.clone();
+    cfg.set("NETWORK_VOLUME_ID", "vol222");
+    regions::note_primary(&home.paths, &cfg, "vol999", "EUR-IS-1", NOW).unwrap();
+    regions::note_primary(&home.paths, &cfg, "", "EUR-IS-1", NOW).unwrap();
+    assert_eq!(primaries(&home), Value::Null);
+    regions::note_primary(&home.paths, &cfg, "vol222", "EUR-IS-1", NOW).unwrap();
+    assert_eq!(
+        primaries(&home),
+        json!({"vol222": {"name": "qwen38-weights", "region": "EUR-IS-1", "pod_name": "qwen-pod",
+                          "idle_days": 30.0, "last_used": NOW}})
+    );
+    std::fs::write(
+        home.paths.backups_file(),
+        json!({"vol333": {"name": "qwen38-weights-backup", "last_used": 1.0}}).to_string(),
+    )
+    .unwrap();
+    cfg.set("NETWORK_VOLUME_ID", "vol333");
+    regions::note_primary(&home.paths, &cfg, "vol333", "CA-MTL-3", NOW + 5.0).unwrap();
+    assert!(primaries(&home).get("vol333").is_none());
+}
+
+/// Both countdowns, as `viy status` shows them.
+#[test]
+fn status_shows_both_countdowns() {
+    let home = Home::new(|_| panic!("no request"));
+    let mut cfg = home.cfg.clone();
+    cfg.set("NETWORK_VOLUME_ID", "vol222");
+    primary_record(&home, NOW - 2.0 * 86400.0, 30.0);
+    std::fs::write(
+        home.paths.backups_file(),
+        json!({"vol333": {"name": "qwen38-weights-backup", "region": "CA-MTL-3",
+                          "last_used": NOW - 9.0 * 86400.0}})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        regions::lifetimes(&home.paths, &cfg, NOW),
+        [
+            "  volume:    vol222 (qwen38-weights, EUR-IS-1): used 2 days ago; deleted in 28 days \
+             unless a pod serves from it (30 days unused)",
+            "  backup:    vol333 (qwen38-weights-backup, CA-MTL-3): used 9 days ago; deleted at \
+             viy reap's next run unless a pod serves from it (7 days unused)",
+        ]
+    );
+    // The profile's own volume follows its config now, whatever the record
+    // kept: PRIMARY_IDLE_DAYS=0 set after it served keeps it at once.
+    cfg.set("PRIMARY_IDLE_DAYS", "0");
+    assert_eq!(
+        regions::lifetimes(&home.paths, &cfg, NOW)[0],
+        "  volume:    vol222 (qwen38-weights, EUR-IS-1): used 2 days ago, kept"
+    );
+    cfg.set("PRIMARY_IDLE_DAYS", "30");
+    primary_record(&home, NOW - 29.8 * 86400.0, 30.0);
+    assert!(
+        regions::lifetimes(&home.paths, &cfg, NOW)[0].contains("deleted within a day"),
+        "{:?}",
+        regions::lifetimes(&home.paths, &cfg, NOW)
+    );
+}
+
+/// A primary no pod has served from for its 30 days goes: no pod, so the
+/// volume alone, and the record with it.
+#[tokio::test(start_paused = true)]
+async fn an_idle_primary_volume_is_deleted() {
+    let home = Home::new(lifetimes_world(vec![], vec![primary_volume()]));
+    primary_record(&home, NOW - 31.0 * 86400.0, 30.0);
+    let (gone, said) = expire_now(&home).await;
+    assert_eq!(gone, ["vol222"]);
+    assert_eq!(
+        said,
+        [
+            "deleted volume vol222 (qwen38-weights, EUR-IS-1): unused for 31 days; the next viy up \
+          makes a new one and downloads the weights again"
+        ]
+    );
+    assert_eq!(primaries(&home), json!({}));
+    assert!(
+        home.sent()
+            .contains(&"DELETE https://rest.runpod.io/v1/networkvolumes/vol222".to_string())
+    );
+}
+
+/// Its stopped pod is terminated before the volume is deleted (RunPod
+/// refuses to delete a held volume, kb f182), and pod.json forgets it.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_pod_goes_before_its_volume() {
+    let stopped = json!({"id": "pod111", "name": "qwen-pod", "desiredStatus": "EXITED",
+                         "networkVolumeId": "vol222"});
+    let home = Home::new(lifetimes_world(vec![stopped], vec![primary_volume()]));
+    primary_record(&home, NOW - 40.0 * 86400.0, 30.0);
+    let (gone, said) = expire_now(&home).await;
+    assert_eq!(gone, ["vol222"]);
+    assert_eq!(
+        said[0],
+        "terminated stopped pod pod111: it held volume vol222, unused for 40 days"
+    );
+    let deletes: Vec<String> = home
+        .sent()
+        .into_iter()
+        .filter(|r| r.starts_with("DELETE"))
+        .collect();
+    assert_eq!(
+        deletes,
+        [
+            "DELETE https://rest.runpod.io/v1/pods/pod111",
+            "DELETE https://rest.runpod.io/v1/networkvolumes/vol222",
+        ]
+    );
+    assert!(!home.paths.pod_state_file().exists());
+}
+
+/// A volume a pod runs on, or a pod not ours holds, is in use: never
+/// deleted, its countdown starts again.
+#[tokio::test(start_paused = true)]
+async fn a_volume_in_use_is_never_deleted() {
+    for pod in [
+        json!({"id": "pod111", "name": "qwen-pod", "desiredStatus": "RUNNING",
+               "networkVolumeId": "vol222"}),
+        json!({"id": "pod777", "name": "someone-else", "desiredStatus": "EXITED",
+               "networkVolumeId": "vol222"}),
+    ] {
+        let home = Home::new(lifetimes_world(vec![pod], vec![primary_volume()]));
+        primary_record(&home, NOW - 40.0 * 86400.0, 30.0);
+        let (gone, said) = expire_now(&home).await;
+        assert!(gone.is_empty() && said.is_empty(), "{said:?}");
+        assert!(!home.sent().iter().any(|r| r.starts_with("DELETE")));
+        assert_eq!(primaries(&home)["vol222"]["last_used"], NOW);
+    }
+}
+
+/// Kept with PRIMARY_IDLE_DAYS=0; never a volume the record does not name
+/// (renamed, or a backup's name); not before its days are up.
+#[tokio::test(start_paused = true)]
+async fn only_the_recorded_primary_is_ever_deleted() {
+    let home = Home::new(lifetimes_world(vec![], vec![primary_volume()]));
+    primary_record(&home, NOW - 400.0 * 86400.0, 0.0);
+    assert_eq!(expire_now(&home).await, (vec![], vec![]));
+    primary_record(&home, NOW - 29.0 * 86400.0, 30.0);
+    assert_eq!(expire_now(&home).await, (vec![], vec![]));
+    assert!(home.sent().is_empty(), "{:?}", home.sent());
+    for volume in [
+        json!({"id": "vol222", "name": "renamed", "dataCenterId": "EUR-IS-1"}),
+        json!({"id": "vol222", "name": "qwen38-weights-backup", "dataCenterId": "EUR-IS-1"}),
+    ] {
+        let home = Home::new(lifetimes_world(vec![], vec![volume]));
+        primary_record(&home, NOW - 31.0 * 86400.0, 30.0);
+        assert_eq!(expire_now(&home).await, (vec![], vec![]));
+        assert!(!home.sent().iter().any(|r| r.starts_with("DELETE")));
+        assert_eq!(primaries(&home), json!({}), "forgotten, not deleted");
+    }
+}
+
+/// viy's backups go after 7 days unused (rp's 30, kb d178).
+#[tokio::test(start_paused = true)]
+async fn a_backup_goes_after_a_week() {
+    let backup = json!({"id": "vol333", "name": "qwen38-weights-backup", "size": 100,
+                        "dataCenterId": "CA-MTL-3"});
+    let home = Home::new(lifetimes_world(vec![], vec![backup]));
+    std::fs::write(
+        home.paths.backups_file(),
+        json!({"vol333": {"name": "qwen38-weights-backup", "region": "CA-MTL-3",
+                          "last_used": NOW - 8.0 * 86400.0}})
+        .to_string(),
+    )
+    .unwrap();
+    let (gone, said) = expire_now(&home).await;
+    assert_eq!(gone, ["vol333"]);
+    assert_eq!(
+        said,
+        ["deleted backup volume vol333 (qwen38-weights-backup, CA-MTL-3): unused for 8 days"]
+    );
+}
+
+/// reap notes a running pod's primary; a stopped pod's is not a use.
+#[tokio::test(start_paused = true)]
+async fn reap_notes_a_running_pods_primary_only() {
+    for (status, noted) in [("RUNNING", true), ("EXITED", false)] {
+        let home = Home::new(move |r: &viy_http::Request| {
+            assert!(r.url.ends_with("/v1/pods/pod111"), "{}", r.url);
+            Reply::answer(
+                200,
+                json!({"id": "pod111", "name": "qwen-pod", "desiredStatus": status,
+                       "networkVolumeId": "vol222"})
+                .to_string(),
+            )
+        });
+        let mut home = home;
+        home.cfg.set("NETWORK_VOLUME_ID", "vol222");
+        home.active(60.0);
+        let (result, _) = home.reap(true).await;
+        result.unwrap();
+        assert_eq!(primaries(&home).get("vol222").is_some(), noted, "{status}");
+    }
+}
+
+/// Under ENGINE=strata an empty PRIMARY_IDLE_DAYS keeps the volume: its
+/// first boot on a new one took 577.7 s (kb f168), not accepted; a set
+/// value counts as for vLLM.
+#[test]
+fn a_strata_primary_is_kept_unless_set() {
+    let mut cfg = Config::defaults();
+    assert_eq!(regions::primary_idle_days(&cfg), 30.0);
+    cfg.set("ENGINE", "strata");
+    assert_eq!(regions::primary_idle_days(&cfg), 0.0);
+    cfg.set("PRIMARY_IDLE_DAYS", "45");
+    assert_eq!(regions::primary_idle_days(&cfg), 45.0);
+    cfg.set("PRIMARY_IDLE_DAYS", "-3");
+    assert_eq!(regions::primary_idle_days(&cfg), 0.0);
+}
+
+/// RunPod still holding the volume right after its stopped pod went: the
+/// delete waits for the next run, without a failure.
+#[tokio::test(start_paused = true)]
+async fn a_volume_still_held_goes_at_the_next_run() {
+    let stopped = json!({"id": "pod111", "name": "qwen-pod", "desiredStatus": "EXITED",
+                         "networkVolumeId": "vol222"});
+    let world = lifetimes_world(vec![stopped], vec![primary_volume()]);
+    let home = Home::new(move |r: &viy_http::Request| {
+        if r.method == Method::DELETE && r.url.contains("/networkvolumes/") {
+            Reply::answer(
+                400,
+                json!({"detail": "You must remove this network volume from all pods before \
+                                  deleting it."})
+                .to_string(),
+            )
+        } else {
+            world(r)
+        }
+    });
+    primary_record(&home, NOW - 40.0 * 86400.0, 30.0);
+    let (gone, said) = expire_now(&home).await;
+    assert!(gone.is_empty());
+    assert_eq!(
+        said[1],
+        "volume vol222 goes at viy reap's next run, once RunPod has let go of it"
+    );
+    assert!(
+        primaries(&home).get("vol222").is_some(),
+        "kept for the next run"
+    );
 }

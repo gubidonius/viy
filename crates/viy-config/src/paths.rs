@@ -155,6 +155,12 @@ impl Paths {
         self.pod_state_dir().join("backups.json")
     }
 
+    /// The primary volumes by id, each with its last use and lifetime,
+    /// `volumes.json` (viy's own, kb d178).
+    pub fn primary_volumes_file(&self) -> PathBuf {
+        self.pod_state_dir().join("volumes.json")
+    }
+
     /// One line per A100 stock query, `stock.jsonl`.
     pub fn stock_file(&self) -> PathBuf {
         self.pod_state_dir().join("stock.jsonl")

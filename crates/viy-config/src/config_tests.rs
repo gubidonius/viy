@@ -103,6 +103,16 @@ fn the_layers_merge_as_rpctl_merges_them() {
             // rp's default only: no case sets it, and viy always saves
             // chats, as Codex (kb d083).
             .filter(|(k, _)| k != "CHAT_AUTOSAVE")
+            // viy keeps a backup volume a week, rp a month; no case sets it
+            // (kb d178).
+            .map(|(k, v)| {
+                let v = if k == "BACKUP_IDLE_DAYS" && v == "30" {
+                    "7".to_string()
+                } else {
+                    v
+                };
+                (k, v)
+            })
             .collect();
         if name == "global_file_syntax" {
             // Python's strip() removes U+001F, Rust's trim() keeps it
@@ -122,6 +132,7 @@ fn the_layers_merge_as_rpctl_merges_them() {
                     "CLIENT_TAG",
                     "GPU_PREFERRED",
                     "BACKUP_VOLUME_TYPE",
+                    "PRIMARY_IDLE_DAYS",
                 ]
                 .contains(&k.as_str())
                     && !ENGINE_KEYS.contains(&k.as_str())
@@ -134,12 +145,14 @@ fn the_layers_merge_as_rpctl_merges_them() {
 /// rpctl's 112 keys (111 plus MTP_DRAFT_HEAD_QUANTIZATION at d528c14) but
 /// CHAT_AUTOSAVE: viy always saves chats, as Codex (kb d083); and viy's own
 /// CHAT_HEADER, the chat's header art, and CLIENT_TAG (kb d137),
-/// GPU_PREFERRED (kb d138), BACKUP_VOLUME_TYPE (kb d139) and the serving
-/// engine's ENGINE_KEYS (kb d162).
+/// GPU_PREFERRED (kb d138), BACKUP_VOLUME_TYPE (kb d139), PRIMARY_IDLE_DAYS
+/// (kb d178) and the serving engine's ENGINE_KEYS (kb d162).
 #[test]
 fn defaults_are_rpctls_keys_but_chat_autosave() {
-    assert_eq!(DEFAULTS.len(), 115 + ENGINE_KEYS.len());
-    assert_eq!(Config::defaults().iter().count(), 115 + ENGINE_KEYS.len());
+    assert_eq!(DEFAULTS.len(), 116 + ENGINE_KEYS.len());
+    assert_eq!(Config::defaults().iter().count(), 116 + ENGINE_KEYS.len());
+    assert_eq!(Config::defaults().get("BACKUP_IDLE_DAYS"), Some("7"));
+    assert_eq!(Config::defaults().get("PRIMARY_IDLE_DAYS"), Some(""));
     assert_eq!(Config::defaults().get("ENGINE"), Some("vllm"));
     assert!(Config::defaults().get("CHAT_AUTOSAVE").is_none());
     assert_eq!(Config::defaults().get("CHAT_HEADER"), Some("1"));

@@ -767,6 +767,12 @@ async fn success_path_is_one_create_request() {
     assert_eq!(state["cost_per_hr"], 1.89);
     assert_eq!(state["created_at"], 1784194200.0);
     assert_eq!(state["last_startup_seconds"], 0.0);
+    // The primary served: its PRIMARY_IDLE_DAYS countdown starts (kb d178).
+    let volumes: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.paths.primary_volumes_file()).unwrap())
+            .unwrap();
+    assert_eq!(volumes["vol222"]["last_used"], 1784194200.0);
+    assert_eq!(volumes["vol222"]["idle_days"], 30.0);
 }
 
 /// rpctl test_regions.py CreatePodTests::test_failover_off_exits_after_the_primary.
@@ -1013,6 +1019,8 @@ async fn status_shows_the_pod_and_whether_vllm_answers() {
             "  started:   2026-07-16T09:00:00Z",
             &format!("  endpoint:  {PROXY}"),
             "  transport: RunPod http proxy (TLS terminated by RunPod)",
+            "  volume:    vol222 (qwen38-weights, EUR-IS-1): not served from since lifetimes \
+             began, kept",
             "  vllm:      ready",
             "  idle:      20 min since this machine last streamed; the pod shuts itself down \
              after 60 min without tokens",
@@ -1030,7 +1038,14 @@ async fn status_without_a_pod_or_runpod() {
     status(&home.env(), &home.cfg, &told.reporter())
         .await
         .unwrap();
-    assert_eq!(told.texts(), ["No pod named 'qwen-pod' found. Run viy up"]);
+    assert_eq!(
+        told.texts(),
+        [
+            "No pod named 'qwen-pod' found. Run viy up",
+            "  volume:    vol222 (qwen38-weights, EUR-IS-1): not served from since lifetimes \
+             began, kept",
+        ]
+    );
 
     let home = Home::new(None, |_| Reply::answer(401, "{\"error\": \"bad key\"}"));
     let told = Told::default();

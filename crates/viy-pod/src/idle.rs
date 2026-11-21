@@ -222,7 +222,8 @@ pub fn decide(
 /// `viy reap`: stops our pod once this machine has streamed nothing for
 /// IDLE_TTL_MIN + REAP_GRACE_MIN, or it has run past MAX_POD_HOURS; warns
 /// ahead; leaves a stopped pod alone, forgetting what it saw of it so a
-/// resumed pod is counted from then; deletes idle backup volumes. Never while an up, stop or down of either tool holds the pod
+/// resumed pod is counted from then; deletes idle backup and primary
+/// volumes, a volume's stopped pods of ours first (kb d178). Never while an up, stop or down of either tool holds the pod
 /// lock: the next run looks again. `quiet` (the timer) says nothing but
 /// the desktop alerts and what `viy stop` says.
 pub async fn reap(
@@ -250,13 +251,11 @@ pub async fn reap(
         alert(report, "viy reap", message.clone(), false);
         print(message);
     };
-    // Backup volumes unused for BACKUP_IDLE_DAYS.
+    // Volumes unused for BACKUP_IDLE_DAYS or PRIMARY_IDLE_DAYS (expiry
+    // takes the pod lock itself when one is due).
     match regions::expire(&rp, env.paths, cfg, now, &mut tell).await {
         Err(CommandError::RunPod(error)) => {
-            print(format!(
-                "backup volume check failed: {}",
-                first_line(&error)
-            ));
+            print(format!("volume check failed: {}", first_line(&error)));
         }
         result => {
             result?;
@@ -278,8 +277,18 @@ pub async fn reap(
         print("no pod running".into());
         return Ok(());
     };
-    regions::note_pod(env.paths, &pod, now)?;
     let desired = pod.get("desiredStatus").and_then(Value::as_str);
+    if desired != Some("EXITED") {
+        // A stopped pod is not a use of its volume (kb d178).
+        regions::note_pod(env.paths, &pod, now)?;
+        let volume = crate::tracked::pod_volume_id(&pod).unwrap_or_default();
+        let region = pod
+            .get("machine")
+            .and_then(|m| m.get("dataCenterId"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| cfg.get("DATA_CENTER_ID").unwrap_or(""));
+        regions::note_primary(env.paths, cfg, volume, region, now)?;
+    }
     if desired == Some("EXITED") {
         // A resumed pod is a new run: its cap counts from when reap sees
         // it running again. The forward points at nothing now.

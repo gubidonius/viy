@@ -430,6 +430,7 @@ async fn up_until(
                 .await;
             }
             let volume_id = tracked::pod_volume_id(&existing).unwrap_or_default();
+            note_serving(env, cfg, volume_id, report);
             retire_replaced(env, cfg, &rp, volume_id, report).await;
             return Ok(());
         }
@@ -608,6 +609,7 @@ async fn up_until(
             report,
         )
         .await;
+        note_serving(env, cfg, &volume_id, report);
         retire_replaced(env, cfg, &rp, &volume_id, report).await;
         return Ok(());
     }
@@ -790,6 +792,22 @@ async fn retire_stopped(
     Ok(())
 }
 
+/// After readiness: the primary volume served, so its PRIMARY_IDLE_DAYS
+/// countdown starts again (kb d178). Never fails `up`.
+fn note_serving(env: &Env<'_>, cfg: &Config, volume_id: &str, report: Reporter<'_>) {
+    // DATA_CENTER_ID as `up` ran it: the volume's own region (ensure_volume).
+    let region = cfg_at(cfg, "DATA_CENTER_ID");
+    if let Err(error) =
+        regions::note_primary(env.paths, cfg, volume_id, region, regions::now(env.time))
+    {
+        say(
+            report,
+            Tone::Warn,
+            format!("Could not record the volume's use for viy reap: {error}"),
+        );
+    }
+}
+
 /// After readiness only: a new backup that just served deletes the one it
 /// replaced. Never fails `up`; a miss is retried on the next ready.
 async fn retire_replaced(
@@ -902,6 +920,7 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
         }
         Err(error) => return Err(error.into()),
     };
+    let lifetimes = regions::lifetimes(env.paths, cfg, regions::now(env.time));
     let Some(pod) = pod else {
         say(
             report,
@@ -911,6 +930,9 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
                 cfg_at(cfg, "POD_NAME")
             ),
         );
+        for line in lifetimes {
+            say(report, Tone::Plain, line);
+        }
         return Ok(());
     };
     let pod_id = text(&pod, "id").unwrap_or_default();
@@ -956,6 +978,9 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
     if tunnelled {
         let mut said = |notice| report(Report::Notice(notice));
         tunnel::status(&env.ssh(cfg), &mut said).await?;
+    }
+    for text in lifetimes {
+        line(text);
     }
     if text(&pod, "desiredStatus") != Some("RUNNING") {
         return Ok(());

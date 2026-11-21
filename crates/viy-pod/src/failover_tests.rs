@@ -52,11 +52,13 @@ fn as_viy(text: &str) -> String {
 
 /// The case's config. GPU_PREFERRED and BACKUP_VOLUME_TYPE are viy's own
 /// (kb d138, d139): off unless the case sets them, so that rpctl's cases
-/// get the requests rpctl sends.
+/// get the requests rpctl sends; BACKUP_IDLE_DAYS is rp's 30, where viy's
+/// default is 7 (kb d178).
 fn config(case: &Value) -> Config {
     let mut cfg = Config::defaults();
     cfg.set("GPU_PREFERRED", "");
     cfg.set("BACKUP_VOLUME_TYPE", "");
+    cfg.set("BACKUP_IDLE_DAYS", "30");
     for (k, v) in case["cfg"].as_object().into_iter().flatten() {
         cfg.set(k, v.as_str().unwrap_or_default());
     }

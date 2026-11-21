@@ -40,6 +40,8 @@ use crate::api::shown;
 use crate::api::truthy;
 use crate::commands::CommandError;
 use crate::commands::Env;
+use crate::lock::LockError;
+use crate::lock::PodLock;
 use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
@@ -615,7 +617,8 @@ pub fn grab_minutes(cfg: &Config) -> f64 {
 /// BACKUP_IDLE_DAYS: 0 keeps backups, and so does a value that is not a
 /// number.
 pub fn idle_days(cfg: &Config) -> f64 {
-    number(cfg, "BACKUP_IDLE_DAYS")
+    // A negative value keeps them too, rather than delete every backup.
+    number(cfg, "BACKUP_IDLE_DAYS").max(0.0)
 }
 
 /// A number in a notice, as rp shows one with `:g`: `1`, `0.5`, `15`.
@@ -709,13 +712,160 @@ pub(crate) async fn delete_empty(
     forget(paths, id(volume))
 }
 
+// ----------------------------------------------------------- primary volume
+
+/// `volumes.json`, viy's own (kb d178): the primary volumes a pod of ours
+/// served from, by id, each with its name, region, the pod name and
+/// PRIMARY_IDLE_DAYS of the profile that used it, and its last use. A
+/// volume no pod has served from since is never in it, so never deleted.
+fn load_primaries(paths: &Paths) -> Map<String, Value> {
+    match fs::read_to_string(paths.primary_volumes_file())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+    {
+        Some(Value::Object(data)) => data,
+        _ => Map::new(),
+    }
+}
+
+fn save_primaries(paths: &Paths, data: &Map<String, Value>) -> io::Result<()> {
+    fs::create_dir_all(paths.pod_state_dir())?;
+    let file = paths.primary_volumes_file();
+    let tmp = file.with_file_name(format!(".volumes.json.{}", std::process::id()));
+    let text = serde_json::to_string_pretty(data).map_err(io::Error::other)?;
+    fs::write(&tmp, text + "\n")?;
+    fs::rename(&tmp, &file)
+}
+
+/// PRIMARY_IDLE_DAYS: 0 keeps the primary volume, and so does a value that
+/// is not a number. Empty is 30, except under ENGINE=strata, whose first
+/// boot on a new volume took 577.7 s (kb f168), a cost not accepted: kept.
+pub fn primary_idle_days(cfg: &Config) -> f64 {
+    match cfg.get("PRIMARY_IDLE_DAYS").map(str::trim) {
+        None | Some("") if cfg.get("ENGINE").map(str::trim) == Some("strata") => 0.0,
+        None | Some("") => 30.0,
+        Some(_) => number(cfg, "PRIMARY_IDLE_DAYS").max(0.0),
+    }
+}
+
+/// The limit for a recorded primary: the active profile's own volume
+/// follows its config now, so a PRIMARY_IDLE_DAYS set later counts at once;
+/// another profile's keeps what that profile had when it last served.
+fn primary_limit(cfg: &Config, volume_id: &str, record: &Value) -> f64 {
+    if cfg.get("NETWORK_VOLUME_ID") == Some(volume_id) {
+        primary_idle_days(cfg)
+    } else {
+        record
+            .get("idle_days")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+    }
+}
+
+/// A pod of ours serves from `volume_id` in `region`: when that is the
+/// profile's own primary (NETWORK_VOLUME_ID, not a backup), its
+/// PRIMARY_IDLE_DAYS countdown starts again.
+pub fn note_primary(
+    paths: &Paths,
+    cfg: &Config,
+    volume_id: &str,
+    region: &str,
+    now: f64,
+) -> io::Result<()> {
+    if volume_id.is_empty()
+        || cfg.get("NETWORK_VOLUME_ID") != Some(volume_id)
+        || load_backups(paths).contains_key(volume_id)
+    {
+        return Ok(());
+    }
+    let mut data = load_primaries(paths);
+    data.insert(
+        volume_id.to_string(),
+        json!({
+            "name": cfg.get("NETWORK_VOLUME_NAME").unwrap_or(""),
+            "region": region,
+            "pod_name": cfg.get("POD_NAME").unwrap_or(""),
+            "idle_days": primary_idle_days(cfg),
+            "last_used": now,
+        }),
+    );
+    save_primaries(paths, &data)
+}
+
+fn forget_primary(paths: &Paths, volume_id: &str) -> io::Result<()> {
+    let mut data = load_primaries(paths);
+    if data.shift_remove(volume_id).is_some() {
+        save_primaries(paths, &data)?;
+    }
+    Ok(())
+}
+
+/// `viy status`'s countdowns: the profile's primary volume and its backup,
+/// each with its last use and the days left before `viy reap` deletes it.
+pub fn lifetimes(paths: &Paths, cfg: &Config, now: f64) -> Vec<String> {
+    let left = |record: &Value, days: f64| {
+        let used = last_used(Some(record)).unwrap_or(now);
+        if days <= 0.0 {
+            return format!("used {}, kept", ago(used, now));
+        }
+        let remaining = days - (now - used) / DAY_S;
+        let when = if remaining <= 0.0 {
+            "deleted at viy reap's next run".to_string()
+        } else if remaining < 1.0 {
+            "deleted within a day".to_string()
+        } else {
+            format!("deleted in {remaining:.0} days")
+        };
+        format!(
+            "used {}; {when} unless a pod serves from it ({} days unused)",
+            ago(used, now),
+            short(days)
+        )
+    };
+    let mut lines = Vec::new();
+    let primary = cfg.get("NETWORK_VOLUME_ID").filter(|v| !v.is_empty());
+    if let Some(vid) = primary {
+        let line = match load_primaries(paths).get(vid) {
+            Some(record) => left(record, primary_limit(cfg, vid, record)),
+            None => "not served from since lifetimes began, kept".to_string(),
+        };
+        lines.push(format!(
+            "  volume:    {vid} ({}, {}): {line}",
+            cfg.get("NETWORK_VOLUME_NAME").unwrap_or(""),
+            cfg.get("DATA_CENTER_ID").unwrap_or("")
+        ));
+    }
+    let backup = backup_name(cfg);
+    for (vid, record) in &load_backups(paths) {
+        if record.get("name").and_then(Value::as_str) == Some(backup.as_str()) {
+            lines.push(format!(
+                "  backup:    {vid} ({backup}, {}): {}",
+                shown(record.get("region")),
+                left(record, idle_days(cfg))
+            ));
+        }
+    }
+    lines
+}
+
 // ------------------------------------------------------------------- expiry
 
+/// Which record a due volume comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Backup,
+    Primary,
+}
+
 /// Deletes backup volumes no pod has used for BACKUP_IDLE_DAYS (0 keeps
-/// them), and after [`UNUSED_GRACE_S`] any volume `viy up` made for a pod
-/// that no region took but could not delete itself. Covers every model's
-/// backups, not only the active profile's. Calls RunPod only when one is
-/// due, so `viy reap`'s 5-minute timer stays free. The volumes deleted.
+/// them), primary volumes none has served from for their PRIMARY_IDLE_DAYS
+/// (kb d178), and after [`UNUSED_GRACE_S`] any volume `viy up` made for a
+/// pod that no region took but could not delete itself. Covers every
+/// model's volumes, not only the active profile's. A volume a pod is
+/// running on, or any pod not ours holds, is in use; one only stopped pods
+/// of ours hold has them terminated first (RunPod refuses to delete a held
+/// volume, kb f182). Calls RunPod only when one is due, so `viy
+/// reap`'s 5-minute timer stays free. The volumes deleted.
 pub async fn expire(
     rp: &RunPod,
     paths: &Paths,
@@ -724,67 +874,156 @@ pub async fn expire(
     say: &mut (dyn FnMut(String) + Send),
 ) -> Result<Vec<Value>, CommandError> {
     let days = idle_days(cfg);
-    let data = load_backups(paths);
     let idle_for = |record: &Value| now - last_used(Some(record)).unwrap_or(now);
-    let due: Vec<(&String, &Value)> = data
-        .iter()
+    let mut due: Vec<(Kind, String, Value)> = load_backups(paths)
+        .into_iter()
         .filter(|(_, r)| {
             (r.get("unused").is_some_and(truthy) && idle_for(r) >= UNUSED_GRACE_S)
                 || (days != 0.0 && idle_for(r) >= days * DAY_S)
         })
+        .map(|(vid, r)| (Kind::Backup, vid, r))
         .collect();
+    due.extend(
+        load_primaries(paths)
+            .into_iter()
+            .filter(|(vid, r)| {
+                let limit = primary_limit(cfg, vid, r);
+                limit > 0.0 && idle_for(r) >= limit * DAY_S
+            })
+            .map(|(vid, r)| (Kind::Primary, vid, r)),
+    );
     if due.is_empty() {
         return Ok(Vec::new());
     }
-    let attached: HashSet<String> = rp
+    // Only now, and only while no up, stop or down runs: a stopped pod an
+    // up is about to resume must not be terminated under it.
+    let _lock = match PodLock::exclusive(paths, "reap") {
+        Ok(lock) => lock,
+        Err(LockError::Busy { .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let pods: Vec<Value> = rp
         .list_pods()
         .await?
-        .iter()
+        .into_iter()
         .filter(|p| text(p, "desiredStatus") != Some("TERMINATED"))
-        .filter_map(|p| pod_volume_id(p).map(str::to_string))
         .collect();
+    let forget_kind = |kind: Kind, vid: &str| match kind {
+        Kind::Backup => forget(paths, vid),
+        Kind::Primary => forget_primary(paths, vid),
+    };
     let mut deleted = Vec::new();
-    for (vid, record) in due {
-        if attached.contains(vid.as_str()) {
-            note_pod(paths, &json!({"networkVolumeId": vid}), now)?;
+    for (kind, vid, record) in due {
+        let on: Vec<&Value> = pods
+            .iter()
+            .filter(|p| pod_volume_id(p) == Some(vid.as_str()))
+            .collect();
+        let ours = record
+            .get("pod_name")
+            .and_then(Value::as_str)
+            .or_else(|| cfg.get("POD_NAME"))
+            .unwrap_or("");
+        // Running, or held by a pod not ours (rp's rule for any pod): in
+        // use, its countdown starts again.
+        if on
+            .iter()
+            .any(|p| text(p, "desiredStatus") != Some("EXITED") || text(p, "name") != Some(ours))
+        {
+            match kind {
+                Kind::Backup => note_pod(paths, &json!({"networkVolumeId": vid}), now)?,
+                Kind::Primary => {
+                    let mut data = load_primaries(paths);
+                    if let Some(r) = data.get_mut(&vid).and_then(Value::as_object_mut) {
+                        r.insert("last_used".into(), json!(now));
+                        save_primaries(paths, &data)?;
+                    }
+                }
+            }
             continue;
         }
-        let volume = match rp.get_volume(vid).await {
+        let volume = match rp.get_volume(&vid).await {
             Ok(volume) => volume,
             Err(error) => {
                 if error.status_code() == Some(404) {
-                    forget(paths, vid)?;
+                    forget_kind(kind, &vid)?;
                 }
                 continue;
             }
         };
-        // Only ever a volume this module made: never the primary, whatever
-        // the record says.
+        // Only ever the volume the record names: a backup this module made,
+        // or a primary of that id and name that is not a backup's.
         let Some(volume) = volume.filter(|v| {
             let name = v.get("name");
-            shown(name).ends_with("-backup") && name == record.get("name")
+            let backup = shown(name).ends_with("-backup");
+            name == record.get("name") && (kind == Kind::Backup) == backup
         }) else {
-            forget(paths, vid)?;
+            forget_kind(kind, &vid)?;
             continue;
         };
-        if let Err(error) = rp.delete_volume(vid).await
+        // Its stopped pods go first.
+        let mut held = false;
+        for pod in &on {
+            let pod_id = shown(pod.get("id"));
+            match rp.delete_pod(&pod_id).await {
+                Err(error) if error.status_code() != Some(404) => {
+                    say(format!(
+                        "could not terminate stopped pod {pod_id}, which holds unused volume \
+                         {vid}: {}; viy reap retries",
+                        first_line(&error)
+                    ));
+                    held = true;
+                }
+                _ => {
+                    if crate::state::load(paths)?.pod_id() == Some(pod_id.as_str()) {
+                        crate::state::clear(paths)?;
+                    }
+                    say(format!(
+                        "terminated stopped pod {pod_id}: it held volume {vid}, unused for {:.0} \
+                         days",
+                        idle_for(&record) / DAY_S
+                    ));
+                }
+            }
+        }
+        if held {
+            continue;
+        }
+        if let Err(error) = rp.delete_volume(&vid).await
             && error.status_code() != Some(404)
         {
+            if !on.is_empty() {
+                // RunPod may not have let go of it yet (kb f182).
+                say(format!(
+                    "volume {vid} goes at viy reap's next run, once RunPod has let go of it"
+                ));
+                continue;
+            }
             say(format!(
-                "could not delete idle backup volume {vid}: {}",
+                "could not delete idle {} volume {vid}: {}",
+                if kind == Kind::Backup {
+                    "backup"
+                } else {
+                    "primary"
+                },
                 first_line(&error)
             ));
             continue;
         }
-        forget(paths, vid)?;
+        forget_kind(kind, &vid)?;
         let (name, region) = (shown(volume.get("name")), shown(volume.get("dataCenterId")));
-        say(if record.get("unused").is_some_and(truthy) {
-            format!("deleted volume {vid} ({name}, {region}): made for a pod no region took")
-        } else {
-            format!(
+        say(match kind {
+            Kind::Backup if record.get("unused").is_some_and(truthy) => {
+                format!("deleted volume {vid} ({name}, {region}): made for a pod no region took")
+            }
+            Kind::Backup => format!(
                 "deleted backup volume {vid} ({name}, {region}): unused for {:.0} days",
-                idle_for(record) / DAY_S
-            )
+                idle_for(&record) / DAY_S
+            ),
+            Kind::Primary => format!(
+                "deleted volume {vid} ({name}, {region}): unused for {:.0} days; the next viy up \
+                 makes a new one and downloads the weights again",
+                idle_for(&record) / DAY_S
+            ),
         });
         deleted.push(volume);
     }
