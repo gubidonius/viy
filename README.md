@@ -539,9 +539,13 @@ and the student must hold out until dawn.
         <li><b>Never in the middle of work.</b> While a <code>viy up</code>,
         <code>stop</code> or <code>down</code> holds the pod lock, the timer
         leaves the pod alone and looks again at its next run.</li>
-        <li><b>Old backups too.</b> A backup volume in the second region that
-        no pod has used for 30 days is deleted, so it stops costing storage.
-        The weights on your main volume always stay.</li>
+        <li><b>Old volumes too.</b> A backup volume in the second region that
+        no pod has used for 7 days is deleted, so it stops costing storage.
+        The main volume goes after 30 days without use, its stopped pod
+        first. The next <code>viy up</code> then makes a new volume and
+        downloads the weights again, which takes about four minutes, once. A
+        volume a pod is running on is never deleted, and
+        <code>viy status</code> shows how many days each one has left.</li>
         <li><b>Ending the night yourself.</b> <code>viy shutdown 90m</code> or
         <code>viy shutdown 23:30</code> saves and closes your open chats at
         that time, runs <code>viy stop</code>, and powers off the PC only once
@@ -550,8 +554,8 @@ and the student must hold out until dawn.
         pod terminated.</li>
       </ul>
       <p>All the numbers are settings: <code>IDLE_TTL_MIN</code>,
-      <code>MAX_POD_HOURS</code>, <code>REAP_GRACE_MIN</code> and
-      <code>BACKUP_IDLE_DAYS</code>.</p>
+      <code>MAX_POD_HOURS</code>, <code>REAP_GRACE_MIN</code>,
+      <code>BACKUP_IDLE_DAYS</code> and <code>PRIMARY_IDLE_DAYS</code>.</p>
     </details></td>
   </tr>
 </table>
