@@ -469,6 +469,89 @@ fn empty_runpod(create: Reply) -> impl Fn(&viy_http::Request) -> Reply + Send + 
     }
 }
 
+/// `viy up` under ENGINE=strata: one create request with Strata's body
+/// (the stock image, the host RAM filter, Strata's boot script), a wait on
+/// Strata's /health, and a boot record that says its engine (kb d171).
+#[tokio::test(start_paused = true)]
+async fn a_strata_profile_creates_a_strata_pod() {
+    let created = json_reply(json!({"id": "pod111", "costPerHr": 1.89}));
+    let mut home = Home::new(None, empty_runpod(created));
+    home.cfg.set("ENGINE", "strata");
+    let told = Told::default();
+    run_up(&mut home, &told).await.unwrap();
+    let creates: Vec<viy_http::Request> = home
+        .api
+        .sent()
+        .into_iter()
+        .filter(|r| r.method == Method::POST && r.url.ends_with("/v1/pods"))
+        .collect();
+    assert_eq!(creates.len(), 1);
+    let body: Value = serde_json::from_slice(creates[0].body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        body["imageName"],
+        "runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404"
+    );
+    assert_eq!(body["minRAMPerGPU"], 150);
+    let script = body["dockerStartCmd"][0].as_str().unwrap();
+    assert!(script.contains("python3 /run/strata-pod.py prepare"));
+    assert!(!script.contains("vllm serve"));
+    let texts = told.texts();
+    assert!(
+        texts.contains(&"Strata is serving. Startup took 0s. Run viy chat".to_string()),
+        "{texts:?}"
+    );
+    let records = Records::new(&home.paths);
+    let row = records.history(1).pop().unwrap();
+    assert_eq!(row["engine"], "strata");
+    assert_eq!(
+        row["image"],
+        "runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404"
+    );
+}
+
+/// A Strata pod's engine is kept in pod.json, a vLLM pod's is not (pod.json
+/// as rp wrote it).
+#[tokio::test(start_paused = true)]
+async fn the_pod_keeps_the_engine_it_was_made_with() {
+    let created = json_reply(json!({"id": "pod111", "costPerHr": 1.89}));
+    let mut home = Home::new(None, empty_runpod(created));
+    home.cfg.set("ENGINE", "strata");
+    run_up(&mut home, &Told::default()).await.unwrap();
+    assert_eq!(home.state()["engine"], "strata");
+    let created = json_reply(json!({"id": "pod111", "costPerHr": 1.89}));
+    let mut home = Home::new(None, empty_runpod(created));
+    run_up(&mut home, &Told::default()).await.unwrap();
+    assert!(home.state().get("engine").is_none(), "{}", home.state());
+}
+
+/// `viy model use` onto a Strata profile without `viy down`: the vLLM pod
+/// pod.json tracks is not resumed as Strata's, nor the reverse.
+#[tokio::test(start_paused = true)]
+async fn a_tracked_pod_of_another_engine_is_not_reused() {
+    let mut home = Home::new(tracked(false), runpod("EXITED"));
+    home.cfg.set("ENGINE", "strata");
+    let error = run_up(&mut home, &Told::default()).await.unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "pod pod111 runs vllm, but this profile's ENGINE is strata. Terminate it first \
+         (viy down), then viy up."
+    );
+    assert!(
+        !home.sent().iter().any(|r| r.ends_with("/start")),
+        "{:?}",
+        home.sent()
+    );
+    let strata_pod = json!({"pod_id": "pod111", "volume_id": "vol222", "tunnel_only": false,
+                            "engine": "strata"});
+    let mut home = Home::new(Some(strata_pod), runpod("EXITED"));
+    let error = run_up(&mut home, &Told::default()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("pod pod111 runs strata, but this profile's ENGINE is vllm.")
+    );
+}
+
 /// rpctl test_regions.py CreatePodTests::test_success_path_is_one_create_request,
 /// through `up`.
 #[tokio::test(start_paused = true)]
@@ -590,11 +673,8 @@ async fn tunnel_mode_without_an_ssh_key_creates_nothing() {
 #[tokio::test(start_paused = true)]
 async fn up_refuses_an_engine_it_cannot_run_before_asking_runpod() {
     for (engine, said) in [
-        (
-            "strata",
-            "ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.25)",
-        ),
         ("vlm", "unknown ENGINE 'vlm'; supported: strata, vllm"),
+        ("SGLang", "unknown ENGINE 'SGLang'; supported: strata, vllm"),
     ] {
         let mut home = Home::new(tracked(false), runpod("EXITED"));
         home.cfg.set("ENGINE", engine);

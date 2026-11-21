@@ -116,6 +116,10 @@ pub(crate) fn pod_requests(v1: &Value) -> Vec<Value> {
             if let Some(cuda) = field("allowedCudaVersions") {
                 gpu.insert("allowedCudaVersions".into(), cuda);
             }
+            // The host RAM a Strata pod asks for (viy-strata's body).
+            if let Some(ram) = field("minRAMPerGPU") {
+                gpu.insert("minRamPerGpu".into(), ram);
+            }
             let mut body = Map::new();
             let mut put = |key: &str, value: Option<Value>| {
                 if let Some(value) = value {

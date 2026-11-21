@@ -51,6 +51,7 @@ use crate::bootreport::Outcome;
 use crate::bootreport::Records;
 use crate::bootreport::Timeline;
 use crate::compile_regex;
+use crate::engine;
 use crate::idle;
 use crate::notice::Alert;
 use crate::notice::Clock;
@@ -277,7 +278,10 @@ impl Summary {
                 return;
             }
             // Lines come oldest first, so a later boot clears an earlier ready.
-            if line.contains("=== boot ") || line.contains("RPCTL_PHASE starting vLLM") {
+            if line.contains("=== boot ")
+                || line.contains("RPCTL_PHASE starting vLLM")
+                || line.contains("RPCTL_PHASE starting Strata")
+            {
                 self.ready = false;
             } else if line.contains("RPCTL_PHASE model ready")
                 || line.contains("HTTP server started")
@@ -494,7 +498,9 @@ struct HealthProbe<'a, 'g> {
     progress: Option<&'a Progress>,
     guard: Option<&'a mut TunnelGuard<'g>>,
     report: Reporter<'a>,
-    /// Since when vLLM has been ready in the pod while /health failed.
+    /// The engine, as viy names it: "vLLM", "Strata".
+    label: &'a str,
+    /// Since when the engine has been ready in the pod while /health failed.
     stuck: Option<Instant>,
     warned: bool,
 }
@@ -537,8 +543,9 @@ impl Probe for HealthProbe<'_, '_> {
                 report,
                 Tone::Error,
                 format!(
-                    "vLLM reports ready inside the pod, but {url} has failed for {}s \
+                    "{} reports ready inside the pod, but {url} has failed for {}s \
                      ({state}). The pod is billing meanwhile.",
+                    self.label,
                     UNREACHABLE_WARN.as_secs()
                 ),
             );
@@ -560,9 +567,12 @@ impl Probe for HealthProbe<'_, '_> {
     }
 }
 
-/// Polls vLLM's `/health` at `url` until it answers 200 (true) or the
-/// timeout passes (false). `guard` looks at the tunnel before every poll,
-/// and may restart it or end the wait.
+/// Polls the engine's `/health` at `url` until it answers 200 (true) or the
+/// timeout passes (false); vLLM and Strata both answer 200 only once the
+/// model is loaded (kb f161). `guard` looks at the tunnel before every
+/// poll, and may restart it or end the wait. `engine` names it in what is
+/// said.
+#[allow(clippy::too_many_arguments)]
 pub async fn wait_ready(
     http: &dyn HttpClient,
     url: &str,
@@ -570,6 +580,7 @@ pub async fn wait_ready(
     timeout: Duration,
     progress: Option<&Progress>,
     guard: Option<&mut TunnelGuard<'_>>,
+    engine: engine::EngineName,
     report: Reporter<'_>,
 ) -> Result<bool, WaitError> {
     let probe = HealthProbe {
@@ -579,10 +590,15 @@ pub async fn wait_ready(
         progress,
         guard,
         report,
+        label: engine.label(),
         stuck: None,
         warned: false,
     };
-    let ready = wait_with_clock("waiting for vLLM", timeout, HEALTH_POLL, probe, report).await?;
+    let waiting = match engine {
+        engine::EngineName::Vllm => "waiting for vLLM",
+        engine::EngineName::Strata => "waiting for Strata",
+    };
+    let ready = wait_with_clock(waiting, timeout, HEALTH_POLL, probe, report).await?;
     Ok(ready.is_some())
 }
 
@@ -617,15 +633,13 @@ fn settle<T>(
     }
 }
 
-fn healthy(timeline: &mut Timeline<'_>, ready: bool) -> bool {
-    timeline.mark(
-        if ready {
-            "vLLM healthy"
-        } else {
-            "timed out waiting for vLLM"
-        },
-        [],
-    );
+fn healthy(timeline: &mut Timeline<'_>, ready: bool, label: &str) -> bool {
+    let event = if ready {
+        format!("{label} healthy")
+    } else {
+        format!("timed out waiting for {label}")
+    };
+    timeline.mark(&event, []);
     ready
 }
 
@@ -662,13 +676,14 @@ pub async fn await_endpoint(
             timeout,
             Some(&progress),
             None,
+            engine::name(cfg),
             report,
         )
         .await;
         let Some(ready) = settle(waited, timeline, report)? else {
             return Ok(None);
         };
-        return Ok(healthy(timeline, ready).then_some(url));
+        return Ok(healthy(timeline, ready, engine::label(cfg)).then_some(url));
     }
 
     say(
@@ -730,6 +745,7 @@ pub async fn await_endpoint(
             remaining,
             Some(&progress),
             Some(&mut guard),
+            engine::name(cfg),
             report,
         )
         .await
@@ -737,7 +753,7 @@ pub async fn await_endpoint(
     let Some(ready) = settle(waited, timeline, report)? else {
         return Ok(None);
     };
-    Ok(healthy(timeline, ready).then_some(url))
+    Ok(healthy(timeline, ready, engine::label(cfg)).then_some(url))
 }
 
 /// [`await_endpoint`] until `interrupted` resolves (Ctrl-C). An
@@ -801,7 +817,9 @@ pub async fn report_boot(
             return total;
         }
     };
-    if over && outcome == Outcome::Ready {
+    // Strata's budget is a target (kb d161): its overrun is said, not alerted.
+    let hard = bootreport::table(engine::name(w.ssh.cfg)).hard_budget;
+    if over && hard && outcome == Outcome::Ready {
         report(Report::Alert(Alert {
             title: "viy up: over the boot budget".into(),
             body: format!(
@@ -828,10 +846,21 @@ async fn record_boot(
         w.rp.pod_logs(w.pod_id, 600, Duration::from_secs(8))
             .await
             .unwrap_or_default();
-    let (stages, details) = bootreport::measure(bootreport::latest_boot(&entries), started, ready);
-    let (text, over) = bootreport::render(&stages, &details, total, bootreport::BUDGET_S, outcome);
-    let tone = if over || outcome != Outcome::Ready {
+    let table = bootreport::table(engine::name(w.ssh.cfg));
+    let (stages, details) =
+        bootreport::measure(bootreport::latest_boot(&entries), started, ready, &table);
+    let (text, over) = bootreport::render(
+        &stages,
+        &details,
+        total,
+        bootreport::BUDGET_S,
+        outcome,
+        &table,
+    );
+    let tone = if (over && table.hard_budget) || outcome != Outcome::Ready {
         Tone::Error
+    } else if over {
+        Tone::Warn
     } else {
         Tone::Dim
     };
@@ -916,9 +945,24 @@ const VLLM_LOG_SCRIPT: &str = "awk 'index($0,\"=== boot \")==1{n++} {l[n]=l[n] $
      END{printf \"%s\", l[n]}' /workspace/vllm.log | head -n 4000; \
      echo '=== sshd.log (tail) ==='; tail -n 100 /workspace/sshd.log";
 
-/// `viy capture-boot`: writes the boot's platform log, the pod's vllm.log
-/// for this boot and the sshd.log tail next to its record, secrets
-/// masked, and adds the host's facts to the record.
+/// The same for a Strata pod's strata.log (viy-strata's boot script).
+const STRATA_LOG_SCRIPT: &str = "awk 'index($0,\"=== boot \")==1{n++} {l[n]=l[n] $0 \"\\n\"} \
+     END{printf \"%s\", l[n]}' /workspace/strata.log | head -n 4000; \
+     echo '=== sshd.log (tail) ==='; tail -n 100 /workspace/sshd.log";
+
+/// The engine's log on the pod: the script that prints this boot's part,
+/// the suffix of its copy next to the record, and its key in `files`.
+fn pod_log(engine: engine::EngineName) -> (&'static str, &'static str, &'static str) {
+    match engine {
+        engine::EngineName::Vllm => (VLLM_LOG_SCRIPT, "vllm.log", "vllm_log"),
+        engine::EngineName::Strata => (STRATA_LOG_SCRIPT, "strata.log", "strata_log"),
+    }
+}
+
+/// `viy capture-boot`: writes the boot's platform log, the engine's log on
+/// the pod for this boot (vllm.log, or strata.log) and the sshd.log tail
+/// next to its record, secrets masked, and adds the host's facts to the
+/// record.
 pub async fn capture_boot(
     ssh: &Ssh<'_>,
     rp: &RunPod,
@@ -962,11 +1006,15 @@ pub async fn capture_boot(
             );
         }
     }
-    if let Err(error) =
-        capture_vllm_log(ssh, rp, &records, boot_id, pod_id, &mut data, &mut files).await
+    // The engine the boot ran, from its record: the config may have moved on.
+    let ran = bootreport::row_engine(&Value::Object(data.clone()));
+    if let Err(error) = capture_pod_log(
+        ssh, rp, &records, boot_id, pod_id, ran, &mut data, &mut files,
+    )
+    .await
     {
         files
-            .entry("vllm_log")
+            .entry(pod_log(ran).2)
             .or_insert_with(|| json!(format!("unavailable: {error}")));
     }
     data.insert("files".into(), Value::Object(files));
@@ -978,13 +1026,16 @@ pub async fn capture_boot(
     Ok(())
 }
 
-/// The host's facts into `data`, and the pod's vllm.log over ssh.
-async fn capture_vllm_log(
+/// The host's facts into `data`, and the engine's log from the pod over
+/// ssh (vllm.log, or strata.log for Strata).
+#[allow(clippy::too_many_arguments)]
+async fn capture_pod_log(
     ssh: &Ssh<'_>,
     rp: &RunPod,
     records: &Records<'_>,
     boot_id: &str,
     pod_id: &str,
+    ran: engine::EngineName,
     data: &mut Map<String, Value>,
     files: &mut Map<String, Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1018,18 +1069,19 @@ async fn capture_vllm_log(
     let Some((ip, port)) = endpoint else {
         return Ok(());
     };
+    let (script, suffix, key) = pod_log(ran);
     let command = Command::new("ssh")
         .args(ssh.opts("yes")?)
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-p"])
         .arg(port.to_string())
         .arg(format!("root@{ip}"))
-        .arg(VLLM_LOG_SCRIPT)
+        .arg(script)
         .timeout(Duration::from_secs(60));
     let output = ssh.exec.run(command).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if stdout.is_empty() {
         files.insert(
-            "vllm_log".into(),
+            key.into(),
             json!(format!(
                 "unavailable: ssh exit {}",
                 exit_text(output.status)
@@ -1037,13 +1089,13 @@ async fn capture_vllm_log(
         );
         return Ok(());
     }
-    let path = records.file(boot_id, "vllm.log");
+    let path = records.file(boot_id, suffix);
     let text: String = stdout
         .lines()
         .map(|line| redact_log(line, ssh.cfg) + "\n")
         .collect();
     fs::write(&path, text)?;
-    files.insert("vllm_log".into(), json!(path.display().to_string()));
+    files.insert(key.into(), json!(path.display().to_string()));
     Ok(())
 }
 

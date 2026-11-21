@@ -366,6 +366,8 @@ fn pod_body(v2: &Value) -> Value {
         "allowedCudaVersions",
         gpu.and_then(|g| g.get("allowedCudaVersions")),
     );
+    // viy's own: a Strata pod's host RAM filter (v1 named it so).
+    put("minRAMPerGPU", gpu.and_then(|g| g.get("minRamPerGpu")));
     Value::Object(v1)
 }
 

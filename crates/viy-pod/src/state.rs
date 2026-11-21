@@ -33,6 +33,9 @@ pub mod key {
     pub const CREATED_AT: &str = "created_at";
     /// Whether the pod was created reachable only through the SSH tunnel.
     pub const TUNNEL_ONLY: &str = "tunnel_only";
+    /// The engine a pod runs when it is not vLLM (viy only, kb d171): a
+    /// pod made by rp or for vLLM has none.
+    pub const ENGINE: &str = "engine";
     /// The last fresh boot's length in seconds, to one decimal.
     pub const LAST_STARTUP_SECONDS: &str = "last_startup_seconds";
     /// The backgrounded tunnel's ssh pid, `null` once it is stopped.

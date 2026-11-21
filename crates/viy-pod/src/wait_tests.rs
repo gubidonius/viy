@@ -446,6 +446,7 @@ async fn ready_in_pod_but_unreachable_warns() {
         Duration::from_secs(100),
         Some(&progress),
         None,
+        crate::engine::EngineName::Vllm,
         &told.reporter(),
     )
     .await
@@ -1239,6 +1240,20 @@ async fn image_pull_is_reported_not_hidden_behind_sshd() {
     );
 }
 
+/// A Strata pod's boot: its watch helper's "model ready" marks it ready,
+/// and a later "starting Strata" (a restarted container) clears that.
+#[tokio::test]
+async fn a_strata_pod_is_ready_by_its_own_lines() {
+    let ready = log_reply(&["RPCTL_PHASE starting Strata", "RPCTL_PHASE model ready"]);
+    let restarted = log_reply(&["RPCTL_PHASE model ready", "RPCTL_PHASE starting Strata"]);
+    for (reply, want) in [(ready, true), (restarted, false)] {
+        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))));
+        let progress = Progress::new(&rp, "pod111", true);
+        progress.refresh().await;
+        assert_eq!(progress.pod_ready(), want);
+    }
+}
+
 /// Boot 20260727T023034Z: every fetch holds the system log's last 30
 /// lines, the end of the image pull, and while vLLM loads the container's
 /// last 30 are sshd refusing the tunnel's health checks.
@@ -1313,6 +1328,7 @@ async fn unauthorized_is_not_ready() {
         Duration::from_secs(3),
         None,
         None,
+        crate::engine::EngineName::Vllm,
         &told.reporter(),
     )
     .await

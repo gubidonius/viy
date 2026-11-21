@@ -125,6 +125,24 @@ fn a_v1_create_is_one_v2_request_per_gpu_type_in_order() {
     assert_eq!(requests, [first, second]);
 }
 
+/// A Strata pod's host RAM filter (viy-strata's `minRAMPerGPU`) goes with
+/// the GPU in each v2 request.
+#[test]
+fn the_host_ram_filter_goes_with_the_gpu() {
+    let mut body = v1_body();
+    body["minRAMPerGPU"] = json!(150);
+    let requests = pod_requests(&body);
+    assert_eq!(requests[0]["gpu"]["minRamPerGpu"], 150);
+    assert_eq!(requests[1]["gpu"]["minRamPerGpu"], 150);
+    assert!(requests[0].get("minRAMPerGPU").is_none());
+    // vLLM's body has none, and its requests stay as they were
+    assert!(
+        pod_requests(&v1_body())[0]["gpu"]
+            .get("minRamPerGpu")
+            .is_none()
+    );
+}
+
 #[test]
 fn a_create_without_the_cuda_filter_or_types_still_asks_once() {
     let mut body = v1_body();

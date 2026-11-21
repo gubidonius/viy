@@ -5,7 +5,8 @@
 //! (kb d006): `<boot_id>.json` (stages, facts, `up`'s own timeline, the
 //! boot-relevant config, the file list), and the logs a detached process
 //! collects afterwards, `<boot_id>.platform.log` and `<boot_id>.vllm.log`
-//! (`crate::wait::capture_boot`). Secrets are masked before anything is
+//! (`crate::wait::capture_boot`; `<boot_id>.strata.log` for a Strata
+//! boot, whose stages are Strata's, kb d171). Secrets are masked before anything is
 //! written, and recording never adds boot time.
 
 use std::fs;
@@ -28,6 +29,7 @@ use viy_time::TimeProvider;
 use crate::api::LogEntry;
 use crate::api::shown;
 use crate::compile_regex;
+use crate::engine::EngineName;
 
 /// Pod creation to a local /health 200, image pull included, in seconds. A
 /// hard limit (kb d004).
@@ -66,6 +68,32 @@ pub const BOOT_KEYS: [&str; 26] = [
     "MAX_POD_HOURS",
 ];
 
+/// The config keys a Strata boot's record keeps. No secrets.
+pub const STRATA_BOOT_KEYS: [&str; 22] = [
+    "ENGINE",
+    "STRATA_IMAGE",
+    "MODEL_REPO",
+    "MODEL_FILES",
+    "MAX_MODEL_LEN",
+    "STRATA_PARALLEL",
+    "STRATA_BATCH_MTP",
+    "STRATA_PLE_IO",
+    "STRATA_PLE_WARM",
+    "STRATA_VRAM_RESERVE_MIB",
+    "STRATA_KV",
+    "MIN_RAM_GB",
+    "GPU_TYPE_IDS",
+    "GPU_TYPE_PRIORITY",
+    "DATA_CENTER_ID",
+    "CLOUD_TYPE",
+    "TUNNEL",
+    "SEARCH_ENABLED",
+    "TOOLS_ENABLED",
+    "CUDA_VERSIONS",
+    "IDLE_TTL_MIN",
+    "MAX_POD_HOURS",
+];
+
 /// vLLM's stages, from viy-vllm with the boot script that prints their
 /// markers (kb d171).
 pub use viy_vllm::stages::STAGES;
@@ -73,13 +101,69 @@ pub use viy_vllm::stages::STAGES;
 /// The last stage, measured on this machine: up to the local 200.
 pub const LOCAL_STAGE: (&str, &str) = ("endpoint", "SSH tunnel / local endpoint");
 
-/// What to check when a stage is the biggest share of an overrun: the
-/// engine's own stages from its crate, the local one here.
-fn hint(key: &str) -> &'static str {
-    if key == LOCAL_STAGE.0 {
-        "sshd or the tunnel came up late"
-    } else {
-        viy_vllm::stages::hint(key)
+/// One engine's boot: its stages, from its crate with the boot script that
+/// prints their markers, what to check when one runs long, and the config
+/// keys its record keeps (kb d171).
+#[derive(Clone, Copy)]
+pub struct StageTable {
+    pub engine: EngineName,
+    pub stages: &'static [(&'static str, &'static str, &'static str)],
+    pub config_keys: &'static [&'static str],
+    /// Whether BUDGET_S is a hard limit (vLLM, kb d004) or a target to
+    /// meet when it can (Strata, kb d161: the first boot prepares the
+    /// volume, minutes over).
+    pub hard_budget: bool,
+    stage_hint: fn(&str) -> &'static str,
+}
+
+/// The stage table of `engine`.
+pub fn table(engine: EngineName) -> StageTable {
+    match engine {
+        EngineName::Vllm => StageTable {
+            engine,
+            stages: &viy_vllm::stages::STAGES,
+            config_keys: &BOOT_KEYS,
+            hard_budget: true,
+            stage_hint: viy_vllm::stages::hint,
+        },
+        EngineName::Strata => StageTable {
+            engine,
+            stages: &viy_strata::stages::STAGES,
+            config_keys: &STRATA_BOOT_KEYS,
+            hard_budget: false,
+            stage_hint: viy_strata::stages::hint,
+        },
+    }
+}
+
+impl StageTable {
+    /// What to check when a stage is the biggest share of an overrun: the
+    /// engine's own stages from its crate, the local one here.
+    fn hint(&self, key: &str) -> &'static str {
+        if key == LOCAL_STAGE.0 {
+            "sshd or the tunnel came up late"
+        } else {
+            (self.stage_hint)(key)
+        }
+    }
+
+    /// A stage's label, with the local one.
+    fn label(&self, key: &str) -> Option<&'static str> {
+        self.stages
+            .iter()
+            .map(|(k, l, _)| (*k, *l))
+            .chain([LOCAL_STAGE])
+            .find(|(k, _)| *k == key)
+            .map(|(_, l)| l)
+    }
+}
+
+/// The engine a recorded boot ran: `engine` in its row or record, vLLM
+/// when absent (every boot before Strata).
+pub fn row_engine(row: &Value) -> EngineName {
+    match row.get("engine").and_then(Value::as_str) {
+        Some("strata") => EngineName::Strata,
+        _ => EngineName::Vllm,
     }
 }
 
@@ -158,12 +242,13 @@ pub fn latest_boot(entries: &[LogEntry]) -> &[LogEntry] {
     &entries[start..]
 }
 
-/// The boot's stages, from pod creation (`created`) to the local 200
-/// (`ready`), and vLLM's own timings.
+/// The boot's stages in `table`, from pod creation (`created`) to the
+/// local 200 (`ready`), and vLLM's own timings when it logged them.
 pub fn measure(
     entries: &[LogEntry],
     created: DateTime<Utc>,
     ready: DateTime<Utc>,
+    table: &StageTable,
 ) -> (Vec<Stage>, Details) {
     static NUMBERS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
         [
@@ -173,14 +258,14 @@ pub fn measure(
         ]
         .map(compile_regex)
     });
-    let mut marks: [Option<DateTime<Utc>>; STAGES.len()] = [None; STAGES.len()];
+    let mut marks: Vec<Option<DateTime<Utc>>> = vec![None; table.stages.len()];
     let mut details = Details::default();
     for entry in entries {
         let Some(ts) = entry.ts.as_deref().and_then(parse_ts) else {
             continue;
         };
         let line = entry.line.as_str();
-        for (mark, (_, _, marker)) in marks.iter_mut().zip(STAGES) {
+        for (mark, (_, _, marker)) in marks.iter_mut().zip(table.stages) {
             if mark.is_none() && line.contains(marker) {
                 *mark = Some(ts);
             }
@@ -201,7 +286,7 @@ pub fn measure(
     }
     let mut stages = Vec::new();
     let mut previous = created;
-    for (mark, (key, label, _)) in marks.into_iter().zip(STAGES) {
+    for (mark, (key, label, _)) in marks.into_iter().zip(table.stages) {
         if let Some(at) = mark
             && at >= previous
         {
@@ -345,6 +430,7 @@ pub fn render(
     total: f64,
     budget: u64,
     outcome: Outcome,
+    table: &StageTable,
 ) -> (String, bool) {
     let title = match outcome {
         Outcome::Ready => "Boot breakdown".to_string(),
@@ -385,11 +471,16 @@ pub fn render(
             .iter()
             .reduce(|best, s| if s.seconds > best.seconds { s } else { best })
     {
+        let overrun = if table.hard_budget {
+            format!("OVER BUDGET by {over:.0}s.")
+        } else {
+            format!("Over the {budget}s target by {over:.0}s.")
+        };
         lines.push(format!(
-            "OVER BUDGET by {over:.0}s. Largest stage: {} ({:.0}s) -- {}.",
+            "{overrun} Largest stage: {} ({:.0}s) -- {}.",
             largest.label,
             largest.seconds,
-            hint(largest.key)
+            table.hint(largest.key)
         ));
     }
     (lines.join("\n"), over > 0.0)
@@ -492,6 +583,7 @@ impl<'a> Records<'a> {
         timeline: &Timeline<'_>,
     ) -> io::Result<Map<String, Value>> {
         let now = time.now();
+        let table = table(crate::engine::name(cfg));
         let boot_id = format!("{}-{}", now.format("%Y%m%dT%H%M%SZ"), boot.pod_id);
         let mut row = Map::new();
         row.insert(
@@ -501,7 +593,11 @@ impl<'a> Records<'a> {
         row.insert("boot_id".to_string(), json!(boot_id));
         row.insert("pod_id".to_string(), json!(boot.pod_id));
         row.insert("outcome".to_string(), json!(boot.outcome.as_str()));
-        row.insert("image".to_string(), json!(cfg.get("VLLM_IMAGE")));
+        let image = match table.engine {
+            EngineName::Vllm => "VLLM_IMAGE",
+            EngineName::Strata => "STRATA_IMAGE",
+        };
+        row.insert("image".to_string(), json!(cfg.get(image)));
         row.insert("total_s".to_string(), json!(tenths(boot.total)));
         row.insert("budget_s".to_string(), json!(BUDGET_S));
         let stages: Map<String, Value> = boot
@@ -511,6 +607,10 @@ impl<'a> Records<'a> {
             .collect();
         row.insert("stages".to_string(), Value::Object(stages));
         boot.details.insert_into(&mut row);
+        // vLLM's rows stay as rp wrote them; another engine's says which.
+        if table.engine != EngineName::Vllm {
+            row.insert("engine".to_string(), json!(table.engine.as_str()));
+        }
 
         fs::create_dir_all(self.paths.pod_state_dir())?;
         let mut history = fs::OpenOptions::new()
@@ -522,7 +622,8 @@ impl<'a> Records<'a> {
         let mut full = row.clone();
         full.insert("facts".to_string(), Value::Object(boot.facts.to_json()));
         full.insert("timeline".to_string(), Value::Array(timeline.rows()));
-        let config: Map<String, Value> = BOOT_KEYS
+        let config: Map<String, Value> = table
+            .config_keys
             .iter()
             .map(|k| (k.to_string(), json!(cfg.get(k))))
             .collect();
@@ -594,11 +695,18 @@ pub fn history_table(records: &Records<'_>, limit: usize) -> String {
             records.paths.boots_history_file().display()
         );
     }
-    let keys: Vec<&str> = STAGES
-        .iter()
-        .map(|(k, _, _)| *k)
-        .chain([LOCAL_STAGE.0])
-        .collect();
+    // The stages of each engine the rows ran, vLLM's first, the local one last.
+    let mut keys: Vec<&str> = Vec::new();
+    for engine in [EngineName::Vllm, EngineName::Strata] {
+        if rows.iter().any(|row| row_engine(row) == engine) {
+            for (key, _, _) in table(engine).stages {
+                if !keys.contains(key) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    keys.push(LOCAL_STAGE.0);
     let mut lines = vec![format!(
         "{:<20} {:>6}  {}  gpu",
         "when (UTC)",
@@ -695,12 +803,7 @@ pub fn show(records: &Records<'_>, boot_id: Option<&str>) -> Result<String, Stri
         .into_iter()
         .flatten()
     {
-        let label = STAGES
-            .iter()
-            .map(|(k, l, _)| (*k, *l))
-            .chain([LOCAL_STAGE])
-            .find(|(k, _)| k == key)
-            .map_or(key.as_str(), |(_, l)| l);
+        let label = table(row_engine(&data)).label(key).unwrap_or(key.as_str());
         lines.push(format!(
             "  {label:<34} {:6.1}s",
             seconds.as_f64().unwrap_or(0.0)

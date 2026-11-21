@@ -58,11 +58,12 @@ fn each_engine_ignores_the_others_keys() {
 }
 
 #[test]
-fn strata_is_refused_until_it_is_built() {
-    assert_eq!(
-        for_config(&with_engine("strata")).err(),
-        Some("ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.25)".to_string())
-    );
+fn strata_is_served_by_viy_strata() {
+    let engine = for_config(&with_engine("strata")).unwrap();
+    assert_eq!(engine.name(), EngineName::Strata);
+    assert_eq!(label(&with_engine("strata")), "Strata");
+    assert_eq!(label(&Config::defaults()), "vLLM");
+    assert_eq!(name(&with_engine("tgi")), EngineName::Vllm);
 }
 
 #[test]

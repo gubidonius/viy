@@ -80,7 +80,8 @@ fn the_report_reads_the_log_as_rpctls_does() {
                 let log = entries(&case["entries"]);
                 let created = ts(case["created"].as_str().unwrap());
                 let ready = ts(case["ready"].as_str().unwrap());
-                let (stages, details) = measure(latest_boot(&log), created, ready);
+                let (stages, details) =
+                    measure(latest_boot(&log), created, ready, &table(EngineName::Vllm));
                 let want: Vec<Stage> = case["stages"]
                     .as_array()
                     .unwrap()
@@ -117,6 +118,7 @@ fn the_report_reads_the_log_as_rpctls_does() {
                     case["total"].as_f64().unwrap(),
                     BUDGET_S,
                     outcome,
+                    &table(EngineName::Vllm),
                 );
                 assert_eq!(text, as_viy(case["text"].as_str().unwrap()), "{name}");
                 assert_eq!(over, case["over"].as_bool().unwrap(), "{name}");
@@ -158,6 +160,7 @@ fn report_names_the_slowest_stage_when_over_budget() {
         210.0,
         BUDGET_S,
         Outcome::Ready,
+        &table(EngineName::Vllm),
     );
     assert!(over);
     assert!(text.contains("OVER BUDGET by 30s"));
@@ -168,6 +171,7 @@ fn report_names_the_slowest_stage_when_over_budget() {
         150.0,
         BUDGET_S,
         Outcome::Ready,
+        &table(EngineName::Vllm),
     );
     assert!(!over);
 }
@@ -179,7 +183,7 @@ fn measure_splits_the_boot_into_stages() {
     let log = entries(&case["entries"]);
     let created = ts("2026-06-25T23:23:03Z");
     let ready = ts("2026-06-25T23:40:05Z");
-    let (stages, details) = measure(latest_boot(&log), created, ready);
+    let (stages, details) = measure(latest_boot(&log), created, ready, &table(EngineName::Vllm));
     // Rounded as rpctl's round() and the report round: halves to even.
     let got: Vec<(&str, String)> = stages
         .iter()
@@ -333,4 +337,170 @@ fn reports_a_key_runpod_refuses() {
         facts(&lines(&[line])).watchdog.as_deref(),
         Some("CANNOT STOP THIS POD: RunPod refused its key (HTTP 403)")
     );
+}
+
+// ------------------------------------------------------------- Strata (kb d171)
+
+/// A Strata boot's log as its script and server print it (the server's
+/// lines from pod n2k01nm2n0ftmx's server.log, 2026-08-08).
+fn strata_log() -> Vec<LogEntry> {
+    [
+        (
+            "2026-08-08T04:22:00Z",
+            "=== boot Sat Aug  8 04:22:00 UTC 2026 ===",
+        ),
+        (
+            "2026-08-08T04:22:01Z",
+            "RPCTL_PHASE container started; preparing SSH",
+        ),
+        ("2026-08-08T04:22:03Z", "RPCTL_PHASE starting Strata"),
+        (
+            "2026-08-08T04:22:04Z",
+            "loading the model (the first start takes a minute or two) ...",
+        ),
+        (
+            "2026-08-08T04:23:18Z",
+            "[strata] experts loaded: 85.55 GiB at 2.12 GiB/s (75 s so far)",
+        ),
+        (
+            "2026-08-08T04:23:23Z",
+            "ready: http://127.0.0.1:8000/v1  (OpenAI: /v1/chat/completions)",
+        ),
+        ("2026-08-08T04:23:24Z", "RPCTL_PHASE model ready"),
+    ]
+    .iter()
+    .map(|(ts, line)| LogEntry {
+        ts: Some(ts.to_string()),
+        source: Some("container".into()),
+        line: line.to_string(),
+    })
+    .collect()
+}
+
+#[test]
+fn a_strata_boot_is_measured_by_its_own_stages() {
+    let created = ts("2026-08-08T04:20:00Z");
+    let ready = ts("2026-08-08T04:23:30Z");
+    let strata = table(EngineName::Strata);
+    let (stages, details) = measure(latest_boot(&strata_log()), created, ready, &strata);
+    let got: Vec<(&str, f64)> = stages.iter().map(|s| (s.key, s.seconds)).collect();
+    assert_eq!(
+        got,
+        [
+            ("pull", 120.0),
+            ("prepare", 3.0),
+            ("experts", 75.0),
+            ("gpu_cache", 5.0),
+            ("endpoint", 7.0)
+        ]
+    );
+    assert_eq!(details, Details::default());
+    // vLLM's table finds only the stages both scripts mark
+    let (vllm, _) = measure(
+        latest_boot(&strata_log()),
+        created,
+        ready,
+        &table(EngineName::Vllm),
+    );
+    assert_eq!(
+        vllm.iter().map(|s| s.key).collect::<Vec<_>>(),
+        ["pull", "endpoint"]
+    );
+}
+
+#[test]
+fn a_strata_overrun_gets_stratas_hint() {
+    let stages = [
+        stage("pull", "GPU allocation + image pull", 150.0),
+        stage(
+            "prepare",
+            "boot script (first boot: release, model, pack)",
+            40.0,
+        ),
+    ];
+    let (text, over) = render(
+        &stages,
+        &Details::default(),
+        190.0,
+        BUDGET_S,
+        Outcome::Ready,
+        &table(EngineName::Strata),
+    );
+    assert!(over);
+    assert!(
+        text.contains("keep STRATA_IMAGE on RunPod's stock runpod/pytorch image (kb d172)"),
+        "{text}"
+    );
+    // a target for Strata (kb d161), a hard limit for vLLM (kb d004)
+    assert!(text.contains("Over the 180s target by 10s."), "{text}");
+    assert!(!text.contains("OVER BUDGET"), "{text}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_strata_record_says_its_engine_and_lists_beside_vllms() {
+    let dir = ScratchDir::new("bootreport-strata").unwrap();
+    let paths = Paths::under(dir.path());
+    let time = FakeTime::at(Utc.with_ymd_and_hms(2026, 8, 8, 4, 30, 0).unwrap());
+    let records = Records::new(&paths);
+    let timeline = Timeline::start(&time);
+    let (details, facts) = (Details::default(), Facts::default());
+    fn boot<'a>(
+        pod_id: &'a str,
+        stages: &'a [Stage],
+        details: &'a Details,
+        facts: &'a Facts,
+    ) -> Boot<'a> {
+        Boot {
+            pod_id,
+            stages,
+            details,
+            total: 130.0,
+            outcome: Outcome::Ready,
+            facts,
+        }
+    }
+    let vllm_stages = [stage("pull", "x", 60.0), stage("weights", "x", 40.0)];
+    let strata_stages = [stage("pull", "x", 10.0), stage("experts", "x", 75.0)];
+    let vllm = records
+        .record(
+            &time,
+            &Config::defaults(),
+            boot("p1", &vllm_stages, &details, &facts),
+            &timeline,
+        )
+        .unwrap();
+    assert!(
+        vllm.get("engine").is_none(),
+        "vLLM's rows stay as they were"
+    );
+    time.advance(std::time::Duration::from_secs(60));
+    let mut cfg = Config::defaults();
+    cfg.set("ENGINE", "strata");
+    let strata = records
+        .record(
+            &time,
+            &cfg,
+            boot("p2", &strata_stages, &details, &facts),
+            &timeline,
+        )
+        .unwrap();
+    assert_eq!(strata["engine"], "strata");
+    assert_eq!(
+        strata["image"],
+        "runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404"
+    );
+    let data = records.read(strata["boot_id"].as_str().unwrap()).unwrap();
+    assert_eq!(data["config"]["STRATA_PARALLEL"], "2");
+    assert_eq!(
+        data["config"].as_object().unwrap().len(),
+        STRATA_BOOT_KEYS.len()
+    );
+    let table = history_table(&records, 10);
+    let header = table.lines().next().unwrap();
+    assert!(header.contains("  weights"), "{header}");
+    assert!(header.contains("  experts"), "{header}");
+    assert!(header.contains("gpu_cache"), "{header}");
+    assert!(header.trim_end().ends_with("endpoint  gpu"), "{header}");
+    let shown = show(&records, Some("p2")).unwrap();
+    assert!(shown.contains("  experts to RAM"), "{shown}");
 }

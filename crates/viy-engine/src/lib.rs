@@ -31,6 +31,14 @@ impl EngineName {
         }
     }
 
+    /// Its name in what viy says: "vLLM is serving", "waiting for Strata".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vllm => "vLLM",
+            Self::Strata => "Strata",
+        }
+    }
+
     /// Its `ENGINE` value.
     pub fn as_str(self) -> &'static str {
         match self {

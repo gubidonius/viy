@@ -150,8 +150,15 @@ pub async fn up(
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
     let print = |text: String| say(report, Tone::Plain, text);
-    // The local backend runs vLLM; an engine viy cannot run starts nothing.
-    engine::for_config(cfg).map_err(CommandError::Exit)?;
+    // The local backend runs vLLM; another engine, or one viy does not
+    // know, starts nothing.
+    let name = engine::for_config(cfg).map_err(CommandError::Exit)?.name();
+    if name != engine::EngineName::Vllm {
+        return Err(CommandError::Exit(format!(
+            "the local backend runs vLLM; ENGINE={} needs a RunPod pod (BACKEND=runpod)",
+            name.as_str()
+        )));
+    }
     if let Some(pid) = alive(env.paths) {
         print(format!(
             "local vLLM already running (pid {pid}) at {}",

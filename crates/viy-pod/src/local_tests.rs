@@ -220,7 +220,7 @@ async fn up_refuses_an_engine_it_cannot_run() {
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.25)"
+        "the local backend runs vLLM; ENGINE=strata needs a RunPod pod (BACKEND=runpod)"
     );
     assert!(!machine.paths.local_state_file().exists());
 }

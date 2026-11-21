@@ -485,8 +485,9 @@ impl Guard {
         say(Notice::new(
             Tone::Error,
             format!(
-                "The SSH tunnel{} died while waiting for vLLM.",
-                tunnel.pid_text()
+                "The SSH tunnel{} died while waiting for {}.",
+                tunnel.pid_text(),
+                crate::engine::label(ssh.cfg)
             ),
         ));
         let tail = tunnel_log_tail(ssh, 5);
@@ -705,7 +706,10 @@ pub async fn foreground(
         }
         say(Notice::new(
             Tone::Dim,
-            "\nTunnel closed. vLLM is no longer reachable from this machine.",
+            format!(
+                "\nTunnel closed. {} is no longer reachable from this machine.",
+                crate::engine::label(ssh.cfg)
+            ),
         ));
     }
     Ok(())

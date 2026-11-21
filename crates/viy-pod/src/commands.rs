@@ -234,8 +234,9 @@ fn cfg_at<'c>(cfg: &'c Config, key: &str) -> &'c str {
 // ------------------------------------------------------------------ up
 
 /// `viy up`: resumes or reuses our pod, else creates one, and waits for
-/// vLLM within `timeout`. A Ctrl-C ends it, as rpctl's KeyboardInterrupt
-/// does: during the wait for vLLM, a booting pod's boot is recorded first,
+/// the engine (vLLM, or Strata under ENGINE=strata) within `timeout`. A
+/// Ctrl-C ends it, as rpctl's KeyboardInterrupt does: during the wait, a
+/// booting pod's boot is recorded first,
 /// and a second Ctrl-C ends that too. With `backup` (`viy up --backup`)
 /// DATA_CENTER_ID is skipped: a new pod goes on the backup volume, and an
 /// existing one is used only if it runs there (rpctl kb d035).
@@ -257,6 +258,29 @@ pub async fn up(
         result = up_until(env, cfg, timeout, backup, interrupt, &abort_at, report, ask) => result,
         () = aborted => Err(CommandError::Interrupted),
     }
+}
+
+/// The pod pod.json tracks runs the engine it was made with: a profile on
+/// another engine (`viy model use` without `viy down`) needs its own pod,
+/// or viy would serve and record one engine as the other. A pod pod.json
+/// does not track, or tracks without an engine (rp's, vLLM's), is vLLM's.
+fn check_pod_engine(env: &Env<'_>, cfg: &Config, pod_id: &str) -> Result<(), CommandError> {
+    let saved = state::load(env.paths)?;
+    if saved.get(key::POD_ID).and_then(Value::as_str) != Some(pod_id) {
+        return Ok(());
+    }
+    let runs = saved
+        .get(key::ENGINE)
+        .and_then(Value::as_str)
+        .unwrap_or(engine::EngineName::Vllm.as_str());
+    let wanted = engine::name(cfg).as_str();
+    if runs == wanted {
+        return Ok(());
+    }
+    Err(CommandError::Exit(format!(
+        "pod {pod_id} runs {runs}, but this profile's ENGINE is {wanted}. Terminate it first \
+         (viy down), then viy up."
+    )))
 }
 
 /// [`up`]'s work; `abort_at` is raised around the wait, and while
@@ -310,6 +334,7 @@ async fn up_until(
             check_backup_pod(env, cfg, &existing)?;
         }
         let pod_id = text(&existing, "id").unwrap_or_default().to_string();
+        check_pod_engine(env, cfg, &pod_id)?;
         regions::note_pod(env.paths, &existing, regions::now(env.time))?;
         let status = existing.get("desiredStatus");
         let booting = text(&existing, "desiredStatus") == Some("EXITED");
@@ -365,7 +390,7 @@ async fn up_until(
             idle::touch(env.paths, env.time, true);
             alert(
                 report,
-                "viy up: vLLM is serving",
+                &format!("viy up: {} is serving", engine::label(cfg)),
                 format!("ready in {took:.0}s"),
                 false,
             );
@@ -463,6 +488,16 @@ async fn up_until(
             (key::VOLUME_ID, json!(volume_id)),
         ],
     )?;
+    // The engine the pod runs, for a later `up` under another profile;
+    // vLLM's pod.json stays as rp wrote it.
+    let made_with = engine::name(cfg);
+    state::update(env.paths, |map| {
+        if made_with == engine::EngineName::Vllm {
+            map.shift_remove(key::ENGINE);
+        } else {
+            map.insert(key::ENGINE.into(), json!(made_with.as_str()));
+        }
+    })?;
     say(report, Tone::Ok, format!("  pod id:   {pod_id}"));
     if truthy(cost) {
         say(
@@ -517,11 +552,14 @@ async fn up_until(
         say(
             report,
             Tone::Ok,
-            format!("vLLM is serving. Startup took {took:.0}s. Run viy chat"),
+            format!(
+                "{} is serving. Startup took {took:.0}s. Run viy chat",
+                engine::label(cfg)
+            ),
         );
         alert(
             report,
-            "viy up: vLLM is serving",
+            &format!("viy up: {} is serving", engine::label(cfg)),
             format!("startup took {took:.0}s"),
             false,
         );
