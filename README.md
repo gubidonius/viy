@@ -514,24 +514,27 @@ and the student must hold out until dawn.
     <td valign="top"><details>
       <summary><b>The rooster</b> <sub>(click to expand)</sub><br>
       is the reap timer. In the story the night ends when the rooster crows.
-      Here a pod nobody has used for an hour is ended, so you don't pay for a
+      Here a pod nobody has used for an hour is stopped, so you don't pay for a
       GPU you forgot.</summary>
       <p>A forgotten pod is billed by the hour, all night. Two roosters watch
-      for that, one on the pod and one on your machine, so either can end it
-      when the other can't.</p>
+      for that, one on the pod and one on your machine, so either can stop it
+      when the other can't. A stopped pod costs nothing but its network
+      volume. The next <code>viy up</code> starts it again, or makes a new
+      pod on the same volume when its GPU was taken in the meantime.</p>
       <ul>
-        <li><b>On the pod.</b> A watchdog in the pod ends it after 60 minutes
+        <li><b>On the pod.</b> A watchdog in the pod stops it after 60 minutes
         in which vLLM took in and produced no tokens. An open but quiet chat
-        doesn't count as use. It also ends the pod after 8 hours whatever
-        happens. Both limits are set when the pod is created. It uses the key
-        RunPod puts in every pod, which can end that pod and nothing
+        doesn't count as use. It also stops the pod after 8 hours whatever
+        happens. Both limits are set when the pod is created. If RunPod
+        refuses the stop, the watchdog terminates the pod instead. It uses the
+        key RunPod puts in every pod, which can act on that pod and nothing
         else.</li>
         <li><b>On your machine.</b> <code>viy reap --install</code> adds a
         systemd user timer that runs <code>viy reap</code> every 5 minutes. A
         chat touches a timestamp while it streams. When nothing has streamed
         for 75 minutes, the pod's hour plus 15 minutes of grace, or the pod has
-        run past 8 hours, <code>viy reap</code> runs <code>viy down</code>. It
-        also ends a pod the watchdog could only stop, and it warns you on the
+        run past 8 hours, <code>viy reap</code> runs <code>viy stop</code>. It
+        leaves a pod that is stopped already alone, and it warns you on the
         desktop before it acts.</li>
         <li><b>Never in the middle of work.</b> While a <code>viy up</code>,
         <code>stop</code> or <code>down</code> holds the pod lock, the timer
@@ -541,9 +544,10 @@ and the student must hold out until dawn.
         The weights on your main volume always stay.</li>
         <li><b>Ending the night yourself.</b> <code>viy shutdown 90m</code> or
         <code>viy shutdown 23:30</code> saves and closes your open chats at
-        that time, runs <code>viy down</code>, and powers off the PC only once
+        that time, runs <code>viy stop</code>, and powers off the PC only once
         no pod is running. <code>--status</code> and <code>--cancel</code>
-        manage it.</li>
+        manage it. <code>viy down</code> is still there when you want every
+        pod terminated.</li>
       </ul>
       <p>All the numbers are settings: <code>IDLE_TTL_MIN</code>,
       <code>MAX_POD_HOURS</code>, <code>REAP_GRACE_MIN</code> and
