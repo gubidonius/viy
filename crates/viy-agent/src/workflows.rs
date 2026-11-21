@@ -48,7 +48,8 @@ use crate::trace::Severity;
 use crate::trace::TurnMonitor;
 use crate::trace::with_note;
 
-/// EXPLORE_MAX_TASKS, EXPLORE_PARALLEL (MAX_NUM_SEQS - 1 when empty),
+/// EXPLORE_MAX_TASKS, EXPLORE_PARALLEL (the server's slots - 1 when empty:
+/// MAX_NUM_SEQS for vLLM, STRATA_PARALLEL for Strata),
 /// EXPLORE_MAX_ROUNDS, EXPLORE_MAX_CONTEXT_CHARS, EXPLORE_REPORT_CHARS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExploreSettings {
@@ -69,7 +70,13 @@ impl ExploreSettings {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d)
         };
-        let seqs = match num("MAX_NUM_SEQS", 4) {
+        // The requests the server runs at once: vLLM's sequences, or
+        // Strata's batch slots (kb d166).
+        let slots = match viy_engine::EngineName::resolve(cfg) {
+            Ok(viy_engine::EngineName::Strata) => "STRATA_PARALLEL",
+            _ => "MAX_NUM_SEQS",
+        };
+        let seqs = match num(slots, 4) {
             0 => 4,
             n => n,
         };

@@ -5,7 +5,7 @@
 //! 9.24-9.25 put them behind the seam.
 
 use viy_config::Config;
-pub use viy_engine::BadNumber;
+pub use viy_engine::BadValue;
 pub use viy_engine::Engine;
 pub use viy_engine::EngineName;
 
@@ -15,17 +15,15 @@ pub fn for_config(cfg: &Config) -> Result<&'static dyn Engine, String> {
     match EngineName::resolve(cfg)? {
         EngineName::Vllm => Ok(&viy_vllm::VLLM),
         EngineName::Strata => {
-            Err("ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.24)".into())
+            Err("ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.25)".into())
         }
     }
 }
 
 /// The config keys the engine `name` does not read: the other engine's own.
-/// Strata's are viy-config's `STRATA_KEYS` until viy-strata lists them
-/// (WP 9.24).
 pub fn ignored_keys(name: EngineName) -> &'static [&'static str] {
     match name {
-        EngineName::Vllm => viy_config::config::STRATA_KEYS,
+        EngineName::Vllm => viy_strata::OWN_KEYS,
         EngineName::Strata => viy_vllm::OWN_KEYS,
     }
 }

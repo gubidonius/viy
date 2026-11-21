@@ -592,7 +592,7 @@ async fn up_refuses_an_engine_it_cannot_run_before_asking_runpod() {
     for (engine, said) in [
         (
             "strata",
-            "ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.24)",
+            "ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.25)",
         ),
         ("vlm", "unknown ENGINE 'vlm'; supported: strata, vllm"),
     ] {

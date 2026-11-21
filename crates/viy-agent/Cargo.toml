@@ -33,6 +33,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 libc = { workspace = true }
 viy-config = { workspace = true }
+viy-engine = { workspace = true }
 viy-exec = { workspace = true }
 viy-http = { workspace = true }
 viy-protocol = { workspace = true }

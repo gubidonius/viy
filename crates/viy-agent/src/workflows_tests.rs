@@ -245,6 +245,19 @@ fn parallelism_leaves_a_slot_free() {
     assert_eq!((at("4"), at("1")), (3, 1));
 }
 
+/// Under Strata the server's slots are STRATA_PARALLEL: with its default
+/// two, one helper at a time and one slot for the chat.
+#[test]
+fn strata_leaves_one_of_its_slots_free() {
+    let at = |parallel: &str| {
+        let mut cfg = viy_config::config::Config::defaults();
+        cfg.set("ENGINE", "strata");
+        cfg.set("STRATA_PARALLEL", parallel);
+        ExploreSettings::from_config(&cfg).parallel
+    };
+    assert_eq!((at("2"), at("4"), at("1")), (1, 3, 1));
+}
+
 // rpctl CompactionTests.test_tool_schema_estimate_counts_explore: the
 // estimate's schemas grow by explore's when it is on.
 #[test]

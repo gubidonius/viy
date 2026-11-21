@@ -55,18 +55,21 @@ pub trait Engine: Sync {
         api_key: &str,
         volume_id: &str,
         public_key: Option<&str>,
-    ) -> Result<Value, BadNumber>;
+    ) -> Result<Value, BadValue>;
 }
 
-/// A config value a pod body needs as a number but that is not one. rp
-/// stops with Python's exception here; viy names the key (kb d047).
+/// A config value a pod body cannot take: not a number where one is needed
+/// (rp stops with Python's exception there; viy names the key, kb d047), or
+/// not one of the values an engine accepts.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{key} must be {kind}, not {value:?}")]
-pub struct BadNumber {
+pub struct BadValue {
     pub key: &'static str,
     pub value: String,
     pub kind: &'static str,
 }
+
+pub mod pod;
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

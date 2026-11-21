@@ -10,7 +10,7 @@
 
 use serde_json::Value;
 use viy_config::Config;
-use viy_engine::BadNumber;
+use viy_engine::BadValue;
 use viy_engine::Engine;
 use viy_engine::EngineName;
 
@@ -65,7 +65,7 @@ impl Engine for Vllm {
         api_key: &str,
         volume_id: &str,
         public_key: Option<&str>,
-    ) -> Result<Value, BadNumber> {
+    ) -> Result<Value, BadValue> {
         build_pod_body(cfg, api_key, volume_id, public_key)
     }
 }

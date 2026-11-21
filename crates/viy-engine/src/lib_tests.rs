@@ -50,7 +50,7 @@ fn an_unknown_engine_names_the_supported_ones() {
 
 #[test]
 fn a_bad_number_names_its_key() {
-    let error = BadNumber {
+    let error = BadValue {
         key: "GPU_COUNT",
         value: "two".into(),
         kind: "a whole number",

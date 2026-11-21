@@ -1,0 +1,25 @@
+[package]
+name = "viy-strata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "viy's Strata engine: the pod's boot script and helper for serving a GGUF model with Strata"
+license-file.workspace = true
+repository.workspace = true
+
+[lib]
+name = "viy_strata"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+viy-config = { workspace = true }
+viy-engine = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+viy-testkit = { workspace = true }

@@ -61,7 +61,7 @@ fn each_engine_ignores_the_others_keys() {
 fn strata_is_refused_until_it_is_built() {
     assert_eq!(
         for_config(&with_engine("strata")).err(),
-        Some("ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.24)".to_string())
+        Some("ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.25)".to_string())
     );
 }
 
@@ -71,4 +71,36 @@ fn an_unknown_engine_is_refused() {
         for_config(&with_engine("tgi")).err(),
         Some("unknown ENGINE 'tgi'; supported: strata, vllm".to_string())
     );
+}
+
+/// The sshd block of Strata's boot script is vLLM's, the pod's only route
+/// in under TUNNEL=1 (kb d003): the same commands, host key paths and
+/// options, only the log file named for Strata. Changing one without the
+/// other fails here.
+#[test]
+fn stratas_sshd_block_is_vllms() {
+    fn sshd_block(script: &str) -> &str {
+        let start = script
+            .find("# sshd. In tunnel mode")
+            .expect("an sshd block");
+        let end = start + script[start..].find("\nfi\n").expect("its end") + "\nfi\n".len();
+        &script[start..end]
+    }
+    let cfg = Config::defaults();
+    let vllm = viy_vllm::build_boot_script(&cfg, "sk-SYNTHETIC");
+    let strata = viy_strata::build_boot_script(&cfg).unwrap();
+    assert_eq!(
+        sshd_block(&strata),
+        sshd_block(&vllm).replace("/workspace/vllm.log", "/workspace/strata.log")
+    );
+    assert!(sshd_block(&vllm).contains(viy_vllm::RUNTIME_HOSTKEY));
+}
+
+#[test]
+fn stratas_body_through_its_crate() {
+    let mut cfg = Config::defaults();
+    cfg.set("ENGINE", "strata");
+    let body = viy_strata::STRATA.pod_body(&cfg, "k", "v", None).unwrap();
+    assert_eq!(body["minRAMPerGPU"], 150);
+    assert_eq!(viy_strata::STRATA.name(), EngineName::Strata);
 }
