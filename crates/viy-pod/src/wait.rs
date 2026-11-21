@@ -933,8 +933,8 @@ pub fn report_watchdog(cfg: &Config, state: Option<&str>, report: Reporter<'_>) 
             report,
             Tone::Dim,
             format!(
-                "Idle watchdog armed: the pod terminates itself after {:.0} min without tokens, \
-                 or after {:.0} h.",
+                "Idle watchdog armed: the pod stops itself after {:.0} min without tokens, or \
+                 after {:.0} h.",
                 limits.ttl / 60.0,
                 limits.max / 3600.0
             ),

@@ -436,14 +436,14 @@ fn down_problems_by_backend() {
     assert_eq!(
         down_problems(&cfg),
         [
-            "RUNPOD_API_KEY is not set, so viy down can't reach RunPod; the pod would be left to \
+            "RUNPOD_API_KEY is not set, so viy stop can't reach RunPod; the pod would be left to \
           its own idle watchdog"
         ]
     );
     cfg.set("BACKEND", "OpenAI");
     assert_eq!(
         down_problems(&cfg),
-        ["viy down does nothing for the 'openai' backend; that step is skipped"]
+        ["viy stop does nothing for the 'openai' backend; that step is skipped"]
     );
     cfg.set("BACKEND", "azure");
     assert_eq!(
@@ -530,8 +530,8 @@ async fn chats_then_down_then_poweroff() {
             "time is up",
             "closing 1 chat(s): 11",
             "closed and saved: 11",
-            "viy down (attempt 1)",
-            "viy down finished",
+            "viy stop (attempt 1)",
+            "viy stop finished",
             "warning: systemctl is not available, so this machine can't be powered off",
             "powering off",
         ]
@@ -551,10 +551,10 @@ async fn failed_down_still_powers_off() {
         (0, vec!["chats".into(), "down".into(), "systemctl".into()])
     );
     let log = lines(&out);
-    assert!(log.contains(&"viy down failed: 1".to_string()), "{log:?}");
+    assert!(log.contains(&"viy stop failed: 1".to_string()), "{log:?}");
     assert!(
         log.iter().any(|l| l.starts_with(
-            "FLAG: viy down could not confirm that no pod is running; \
+            "FLAG: viy stop could not confirm that no pod is running; \
                                     powering off anyway."
         )),
         "{log:?}"
@@ -595,7 +595,7 @@ async fn refused_poweroff_is_flagged() {
             ]
         )
     );
-    let msg = "the pod is down, but the poweroff was refused: inhibited";
+    let msg = "the pod is stopped, but the poweroff was refused: inhibited";
     assert_eq!(lines(&out).last().unwrap(), &format!("FLAG: {msg}"));
     assert_eq!(
         machine.sent()[1],
@@ -718,7 +718,7 @@ async fn warns_ten_minutes_and_one_minute_ahead() {
             "could not reread the config, using the one from scheduling: no config here",
             "time is up",
             "no open chats",
-            "viy down (attempt 1)",
+            "viy stop (attempt 1)",
             "the 'openai' backend has nothing to take down",
         ]
     );
@@ -763,13 +763,13 @@ async fn waking_past_the_deadline_gives_a_minute() {
     let notes: Vec<String> = machine.sent().iter().map(|a| a[6].clone()).collect();
     // Under a minute left, both warnings go out at once, as rp's do: the
     // 10-minute one is looked at first.
-    let early = "In 30s: open chats close and the pod goes down. Cancel: viy shutdown --cancel";
+    let early = "In 30s: open chats close and the pod stops. Cancel: viy shutdown --cancel";
     assert_eq!(
         notes,
         [
             early,
             early,
-            "Woke up past the deadline: chats close, the pod goes down and this PC powers off in \
+            "Woke up past the deadline: chats close, the pod stops and this PC powers off in \
              60s. Cancel: viy shutdown --cancel",
         ]
     );
@@ -924,7 +924,7 @@ async fn status_then_cancel() {
         told.texts(),
         [
             format!(
-                "shutdown at {} (in 1h30m): chats close, viy down, then poweroff",
+                "shutdown at {} (in 1h30m): chats close, viy stop, then poweroff",
                 clock(deadline, "%a %H:%M:%S")
             ),
             format!(
@@ -1020,7 +1020,7 @@ async fn schedule_flags_what_would_fail_and_replaces_the_last_one() {
             (
                 Tone::Ok,
                 format!(
-                    "At {} (in 1h30m): close open chats, viy down, power off this PC.",
+                    "At {} (in 1h30m): close open chats, viy stop, power off this PC.",
                     clock(deadline, "%a %H:%M:%S")
                 )
             ),

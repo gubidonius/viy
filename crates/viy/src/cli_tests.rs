@@ -19,6 +19,12 @@ fn viy_description(rpctl: &str) -> String {
         .filter(|l| !l.starts_with("viy chats import"))
         .collect::<Vec<_>>()
         .join("\n")
+        // viy's shutdown stops the pod (kb d177).
+        .replace(
+            "then viy down runs; the PC powers off\nonly once viy down has confirmed no pod is \
+             running.",
+            "then viy stop runs; the PC powers off\nonly once no pod of ours is left running.",
+        )
 }
 
 /// rpctl's help where viy's says something else on purpose.
@@ -26,6 +32,8 @@ fn viy_help(subcommand: &str, rpctl: &str) -> String {
     match subcommand {
         // rp's migrate copied an old in-repo .env (kb d043).
         "migrate" => "copy rp's config and model profiles to viy's (rp's stay in place)".into(),
+        // viy's reap and shutdown stop the pod where rp's take it down (kb d177).
+        "reap" | "shutdown" => as_viy(rpctl).replace("viy down", "viy stop"),
         _ => as_viy(rpctl),
     }
 }

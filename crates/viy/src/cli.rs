@@ -64,7 +64,7 @@ pub enum Command {
     #[command(about = "terminate the pod (weights stay on the volume)")]
     Down,
     #[command(
-        about = "viy down if nothing streamed for IDLE_TTL_MIN + REAP_GRACE_MIN (backup for the pod's own idle watchdog)"
+        about = "viy stop if nothing streamed for IDLE_TTL_MIN + REAP_GRACE_MIN (backup for the pod's own idle watchdog)"
     )]
     Reap {
         #[arg(long, help = "run viy reap every 5 minutes with a systemd user timer")]
@@ -73,13 +73,13 @@ pub enum Command {
         quiet: bool,
     },
     #[command(
-        about = "after a timeout: close open chats, viy down, power off this PC",
+        about = "after a timeout: close open chats, viy stop, power off this PC",
         after_help = "viy shutdown 90m          in 90 minutes (also 1h30m, 45s, 2h; a bare number is minutes)\n\
                       viy shutdown 23:30        at the next 23:30\n\
                       viy shutdown --status     what is scheduled\n\
                       viy shutdown --cancel     cancel it\n\
-                      Open chats are saved and closed, then viy down runs; the PC powers off\n\
-                      only once viy down has confirmed no pod is running. Anything that can't\n\
+                      Open chats are saved and closed, then viy stop runs; the PC powers off\n\
+                      only once no pod of ours is left running. Anything that can't\n\
                       happen is flagged now and, with a desktop notification, when it fires."
     )]
     Shutdown(ShutdownArgs),
@@ -310,7 +310,7 @@ pub struct BootsArgs {
 pub struct ShutdownArgs {
     #[arg(help = "duration (90m, 1h30m) or clock time (23:30)")]
     pub when: Option<String>,
-    #[arg(long, help = "close chats and viy down, but leave this PC on")]
+    #[arg(long, help = "close chats and viy stop, but leave this PC on")]
     pub no_poweroff: bool,
     #[arg(
         short,

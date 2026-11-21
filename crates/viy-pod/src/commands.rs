@@ -351,7 +351,19 @@ async fn up_until(
                 format!("Resuming stopped pod {pod_id} (named '{name}')..."),
             );
             match rp.start_pod(&pod_id).await {
-                Ok(()) => timeline.mark("resume requested", [("pod_id", json!(pod_id))]),
+                Ok(()) => {
+                    timeline.mark("resume requested", [("pod_id", json!(pod_id))]);
+                    // A new run: reap counts its idle time and cap from now.
+                    if let Err(error) = idle::forget(env.paths) {
+                        say(
+                            report,
+                            Tone::Warn,
+                            format!(
+                                "Could not reset viy reap's count for the resumed pod: {error}"
+                            ),
+                        );
+                    }
+                }
                 Err(error) if regions::is_capacity_error(&error) => {
                     retire_stopped(env, cfg, &rp, &existing, &error, report).await?;
                     timeline.mark("resume refused", [("pod_id", json!(pod_id))]);
@@ -982,6 +994,43 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
 
 /// `viy stop`: stops the pod, which ends GPU billing and can be resumed.
 pub async fn stop(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result<(), CommandError> {
+    stop_pod(env, cfg, false, report).await
+}
+
+/// `viy stop` for `viy reap` and `viy shutdown`: RunPod out of reach
+/// fails, so they try again and flag it rather than take it for a stopped
+/// pod.
+pub async fn stop_confirmed(
+    env: &Env<'_>,
+    cfg: &Config,
+    report: Reporter<'_>,
+) -> Result<(), CommandError> {
+    stop_pod(env, cfg, true, report).await
+}
+
+/// Pods of ours RunPod lists as neither stopped nor terminated: after the
+/// shutdown's stop there should be none, or `down` ends them.
+pub async fn running_pods(env: &Env<'_>, cfg: &Config) -> Result<Vec<String>, CommandError> {
+    let rp = connect(env, cfg)?;
+    let ids: HashSet<String> = state::load(env.paths)?
+        .pod_id()
+        .map(str::to_string)
+        .into_iter()
+        .collect();
+    Ok(our_pods(&rp, cfg, &ids)
+        .await?
+        .iter()
+        .filter(|p| text(p, "desiredStatus") != Some("EXITED"))
+        .filter_map(|p| text(p, "id").map(str::to_string))
+        .collect())
+}
+
+async fn stop_pod(
+    env: &Env<'_>,
+    cfg: &Config,
+    confirmed: bool,
+    report: Reporter<'_>,
+) -> Result<(), CommandError> {
     let _lock = PodLock::exclusive(env.paths, "stop")?;
     let rp = connect(env, cfg)?;
     let pod = match resolve(&rp, env, cfg, report).await {
@@ -993,7 +1042,11 @@ pub async fn stop(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result<(
                 "Could not reach RunPod; nothing was stopped.",
             );
             say(report, Tone::Dim, error.to_string());
-            return Ok(());
+            return if confirmed {
+                Err(CommandError::Failed)
+            } else {
+                Ok(())
+            };
         }
         Err(error) => return Err(error.into()),
     };
@@ -1014,7 +1067,8 @@ pub async fn stop(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result<(
     say(
         report,
         Tone::Dim,
-        "Note: a stopped pod still incurs disk charges and may lose its GPU slot.",
+        "Note: a stopped pod costs nothing but its network volume; if its GPU is taken meanwhile, \
+         viy up makes a new pod.",
     );
     Ok(())
 }

@@ -253,6 +253,10 @@ ACTIVITY_METRICS = ("vllm:prompt_tokens_total", "vllm:generation_tokens_total")
 WATCHDOG_POLL_S = 30
 GRAPHQL = "https://api.runpod.io/graphql"
 REST = "https://rest.runpod.io/v1"
+# On the container disk: a restarted container still has it, while a pod
+# started again after a stop runs in a new container without it (RunPod
+# removes the container on stop, viy kb f173).
+CONTAINER_MARK = Path("/var/tmp/rpctl-watchdog-container")
 
 
 def token_count(metrics_text):
@@ -274,14 +278,18 @@ class IdleClock:
     """Decides when the pod has been idle for ttl_s, or alive for max_s.
 
     Wall-clock times are persisted per pod id on the network volume, so a
-    container that crash-loops (RunPod restarts it, and the new container
-    starts a new watchdog) carries on the same countdown instead of
-    restarting it forever."""
+    container that crash-loops (RunPod restarts it, and the restarted
+    container starts a new watchdog) carries on the same countdown instead
+    of restarting it forever. A new container (`fresh`: a pod started again
+    after a stop) starts a new countdown, or the clock saved before the stop
+    would shut the resumed pod down at once."""
 
-    def __init__(self, path, pod_id, ttl_s, max_s, now):
+    def __init__(self, path, pod_id, ttl_s, max_s, now, fresh=False):
         self.path, self.pod_id, self.ttl_s, self.max_s = path, pod_id, ttl_s, max_s
         self.last_tokens = None
         try:
+            if fresh:
+                raise ValueError("a new container")
             saved = json.loads(path.read_text())
             if saved["pod_id"] != pod_id:
                 raise ValueError("another pod")
@@ -359,19 +367,13 @@ def can_manage(pod_id, key):
     return ok, "ok" if ok else f"REST {detail}, GraphQL {gql_detail}"
 
 
-def terminate_self(pod_id, key):
-    """Terminate this pod, the same as `rp down`; if RunPod refuses that, stop
-    it, which ends GPU billing too (rp reap terminates it later). A restricted
-    key may be allowed on only one of the two APIs, so both are tried."""
+def stop_self(pod_id, key):
+    """Stop this pod, the same as `rp stop`: GPU billing ends, the container
+    disk is not charged while stopped (viy kb f172), and the next up resumes
+    it, or replaces it if its host's GPU has been taken. If RunPod refuses
+    the stop, terminate it, which ends billing too. A restricted key may be
+    allowed on only one of the two APIs, so both are tried."""
     tried = []
-    for label, method, url, query in (
-            ("REST terminate", "DELETE", f"{REST}/pods/{pod_id}", None),
-            ("GraphQL terminate", "POST", GRAPHQL,
-             'mutation { podTerminate(input: {podId: "%s"}) }' % pod_id)):
-        ok, detail = runpod_call(method, url, key, query)
-        if ok:
-            return "terminated"
-        tried.append(f"{label}: {detail}")
     for label, method, url, query in (
             ("REST stop", "POST", f"{REST}/pods/{pod_id}/stop", None),
             ("GraphQL stop", "POST", GRAPHQL,
@@ -380,7 +382,29 @@ def terminate_self(pod_id, key):
         if ok:
             return "stopped"
         tried.append(f"{label}: {detail}")
+    for label, method, url, query in (
+            ("REST terminate", "DELETE", f"{REST}/pods/{pod_id}", None),
+            ("GraphQL terminate", "POST", GRAPHQL,
+             'mutation { podTerminate(input: {podId: "%s"}) }' % pod_id)):
+        ok, detail = runpod_call(method, url, key, query)
+        if ok:
+            return "terminated"
+        tried.append(f"{label}: {detail}")
     raise RuntimeError("; ".join(tried))
+
+
+def new_container(mark):
+    """True the first time this is asked in a container: `mark` lives on
+    the container disk, which a restart keeps and a stop removes."""
+    if mark.exists():
+        return False
+    try:
+        mark.touch()
+    except OSError:
+        # Unmarked, a crash loop would restart the countdown forever: keep
+        # the saved one, at worst stopping a resumed pod at once.
+        return False
+    return True
 
 
 def watchdog(now=time.time, sleep=time.sleep):
@@ -401,7 +425,7 @@ def watchdog(now=time.time, sleep=time.sleep):
         phase("WATCHDOG CANNOT STOP THIS POD: no RunPod key (set RUNPOD_WATCHDOG_API_KEY)")
         return
     clock = IdleClock(Path(os.environ["RPCTL_CACHE_DIR"]) / f"watchdog-{pod_id}.json",
-                      pod_id, ttl_s, max_s, now())
+                      pod_id, ttl_s, max_s, now(), fresh=new_container(CONTAINER_MARK))
     can_stop, detail = can_manage(pod_id, key)
     if injected and key != injected:
         # Diagnostic only: if RunPod's own key works, no dedicated key is needed.
@@ -430,7 +454,7 @@ def watchdog(now=time.time, sleep=time.sleep):
         elif reason:
             phase(f"watchdog: {reason}; shutting the pod down")
             try:
-                phase(f"watchdog: pod {terminate_self(pod_id, key)}")
+                phase(f"watchdog: pod {stop_self(pod_id, key)}")
                 return
             except RuntimeError as error:
                 phase(f"WATCHDOG FAILED TO STOP THIS POD ({error}); retrying")

@@ -111,10 +111,10 @@ const HELP: &str = "  /help              show this
   /boots [list|show] [boot] [-n N]  stage timings of recent boots
   /backup [--samples N]  primary and backup region, A100 stock per region
   /volume [list|create|delete] [id]  manage the weights network volume
-  /reap [--quiet]    viy down if nothing streamed for IDLE_TTL_MIN +
+  /reap [--quiet]    viy stop if nothing streamed for IDLE_TTL_MIN +
                      REAP_GRACE_MIN
   /shutdown [when] [--status|--cancel] [--no-poweroff]  close open chats,
-                     viy down, power off this PC
+                     viy stop, power off this PC
 
   /redraw            draw the screen again (Ctrl-L)
   /exit              quit  (the pod keeps running - use viy stop)

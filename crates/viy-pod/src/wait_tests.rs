@@ -105,6 +105,8 @@ fn as_viy(text: &str) -> String {
     text.replace("rp logs", "viy logs")
         .replace("rp reap", "viy reap")
         .replace("rp down", "viy down")
+        // rp's notice predates the watchdog's stop (kb d177).
+        .replace("the pod terminates itself", "the pod stops itself")
 }
 
 /// pod._redact_log, _startup_progress and _report_watchdog, case by case.
@@ -938,8 +940,8 @@ async fn a_boot_is_reported_recorded_and_its_logs_collected() {
         notices[1],
         (
             Tone::Dim,
-            "Idle watchdog armed: the pod terminates itself after 60 min without tokens, or \
-             after 8 h."
+            "Idle watchdog armed: the pod stops itself after 60 min without tokens, or after \
+             8 h."
                 .into()
         )
     );

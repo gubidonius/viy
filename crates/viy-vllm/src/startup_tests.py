@@ -3,7 +3,8 @@
 tests do too; the Rust test boot_tests.rs::startup_py_passes_its_tests runs
 this file with python3 under cargo test.
 
-Ported from rpctl a51d1ca: tests/test_boot_budget.py, tests/test_startup.py
+Ported from rpctl a51d1ca (the watchdog's stop first and new-container clock
+from 559507d): tests/test_boot_budget.py, tests/test_startup.py
 and tests/test_idle.py, the tests that touch startup.py alone; the ones that
 also build the boot script or the pod body are Rust tests in boot_tests.rs.
 Only the import differs. The hash in test_foreground_cache_code_is_unchanged
@@ -16,6 +17,7 @@ import hashlib
 import importlib.util
 import inspect
 import io
+import json
 from pathlib import Path
 import socket
 import subprocess
@@ -270,36 +272,62 @@ class IdleClockTests(unittest.TestCase):
         other = self.clock(5000, pod="p2")
         self.assertEqual(other.started, 5000)
 
+    def test_a_new_container_starts_a_new_countdown(self):
+        # Stopped after an idle hour, started again the next day: the old
+        # clock would shut the resumed pod down at its first tick.
+        c = self.clock(0)
+        c.tick(30, 100)
+        self.assertIn("idle", c.tick(HOUR, 100))
+        resumed = startup.IdleClock(self.path, "p1", ttl_s=HOUR, max_s=8 * HOUR,
+                                    now=86400, fresh=True)
+        self.assertEqual((resumed.started, resumed.last_activity), (86400, 86400))
+        self.assertIsNone(resumed.tick(86430, 0))
+        self.assertIn("idle", resumed.tick(86400 + HOUR, 0))
 
-class TerminateTests(unittest.TestCase):
-    def test_rest_terminate_first(self):
+
+class NewContainerTests(unittest.TestCase):
+    def test_true_once_per_container(self):
+        with tempfile.TemporaryDirectory() as d:
+            mark = Path(d) / "mark"
+            self.assertTrue(startup.new_container(mark))
+            self.assertFalse(startup.new_container(mark))   # a restart
+
+    def test_an_unwritable_mark_keeps_the_saved_countdown(self):
+        self.assertFalse(startup.new_container(Path("/nonexistent-dir/mark")))
+
+
+class StopTests(unittest.TestCase):
+    def test_rest_stop_first(self):
         with patch.object(startup, "runpod_call", return_value=(True, "ok")) as call:
-            self.assertEqual(startup.terminate_self("p1", "k"), "terminated")
-        self.assertEqual(call.call_args_list[0][0][:2], ("DELETE", startup.REST + "/pods/p1"))
+            self.assertEqual(startup.stop_self("p1", "k"), "stopped")
+        self.assertEqual(call.call_args_list[0][0][:2],
+                         ("POST", startup.REST + "/pods/p1/stop"))
 
-    def test_graphql_terminate_when_rest_is_refused(self):
+    def test_graphql_stop_when_rest_is_refused(self):
         with patch.object(startup, "runpod_call", side_effect=[(False, "HTTP 403"), (True, "ok")]) as call:
-            self.assertEqual(startup.terminate_self("p1", "k"), "terminated")
-        self.assertIn("podTerminate", call.call_args_list[1][0][3])
+            self.assertEqual(startup.stop_self("p1", "k"), "stopped")
+        self.assertIn("podStop", call.call_args_list[1][0][3])
 
-    def test_stop_when_terminate_is_refused(self):
+    def test_terminate_when_stop_is_refused(self):
         with patch.object(startup, "runpod_call",
-                          side_effect=[(False, "x"), (False, "x"), (True, "ok")]):
-            self.assertEqual(startup.terminate_self("p1", "k"), "stopped")
+                          side_effect=[(False, "x"), (False, "x"), (True, "ok")]) as call:
+            self.assertEqual(startup.stop_self("p1", "k"), "terminated")
+        self.assertEqual(call.call_args_list[2][0][:2], ("DELETE", startup.REST + "/pods/p1"))
 
     def test_raises_when_everything_is_refused(self):
         with patch.object(startup, "runpod_call", return_value=(False, "HTTP 403")):
             with self.assertRaises(RuntimeError) as caught:
-                startup.terminate_self("p1", "k")
+                startup.stop_self("p1", "k")
         self.assertEqual(str(caught.exception).count("HTTP 403"), 4)
 
     def test_dedicated_key_wins_over_the_injected_one(self):
         seen = []
         with tempfile.TemporaryDirectory() as d, \
+                patch.object(startup, "CONTAINER_MARK", Path(d) / "mark"), \
                 patch.object(startup, "can_manage",
                              side_effect=lambda pod, key: seen.append(key) or (True, "ok")), \
                 patch.object(startup.urllib.request, "urlopen", side_effect=OSError), \
-                patch.object(startup, "terminate_self", return_value="terminated"), \
+                patch.object(startup, "stop_self", return_value="stopped"), \
                 patch.dict("os.environ", {"RUNPOD_POD_ID": "p1", "RUNPOD_API_KEY": "injected",
                                           "RPCTL_WATCHDOG_KEY": "mine",
                                           "RPCTL_IDLE_TTL_S": "60", "RPCTL_CACHE_DIR": d,
@@ -322,16 +350,17 @@ class WatchdogLoopTests(unittest.TestCase):
 
         calls = []
 
-        def terminate(pod_id, key):
+        def stop(pod_id, key):
             calls.append(clock[0])
             if len(calls) == 1:
                 raise RuntimeError("transient")
-            return "terminated"
+            return "stopped"
 
         with tempfile.TemporaryDirectory() as d, \
+                patch.object(startup, "CONTAINER_MARK", Path(d) / "mark"), \
                 patch.object(startup.urllib.request, "urlopen", urlopen), \
                 patch.object(startup, "can_manage", return_value=(True, "ok")), \
-                patch.object(startup, "terminate_self", terminate), \
+                patch.object(startup, "stop_self", stop), \
                 patch.dict("os.environ", {"RUNPOD_POD_ID": "p1", "RUNPOD_API_KEY": "k",
                                           "RPCTL_IDLE_TTL_S": "3600", "RPCTL_MAX_POD_S": "28800",
                                           "RPCTL_CACHE_DIR": d, "RPCTL_PORT": "8000"}):
@@ -340,12 +369,40 @@ class WatchdogLoopTests(unittest.TestCase):
         self.assertGreaterEqual(calls[0], HOUR)
         self.assertLess(calls[0], HOUR + 2 * startup.WATCHDOG_POLL_S)
 
+    def test_a_resumed_pod_is_not_stopped_by_the_clock_it_was_stopped_with(self):
+        # The pod stopped itself at 3600 and is started again at 86400 in a
+        # new container (no mark): it gets a new hour. A restart of the
+        # same container (mark there) carries on the old, expired clock.
+        for marked, stops_at in ((False, 86400 + HOUR), (True, 86400)):
+            with self.subTest(restarted_container=marked), \
+                    tempfile.TemporaryDirectory() as d, \
+                    patch.object(startup, "CONTAINER_MARK", Path(d) / "mark"), \
+                    patch.object(startup.urllib.request, "urlopen",
+                                 lambda request, timeout: io.BytesIO((METRICS % ("5", "5")).encode())), \
+                    patch.object(startup, "can_manage", return_value=(True, "ok")), \
+                    patch.dict("os.environ", {"RUNPOD_POD_ID": "p1", "RUNPOD_API_KEY": "k",
+                                              "RPCTL_IDLE_TTL_S": "3600", "RPCTL_MAX_POD_S": "28800",
+                                              "RPCTL_CACHE_DIR": d, "RPCTL_PORT": "8000"}):
+                Path(d, "watchdog-p1.json").write_text(json.dumps(
+                    {"pod_id": "p1", "started": 0, "last_activity": 0, "checked": HOUR}))
+                if marked:
+                    (Path(d) / "mark").touch()
+                clock = [86400.0]
+                stopped = []
+                with patch.object(startup, "stop_self",
+                                  lambda pod, key: stopped.append(clock[0]) or "stopped"):
+                    startup.watchdog(now=lambda: clock[0],
+                                     sleep=lambda s: clock.__setitem__(0, clock[0] + s))
+                self.assertGreaterEqual(stopped[0], stops_at)
+                self.assertLess(stopped[0], stops_at + 2 * startup.WATCHDOG_POLL_S)
+
     def test_reports_a_key_runpod_refuses(self):
         with tempfile.TemporaryDirectory() as d, \
+                patch.object(startup, "CONTAINER_MARK", Path(d) / "mark"), \
                 patch.object(startup, "can_manage", return_value=(False, "HTTP 403")), \
                 patch.object(startup, "phase") as phase, \
                 patch.object(startup.urllib.request, "urlopen", side_effect=OSError), \
-                patch.object(startup, "terminate_self", return_value="terminated"), \
+                patch.object(startup, "stop_self", return_value="stopped"), \
                 patch.dict("os.environ", {"RUNPOD_POD_ID": "p1", "RUNPOD_API_KEY": "k",
                                           "RPCTL_IDLE_TTL_S": "60", "RPCTL_CACHE_DIR": d,
                                           "RPCTL_PORT": "8000"}):

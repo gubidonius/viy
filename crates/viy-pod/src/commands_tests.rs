@@ -352,8 +352,15 @@ async fn a_second_ctrl_c_ends_the_record_of_an_interrupted_boot() {
 #[tokio::test(start_paused = true)]
 async fn up_resumes_a_stopped_pod_and_records_its_boot() {
     let mut home = Home::new(tracked(false), runpod("EXITED"));
+    // What reap saw of the pod's last run, 9 h ago: forgotten on resume.
+    std::fs::write(
+        home.paths.reap_state_file(),
+        json!({"pod_id": "pod111", "first_seen": 1_784_161_800.0}).to_string(),
+    )
+    .unwrap();
     let told = Told::default();
     run_up(&mut home, &told).await.unwrap();
+    assert!(!home.paths.reap_state_file().exists());
     assert_eq!(
         home.sent(),
         [
@@ -1073,7 +1080,8 @@ async fn stop_stops_the_pod() {
         told.texts(),
         [
             "Stopped pod111. GPU billing ends; the pod can be resumed with viy up.",
-            "Note: a stopped pod still incurs disk charges and may lose its GPU slot.",
+            "Note: a stopped pod costs nothing but its network volume; if its GPU is taken \
+             meanwhile, viy up makes a new pod.",
         ]
     );
 }

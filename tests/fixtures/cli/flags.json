@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "d3a72e00647c8692987b6c3582085b971ccd16a0",
+ "rpctl_commit": "559507dee2d298db0016e3abf637d3e8dab1cf3e",
  "generator": "tools/fixtures.py cli/flags",
  "about": "rpctl __main__.build_parser(): the program (name \"\") and each subcommand in order, with its help, description and arguments (option strings, nargs, whether a store_true flag, const, default, type, choices, required, hidden, help; values as strings). Help and usage layout are argparse's and not recorded (flags.md F31)",
  "cases": [

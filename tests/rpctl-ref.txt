@@ -1,6 +1,6 @@
 # The rpctl commit viy ports from. Change it only together with regenerated
 # fixtures (docs/implementation-plan.md 3.1); tools/refsnap.sh extracts it.
-commit: d3a72e00647c8692987b6c3582085b971ccd16a0
+commit: 559507dee2d298db0016e3abf637d3e8dab1cf3e
 branch: leak-protection
-pinned: 2026-08-05
-subject: rp up --backup: boot on the backup volume, skipping DATA_CENTER_ID (kb d035)
+pinned: 2026-08-08
+subject: startup.py: the idle watchdog stops the pod, terminating only if the stop is refused (viy kb d177)

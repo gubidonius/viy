@@ -219,15 +219,17 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // Local end of the forward. Empty = the same number as VLLM_PORT.
     ("TUNNEL_LOCAL_PORT", ""),
     // --- leak protection ----------------------------------------------------
-    // The pod terminates itself after IDLE_TTL_MIN minutes in which vLLM took
-    // in and produced no tokens (streaming counts as use; an open, idle chat
+    // The pod stops itself after IDLE_TTL_MIN minutes in which vLLM took in
+    // and produced no tokens (streaming counts as use; an open, idle chat
     // does not), and after MAX_POD_HOURS whatever happens. Fixed at pod
-    // creation. 0 disables either. `rp reap` (run by a systemd timer, see
-    // `rp reap --install`) is the laptop-side backup: it runs rp down once
-    // this machine has streamed nothing for IDLE_TTL_MIN + REAP_GRACE_MIN.
+    // creation. 0 disables either. A stopped pod costs nothing but its
+    // volume; `viy up` resumes it, or makes a new one if its GPU is taken.
+    // `viy reap` (run by a systemd timer, see `viy reap --install`) is the
+    // laptop-side backup: it runs viy stop once this machine has streamed
+    // nothing for IDLE_TTL_MIN + REAP_GRACE_MIN.
     //
     // For that the pod uses the pod-scoped key RunPod injects into every pod
-    // (RUNPOD_API_KEY inside the pod): it can terminate its own pod and nothing
+    // (RUNPOD_API_KEY inside the pod): it can act on its own pod and nothing
     // else, verified 2026-06-26. RUNPOD_WATCHDOG_API_KEY overrides it with a
     // key of your own; leave it empty unless the injected key stops working.
     // It is passed in the pod env only, never written to the volume or logs.

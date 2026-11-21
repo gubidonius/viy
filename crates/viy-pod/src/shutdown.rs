@@ -1,6 +1,7 @@
-//! `viy shutdown`: after a timeout, close every open chat, run `viy down`,
+//! `viy shutdown`: after a timeout, close every open chat, run `viy stop`
+//! (`viy down` while another up, stop or down holds the pod lock, kb d177),
 //! and once that has finished, power off this machine. rpctl's
-//! `shutdown.py`.
+//! `shutdown.py`, which runs `rp down`.
 //!
 //! The countdown runs in a detached process (`viy shutdown --run-at`, which
 //! survives the terminal closing), so a chat can go on in the same
@@ -8,8 +9,8 @@
 //! shutdown is scheduled ([`schedule`]), and again, with a desktop
 //! notification, when it fires ([`fire`]).
 //!
-//! The machine powers off even if `viy down` fails: a pod left behind is
-//! ended by its own idle watchdog, which needs nothing from this machine.
+//! The machine powers off even if `viy stop` fails: a pod left behind is
+//! stopped by its own idle watchdog, which needs nothing from this machine.
 //!
 //! One shutdown per machine: `shutdown.json` and `shutdown.log` are rp's
 //! (kb d049), so either tool's `--status` and `--cancel` see the other's,
@@ -47,6 +48,7 @@ use crate::commands::CommandError;
 use crate::commands::Env;
 use crate::compile_regex;
 use crate::local;
+use crate::lock::PodLock;
 use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
@@ -60,7 +62,7 @@ pub const CHAT_GRACE: Duration = Duration::from_secs(20);
 /// Slept past the deadline: warn, then fire this many seconds later.
 const WOKE_LATE_GRACE_S: f64 = 60.0;
 
-/// How long [`fire`] retries `viy down`.
+/// How long [`fire`] retries `viy stop`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownBudget {
     /// No retry starts that could not finish within this.
@@ -260,16 +262,16 @@ pub async fn poweroff_problems(host: &Host<'_>) -> Vec<String> {
         .collect()
 }
 
-/// Reasons `viy down` would not take the pod down.
+/// Reasons `viy stop` would not stop the pod.
 pub fn down_problems(cfg: &Config) -> Vec<String> {
     match Backend::resolve(cfg) {
         Err(message) => vec![message],
         Ok(backend) if !backend.manages_server() => vec![format!(
-            "viy down does nothing for the '{}' backend; that step is skipped",
+            "viy stop does nothing for the '{}' backend; that step is skipped",
             backend.name()
         )],
         Ok(Backend::Runpod) if cfg.get("RUNPOD_API_KEY").unwrap_or("").is_empty() => vec![
-            "RUNPOD_API_KEY is not set, so viy down can't reach RunPod; the pod would be left \
+            "RUNPOD_API_KEY is not set, so viy stop can't reach RunPod; the pod would be left \
              to its own idle watchdog"
                 .into(),
         ],
@@ -483,7 +485,7 @@ async fn flag(host: &Host<'_>, log: &Log<'_>, msg: &str) {
     notify(host, msg, true).await;
 }
 
-/// How one `viy down` attempt went well.
+/// How one `viy stop` attempt went well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Down {
     /// It confirmed no pod is running.
@@ -492,7 +494,7 @@ pub enum Down {
     Nothing(&'static str),
 }
 
-/// `viy down` for the backend `cfg` names, with what it says written to
+/// `viy stop` (or `viy down`) for the backend `cfg` names, with what it says written to
 /// the log; why it failed otherwise.
 pub async fn take_down(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result<Down, String> {
     match Backend::resolve(cfg)? {
@@ -514,11 +516,38 @@ async fn backend_down(
 ) -> Result<(), CommandError> {
     match backend {
         Backend::Local => local::down(env, report).await,
-        _ => commands::down(env, cfg, false, report).await,
+        // An up still holding the lock may have a create in flight, which
+        // only `down` kills and sweeps for.
+        _ if !PodLock::is_free(env.paths)? => {
+            say(
+                report,
+                Tone::Warn,
+                "An up, stop or down holds the pod lock: running viy down instead of viy stop.",
+            );
+            commands::down(env, cfg, false, report).await
+        }
+        _ => {
+            commands::stop_confirmed(env, cfg, report).await?;
+            // The poweroff waits for no pod of ours running: one the stop
+            // did not cover (an old up's, say) is taken down.
+            let left = commands::running_pods(env, cfg).await?;
+            if left.is_empty() {
+                return Ok(());
+            }
+            say(
+                report,
+                Tone::Warn,
+                format!(
+                    "Still running after the stop: {}; running viy down.",
+                    left.join(", ")
+                ),
+            );
+            commands::down(env, cfg, false, report).await
+        }
     }
 }
 
-/// `viy down`, retried while another full attempt fits in the budget.
+/// `viy stop`, retried while another full attempt fits in the budget.
 /// True once it reports success, or the backend has nothing to take down.
 async fn run_down<D>(log: &Log<'_>, cfg: &Config, budget: DownBudget, down: &mut D) -> bool
 where
@@ -526,14 +555,14 @@ where
 {
     let start = Instant::now();
     for attempt in 1.. {
-        log.line(&format!("viy down (attempt {attempt})"));
+        log.line(&format!("viy stop (attempt {attempt})"));
         match down(cfg).await {
             Ok(Down::Done) => return true,
             Ok(Down::Nothing(name)) => {
                 log.line(&format!("the '{name}' backend has nothing to take down"));
                 return true;
             }
-            Err(why) => log.line(&format!("viy down failed: {why}")),
+            Err(why) => log.line(&format!("viy stop failed: {why}")),
         }
         if start.elapsed() + budget.retry + budget.worst > budget.total {
             return false;
@@ -590,14 +619,14 @@ where
 
     let down_ok = run_down(log, cfg, budget, &mut down).await;
     if down_ok {
-        log.line("viy down finished");
+        log.line("viy stop finished");
     } else if poweroff {
-        let msg = "viy down could not confirm that no pod is running; powering off anyway. The \
-                   pod's idle watchdog ends a leftover pod; check https://console.runpod.io/pods \
+        let msg = "viy stop could not confirm that no pod is running; powering off anyway. The \
+                   pod's idle watchdog stops a leftover pod; check https://console.runpod.io/pods \
                    when you are back";
         flag(host, log, msg).await;
     } else {
-        let msg = "viy down could not confirm that no pod is running. Run viy down yourself, or \
+        let msg = "viy stop could not confirm that no pod is running. Run viy stop yourself, or \
                    check https://console.runpod.io/pods";
         flag(host, log, msg).await;
     }
@@ -615,7 +644,7 @@ where
         .timeout(Duration::from_secs(60));
     match host.exec.run(command).await {
         Err(error) => {
-            let msg = format!("the pod is down, but the poweroff failed: {error}");
+            let msg = format!("the pod is stopped, but the poweroff failed: {error}");
             flag(host, log, &msg).await;
             1
         }
@@ -625,7 +654,7 @@ where
                 "" => format!("systemctl exited {}", viy_exec::exit_text(out.status)),
                 text => text.to_string(),
             };
-            let msg = format!("the pod is down, but the poweroff was refused: {why}");
+            let msg = format!("the pod is stopped, but the poweroff was refused: {why}");
             flag(host, log, &msg).await;
             1
         }
@@ -664,8 +693,8 @@ where
             if now - last_check > WOKE_LATE_GRACE_S + 30.0 && now - deadline > 30.0 {
                 log.line("woke up past the deadline");
                 let msg = format!(
-                    "Woke up past the deadline: chats close, the pod goes down and this PC \
-                     powers off in {WOKE_LATE_GRACE_S:.0}s. Cancel: viy shutdown --cancel"
+                    "Woke up past the deadline: chats close, the pod stops and this PC powers \
+                     off in {WOKE_LATE_GRACE_S:.0}s. Cancel: viy shutdown --cancel"
                 );
                 notify(host, &msg, true).await;
                 deadline = now + WOKE_LATE_GRACE_S;
@@ -680,7 +709,7 @@ where
                 let action = if poweroff {
                     "this PC powers off"
                 } else {
-                    "the pod goes down"
+                    "the pod stops"
                 };
                 let msg = format!(
                     "In {}: open chats close and {action}. Cancel: viy shutdown --cancel",
@@ -823,10 +852,12 @@ pub fn status(host: &Host<'_>, report: Reporter<'_>) {
         return;
     };
     let tool = process::tool_of(&process::cmdline(scheduled.pid)).map_or("viy", |t| t.name());
+    // rp's runner still takes the pod down; viy's stops it (kb d177).
+    let verb = if tool == "rp" { "down" } else { "stop" };
     let what = if scheduled.poweroff {
-        format!("chats close, {tool} down, then poweroff")
+        format!("chats close, {tool} {verb}, then poweroff")
     } else {
-        format!("chats close, {tool} down (no poweroff)")
+        format!("chats close, {tool} {verb} (no poweroff)")
     };
     let at = local(scheduled.deadline)
         .map_or_else(String::new, |at| at.format("%a %H:%M:%S").to_string());
@@ -887,9 +918,9 @@ pub async fn schedule(
         );
     }
     let steps = if poweroff {
-        "close open chats, viy down, power off this PC"
+        "close open chats, viy stop, power off this PC"
     } else {
-        "close open chats, viy down"
+        "close open chats, viy stop"
     };
     let chats = host.chats.find();
     say(

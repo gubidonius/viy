@@ -220,5 +220,5 @@ fn strata_pod_passes_its_tests() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("Ran 39 tests"), "{stderr}");
+    assert!(stderr.contains("Ran 43 tests"), "{stderr}");
 }

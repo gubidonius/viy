@@ -63,7 +63,7 @@ fn waits_for_ttl_plus_grace() {
     );
     assert_eq!(
         verdict(900.0 + HOUR + 15.0 * 60.0, Some(900.0), &fresh, "RUNNING"),
-        Some(Verdict::Down)
+        Some(Verdict::Stop)
     );
 }
 
@@ -89,7 +89,7 @@ fn no_activity_file_counts_from_first_sighting() {
             &seen(600.0, None),
             "RUNNING"
         ),
-        Some(Verdict::Down)
+        Some(Verdict::Stop)
     );
 }
 
@@ -98,12 +98,11 @@ fn hard_cap_and_stopped_pods() {
     let now = 8.0 * HOUR + 15.0 * 60.0;
     assert_eq!(
         verdict(now, Some(now - 60.0), &seen(0.0, None), "RUNNING"),
-        Some(Verdict::Down)
+        Some(Verdict::Stop)
     );
-    assert_eq!(
-        verdict(10.0, Some(5.0), &seen(0.0, None), "EXITED"),
-        Some(Verdict::Down)
-    );
+    // A stopped pod is left alone: only its volume bills (kb d177).
+    assert_eq!(verdict(10.0, Some(5.0), &seen(0.0, None), "EXITED"), None);
+    assert_eq!(verdict(now, Some(0.0), &seen(0.0, None), "EXITED"), None);
 }
 
 #[test]
@@ -119,10 +118,7 @@ fn the_reasons_say_how_long() {
         reason(900.0 + HOUR + 15.0 * 60.0, "RUNNING"),
         "nothing streamed from this machine for 75 min"
     );
-    assert_eq!(
-        reason(1000.0, "EXITED"),
-        "the pod was stopped by its watchdog; terminating it"
-    );
+    assert_eq!(reason(1000.0, "EXITED"), "the pod is stopped");
     let off = Limits { ttl: 0.0, ..LIMITS };
     assert_eq!(
         decide(1000.0, Some("RUNNING"), None, &fresh, off).1,
@@ -137,7 +133,7 @@ fn the_reasons_say_how_long() {
     );
     assert_eq!(
         capped,
-        (Some(Verdict::Down), "pod running for 8.2 h".into())
+        (Some(Verdict::Stop), "pod running for 8.2 h".into())
     );
 }
 
@@ -319,11 +315,20 @@ impl Home {
 /// RunPod with `pod111` in `status` until it is deleted, and nothing else.
 fn runpod(status: &'static str) -> impl Fn(&viy_http::Request) -> Reply + Send + Sync + 'static {
     let deleted = Mutex::new(false);
+    let stopped = Mutex::new(false);
     move |r| {
         let gone = *deleted.lock().unwrap();
+        let status = if *stopped.lock().unwrap() {
+            "EXITED"
+        } else {
+            status
+        };
         let pod = json!({"id": "pod111", "name": "qwen-pod", "desiredStatus": status});
         if r.method == Method::DELETE {
             *deleted.lock().unwrap() = true;
+            Reply::answer(200, "{}")
+        } else if r.url.ends_with("/v1/pods/pod111/stop") {
+            *stopped.lock().unwrap() = true;
             Reply::answer(200, "{}")
         } else if r.url.ends_with("/v1/pods/pod111") {
             if gone {
@@ -395,7 +400,7 @@ async fn an_idle_pod_is_warned_about_once() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_forgotten_pod_is_taken_down() {
+async fn a_forgotten_pod_is_stopped() {
     let home = Home::new(runpod("RUNNING"));
     home.active(HOUR + 20.0 * 60.0);
     std::fs::write(
@@ -409,43 +414,82 @@ async fn a_forgotten_pod_is_taken_down() {
     assert_eq!(
         told.alerts(),
         [Alert {
-            title: "viy reap: shutting the pod down".into(),
+            title: "viy reap: stopping the pod".into(),
             body: reason.into(),
             urgent: true
         }]
     );
-    // Quiet: only what `viy down` says.
+    // Quiet: only what `viy stop` says.
     assert_eq!(
         told.texts(),
         [
-            "  terminated pod111 (was RUNNING)",
-            "Terminated pod111. No pod is running or starting; GPU and pod-disk billing has \
-             ended.",
-            "Model and startup caches stay on the network volume for the next viy up.",
+            "Stopped pod111. GPU billing ends; the pod can be resumed with viy up.",
+            "Note: a stopped pod costs nothing but its network volume; if its GPU is taken \
+             meanwhile, viy up makes a new pod.",
         ]
     );
+    let sent = home.sent();
     assert!(
-        home.sent()
-            .contains(&"DELETE https://rest.runpod.io/v1/pods/pod111".to_string())
+        sent.contains(&"POST https://rest.runpod.io/v1/pods/pod111/stop".to_string()),
+        "{sent:?}"
     );
+    assert!(!sent.iter().any(|r| r.starts_with("DELETE")), "{sent:?}");
     assert!(!home.paths.reap_state_file().exists());
-    assert!(!home.paths.pod_state_file().exists());
 }
 
+/// RunPod drops out between reap's look and its stop: the stop fails and
+/// reap.json stays, so the next run stops the pod from the same count
+/// instead of granting it another idle hour.
 #[tokio::test(start_paused = true)]
-async fn a_pod_its_watchdog_stopped_is_terminated() {
+async fn a_stop_runpod_never_got_keeps_the_count() {
+    let asked = Mutex::new(0);
+    let home = Home::new(move |r: &viy_http::Request| {
+        let mut n = asked.lock().unwrap();
+        *n += 1;
+        if *n == 1 && r.url.ends_with("/v1/pods/pod111") {
+            Reply::answer(
+                200,
+                json!({"id": "pod111", "name": "qwen-pod", "desiredStatus": "RUNNING"}).to_string(),
+            )
+        } else {
+            Reply::answer(401, "bad key")
+        }
+    });
+    home.active(HOUR + 20.0 * 60.0);
+    let first_seen = NOW - 3.0 * HOUR;
+    std::fs::write(
+        home.paths.reap_state_file(),
+        json!({"pod_id": "pod111", "first_seen": first_seen}).to_string(),
+    )
+    .unwrap();
+    let (result, _) = home.reap(true).await;
+    assert!(matches!(result, Err(CommandError::Failed)), "{result:?}");
+    assert_eq!(
+        Seen::load(&home.paths, "pod111", NOW).first_seen,
+        first_seen
+    );
+}
+
+/// A stopped pod (by its watchdog, reap, `viy stop` or the shutdown) is
+/// left alone, and what reap saw of it forgotten: once resumed, its idle
+/// time and cap count from then (kb d177).
+#[tokio::test(start_paused = true)]
+async fn a_stopped_pod_is_left_alone() {
     let home = Home::new(runpod("EXITED"));
-    home.active(60.0);
+    home.active(3.0 * HOUR);
+    seen(NOW - 9.0 * HOUR, None).save(&home.paths).unwrap();
     let (result, told) = home.reap(false).await;
     result.unwrap();
-    assert_eq!(
-        told.texts()[0],
-        "the pod was stopped by its watchdog; terminating it"
-    );
+    assert_eq!(told.texts(), ["the pod is stopped"]);
+    assert!(told.alerts().is_empty());
+    let sent = home.sent();
     assert!(
-        home.sent()
-            .contains(&"DELETE https://rest.runpod.io/v1/pods/pod111".to_string())
+        !sent
+            .iter()
+            .any(|r| r.starts_with("DELETE") || r.ends_with("/stop")),
+        "{sent:?}"
     );
+    assert!(!home.paths.reap_state_file().exists());
 }
 
 #[tokio::test(start_paused = true)]
@@ -478,6 +522,104 @@ async fn runpod_out_of_reach_ends_the_check() {
         told.texts()
     );
     assert!(!home.paths.reap_state_file().exists());
+}
+
+// ------------------------------------------------- the shutdown's stop
+
+/// `viy shutdown` stops the pod (kb d177): one stop request, no delete.
+#[tokio::test(start_paused = true)]
+async fn the_shutdown_stops_the_pod() {
+    let home = Home::new(runpod("RUNNING"));
+    let told = Told::default();
+    let done = crate::shutdown::take_down(&home.env(), &home.cfg, &told.reporter()).await;
+    assert_eq!(done, Ok(crate::shutdown::Down::Done));
+    let sent = home.sent();
+    assert!(
+        sent.contains(&"POST https://rest.runpod.io/v1/pods/pod111/stop".to_string()),
+        "{sent:?}"
+    );
+    assert!(!sent.iter().any(|r| r.starts_with("DELETE")), "{sent:?}");
+    assert_eq!(
+        told.texts()[0],
+        "Stopped pod111. GPU billing ends; the pod can be resumed with viy up."
+    );
+}
+
+/// A pod of ours the stop did not cover (an old up's, still RUNNING): the
+/// shutdown runs `down`, which ends every pod of ours, before it reports no
+/// pod running.
+#[tokio::test(start_paused = true)]
+async fn the_shutdown_takes_down_a_pod_its_stop_missed() {
+    #[derive(Default)]
+    struct World {
+        stopped: bool,
+        gone: Vec<String>,
+    }
+    let world = Arc::new(Mutex::new(World::default()));
+    let w = Arc::clone(&world);
+    let home = Home::new(move |r: &viy_http::Request| {
+        let mut w = w.lock().unwrap();
+        let url = r.url.as_str();
+        let id = url.rsplit('/').next().unwrap_or_default().to_string();
+        let pod = |id: &str| {
+            let status = if id == "pod111" && w.stopped {
+                "EXITED"
+            } else {
+                "RUNNING"
+            };
+            json!({"id": id, "name": "qwen-pod", "desiredStatus": status})
+        };
+        if url.ends_with("/v1/pods/pod111/stop") {
+            w.stopped = true;
+            Reply::answer(200, "{}")
+        } else if r.method == Method::DELETE {
+            w.gone.push(id);
+            Reply::answer(200, "{}")
+        } else if url.ends_with("/v1/pods") {
+            let pods: Vec<Value> = ["pod111", "pod222"]
+                .into_iter()
+                .filter(|id| !w.gone.iter().any(|g| g == id))
+                .map(pod)
+                .collect();
+            Reply::answer(200, json!(pods).to_string())
+        } else if w.gone.contains(&id) {
+            Reply::answer(404, "{}")
+        } else {
+            Reply::answer(200, pod(&id).to_string())
+        }
+    });
+    let told = Told::default();
+    let done = crate::shutdown::take_down(&home.env(), &home.cfg, &told.reporter()).await;
+    assert_eq!(done, Ok(crate::shutdown::Down::Done));
+    assert!(
+        told.texts()
+            .contains(&"Still running after the stop: pod222; running viy down.".to_string()),
+        "{:?}",
+        told.texts()
+    );
+    assert!(
+        world.lock().unwrap().gone.contains(&"pod222".to_string()),
+        "{:?}",
+        home.sent()
+    );
+}
+
+/// RunPod out of reach is a failed stop for the shutdown, which retries it
+/// and flags it, where `viy stop` itself only warns.
+#[tokio::test(start_paused = true)]
+async fn the_shutdown_does_not_take_an_unreachable_runpod_for_a_stop() {
+    let home = Home::new(|_: &viy_http::Request| Reply::answer(401, "bad key"));
+    let told = Told::default();
+    let done = crate::shutdown::take_down(&home.env(), &home.cfg, &told.reporter()).await;
+    assert_eq!(done, Err("1".to_string()));
+    assert_eq!(
+        told.texts()[0],
+        "Could not reach RunPod; nothing was stopped."
+    );
+    let told = Told::default();
+    commands::stop(&home.env(), &home.cfg, &told.reporter())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -607,7 +749,7 @@ async fn install_writes_the_units_and_enables_the_timer() {
     let units = paths.systemd_user_dir();
     assert_eq!(
         std::fs::read_to_string(units.join("viy-reap.service")).unwrap(),
-        "[Unit]\nDescription=viy reap: terminate an idle RunPod pod (backup for the pod's own \
+        "[Unit]\nDescription=viy reap: stop an idle RunPod pod (backup for the pod's own \
          watchdog)\n\n[Service]\nType=oneshot\nExecStart=/home/u/.cargo/bin/viy reap --quiet\n"
     );
     assert_eq!(
@@ -759,7 +901,8 @@ async fn rps_timer_stays_when_systemctl_fails() {
 
 /// rpctl's `idle.decide` and `idle.limits` against viy's on generated
 /// cases (`cargo test -p viy-pod --features oracle`): the same verdict and
-/// reason for every one, so reap is never less strict than rp's.
+/// reason for every one, so reap is never less strict than rp's; viy's
+/// stop stands for rp's down, and a stopped pod is viy's own (kb d177).
 #[cfg(feature = "oracle")]
 mod oracle {
     use pretty_assertions::assert_eq;
@@ -842,8 +985,15 @@ mod oracle {
                 "idle.decide",
                 json!([now, "p1", desired, activity, seen, ttl, grace, max]),
             );
+            if desired == "EXITED" {
+                // viy leaves a stopped pod alone where rp terminates it
+                // (kb d177): it bills nothing but its volume.
+                assert_eq!(ours, (None, "the pod is stopped".to_string()));
+                continue;
+            }
+            // viy stops where rp terminates: both end GPU billing (d177).
             let verdict = match ours.0 {
-                Some(Verdict::Down) => json!("down"),
+                Some(Verdict::Stop) => json!("down"),
                 Some(Verdict::Warn) => json!("warn"),
                 None => Value::Null,
             };

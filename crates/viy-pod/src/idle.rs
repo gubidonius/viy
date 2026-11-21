@@ -1,12 +1,14 @@
 //! This machine's backup for the pod's own idle watchdog: rpctl's
 //! `idle.py`.
 //!
-//! The pod shuts itself down after IDLE_TTL_MIN without tokens flowing,
-//! which works while this machine sleeps. This covers the pod's watchdog
+//! The pod stops itself after IDLE_TTL_MIN without tokens flowing, which
+//! works while this machine sleeps. This covers the pod's watchdog
 //! failing: the chat records when it last streamed ([`touch`]), and
-//! [`reap`], run every 5 minutes by a systemd user timer, runs `viy down`
-//! once nothing has streamed for IDLE_TTL_MIN + REAP_GRACE_MIN. It sees
-//! only this machine's activity, which is why it waits longer than the pod.
+//! [`reap`], run every 5 minutes by a systemd user timer, runs `viy stop`
+//! once nothing has streamed for IDLE_TTL_MIN + REAP_GRACE_MIN, and leaves
+//! a stopped pod alone: it costs nothing but its volume, and `viy up`
+//! resumes or replaces it (kb d177, d176). It sees only this machine's
+//! activity, which is why it waits longer than the pod.
 //!
 //! Until cutover rp's `rpctl-reap.timer` reaps the shared pod, and reads
 //! the same `last_activity` and `reap.json` (kb d006); [`install`] refuses
@@ -154,8 +156,8 @@ impl Seen {
 pub enum Verdict {
     /// Tell the user the pod is about to shut itself down.
     Warn,
-    /// Terminate it.
-    Down,
+    /// Stop it.
+    Stop,
 }
 
 /// When the pod was last in use as far as this machine knows: its last
@@ -180,11 +182,8 @@ pub fn decide(
         max: cap,
     } = limits;
     if desired == Some("EXITED") {
-        // Stopped by the pod's watchdog (terminate was refused): finish the job.
-        return (
-            Some(Verdict::Down),
-            "the pod was stopped by its watchdog; terminating it".into(),
-        );
+        // Stopped already: nothing bills but the volume (kb d177).
+        return (None, "the pod is stopped".into());
     }
     if ttl == 0.0 {
         return (None, "IDLE_TTL_MIN=0".into());
@@ -193,7 +192,7 @@ pub fn decide(
     let idle = now - last;
     if idle >= ttl + grace {
         return (
-            Some(Verdict::Down),
+            Some(Verdict::Stop),
             format!(
                 "nothing streamed from this machine for {:.0} min",
                 idle / 60.0
@@ -202,7 +201,7 @@ pub fn decide(
     }
     if cap != 0.0 && now - seen.first_seen >= cap + grace {
         return (
-            Some(Verdict::Down),
+            Some(Verdict::Stop),
             format!("pod running for {:.1} h", (now - seen.first_seen) / 3600.0),
         );
     }
@@ -220,12 +219,12 @@ pub fn decide(
     (None, format!("idle {:.0} min", idle / 60.0))
 }
 
-/// `viy reap`: terminates our pod once this machine has streamed nothing
-/// for IDLE_TTL_MIN + REAP_GRACE_MIN, or it has run past MAX_POD_HOURS, or
-/// its watchdog could only stop it; warns ahead; deletes idle backup
-/// volumes. Never while an up, stop or down of either tool holds the pod
+/// `viy reap`: stops our pod once this machine has streamed nothing for
+/// IDLE_TTL_MIN + REAP_GRACE_MIN, or it has run past MAX_POD_HOURS; warns
+/// ahead; leaves a stopped pod alone, forgetting what it saw of it so a
+/// resumed pod is counted from then; deletes idle backup volumes. Never while an up, stop or down of either tool holds the pod
 /// lock: the next run looks again. `quiet` (the timer) says nothing but
-/// the desktop alerts and what `viy down` says.
+/// the desktop alerts and what `viy stop` says.
 pub async fn reap(
     env: &Env<'_>,
     cfg: &Config,
@@ -280,10 +279,19 @@ pub async fn reap(
         return Ok(());
     };
     regions::note_pod(env.paths, &pod, now)?;
+    let desired = pod.get("desiredStatus").and_then(Value::as_str);
+    if desired == Some("EXITED") {
+        // A resumed pod is a new run: its cap counts from when reap sees
+        // it running again. The forward points at nothing now.
+        forget(env.paths)?;
+        let mut said = |notice| report(Report::Notice(notice));
+        tunnel::stop(&env.ssh(cfg), true, &mut said).await?;
+        print("the pod is stopped".into());
+        return Ok(());
+    }
     let id = pod.get("id").and_then(Value::as_str).unwrap_or_default();
     let mut seen = Seen::load(env.paths, id, now);
     let activity = activity_seconds(env.paths);
-    let desired = pod.get("desiredStatus").and_then(Value::as_str);
     let (verdict, reason) = decide(now, desired, activity, &seen, limits(cfg));
     if verdict == Some(Verdict::Warn) {
         seen.warned_for = Some(last_active(activity, &seen));
@@ -291,12 +299,20 @@ pub async fn reap(
     }
     seen.save(env.paths)?;
     print(reason.clone());
-    if verdict == Some(Verdict::Down) {
-        alert(report, "viy reap: shutting the pod down", reason, true);
-        commands::down(env, cfg, false, report).await?;
+    if verdict == Some(Verdict::Stop) {
+        alert(report, "viy reap: stopping the pod", reason, true);
+        // A stop RunPod never got keeps reap.json, so the next run tries
+        // again from the same count.
+        commands::stop_confirmed(env, cfg, report).await?;
         remove(&env.paths.reap_state_file())?;
     }
     Ok(())
+}
+
+/// Forgets what reap saw of the pod, so its next run counts the pod from
+/// then: a resumed pod's idle time and cap start anew, as its watchdog's do.
+pub fn forget(paths: &Paths) -> io::Result<()> {
+    remove(&paths.reap_state_file())
 }
 
 /// Removes `path`; one that is not there is no error.
@@ -315,7 +331,7 @@ const RPCTL_TIMER: &str = "rpctl-reap.timer";
 fn service(viy: &Path) -> String {
     format!(
         "[Unit]\n\
-         Description=viy reap: terminate an idle RunPod pod (backup for the pod's own watchdog)\n\
+         Description=viy reap: stop an idle RunPod pod (backup for the pod's own watchdog)\n\
          \n\
          [Service]\n\
          Type=oneshot\n\

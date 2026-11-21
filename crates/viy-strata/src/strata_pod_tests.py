@@ -1,6 +1,7 @@
 """Tests of assets/strata_pod.py, run with python3 under cargo test
 (boot_tests.rs::strata_pod_passes_its_tests). The watchdog's are startup_tests.py's IdleClock,
-terminate and loop cases (viy-vllm), run on Strata's copy, plus Strata's Prometheus request.
+stop, new-container and loop cases (viy-vllm), run on Strata's copy, plus Strata's Prometheus
+request.
 
     python3 -I crates/viy-strata/src/strata_pod_tests.py
 """
@@ -21,6 +22,9 @@ _spec = importlib.util.spec_from_file_location("strata_pod", ASSET)
 pod = importlib.util.module_from_spec(_spec)
 sys.modules["strata_pod"] = pod
 _spec.loader.exec_module(pod)
+# No test marks the real container disk; the folder goes when the run ends.
+_MARKS = tempfile.TemporaryDirectory(prefix="strata-pod-tests-")
+pod.CONTAINER_MARK = Path(_MARKS.name) / "mark"
 
 HOUR = 3600
 # Strata 0.2.16's /metrics?format=prometheus after a run (pod n2k01nm2n0ftmx, 2026-08-08, kb f162)
@@ -93,26 +97,51 @@ class IdleClockTests(unittest.TestCase):
         self.assertEqual(other.started, 5000)
 
 
-class TerminateTests(unittest.TestCase):
-    def test_rest_terminate_first(self):
+class StopTests(unittest.TestCase):
+    def test_rest_stop_first(self):
         with patch.object(pod, "runpod_call", return_value=(True, "ok")) as call:
-            self.assertEqual(pod.terminate_self("p1", "k"), "terminated")
-        self.assertEqual(call.call_args_list[0][0][:2], ("DELETE", pod.REST + "/pods/p1"))
+            self.assertEqual(pod.stop_self("p1", "k"), "stopped")
+        self.assertEqual(call.call_args_list[0][0][:2], ("POST", pod.REST + "/pods/p1/stop"))
 
-    def test_graphql_terminate_when_rest_is_refused(self):
+    def test_graphql_stop_when_rest_is_refused(self):
         with patch.object(pod, "runpod_call", side_effect=[(False, "HTTP 403"), (True, "ok")]) as call:
-            self.assertEqual(pod.terminate_self("p1", "k"), "terminated")
-        self.assertIn("podTerminate", call.call_args_list[1][0][3])
+            self.assertEqual(pod.stop_self("p1", "k"), "stopped")
+        self.assertIn("podStop", call.call_args_list[1][0][3])
 
-    def test_stop_when_terminate_is_refused(self):
-        with patch.object(pod, "runpod_call", side_effect=[(False, "x"), (False, "x"), (True, "ok")]):
-            self.assertEqual(pod.terminate_self("p1", "k"), "stopped")
+    def test_terminate_when_stop_is_refused(self):
+        with patch.object(pod, "runpod_call",
+                          side_effect=[(False, "x"), (False, "x"), (True, "ok")]) as call:
+            self.assertEqual(pod.stop_self("p1", "k"), "terminated")
+        self.assertEqual(call.call_args_list[2][0][:2], ("DELETE", pod.REST + "/pods/p1"))
 
     def test_raises_when_everything_is_refused(self):
         with patch.object(pod, "runpod_call", return_value=(False, "HTTP 403")):
             with self.assertRaises(RuntimeError) as caught:
-                pod.terminate_self("p1", "k")
+                pod.stop_self("p1", "k")
         self.assertEqual(str(caught.exception).count("HTTP 403"), 4)
+
+
+class NewContainerTests(unittest.TestCase):
+    def test_true_once_per_container(self):
+        with tempfile.TemporaryDirectory() as d:
+            mark = Path(d) / "mark"
+            self.assertTrue(pod.new_container(mark))
+            self.assertFalse(pod.new_container(mark))   # a restart
+
+    def test_an_unwritable_mark_keeps_the_saved_countdown(self):
+        self.assertFalse(pod.new_container(Path("/nonexistent-dir/mark")))
+
+    def test_a_new_container_starts_a_new_countdown(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "watchdog-p1.json"
+            c = pod.IdleClock(path, "p1", ttl_s=HOUR, max_s=8 * HOUR, now=0)
+            c.tick(30, 100)
+            self.assertIn("idle", c.tick(HOUR, 100))
+            kept = pod.IdleClock(path, "p1", ttl_s=HOUR, max_s=8 * HOUR, now=86400)
+            self.assertIn("idle", kept.tick(86400, 0))
+            resumed = pod.IdleClock(path, "p1", ttl_s=HOUR, max_s=8 * HOUR, now=86400, fresh=True)
+            self.assertIsNone(resumed.tick(86430, 0))
+            self.assertIn("idle", resumed.tick(86400 + HOUR, 0))
 
 
 class WatchdogLoopTests(unittest.TestCase):
@@ -134,16 +163,16 @@ class WatchdogLoopTests(unittest.TestCase):
 
         calls = []
 
-        def terminate(pod_id, key):
+        def stop(pod_id, key):
             calls.append(clock[0])
             if len(calls) == 1:
                 raise RuntimeError("transient")
-            return "terminated"
+            return "stopped"
 
         with tempfile.TemporaryDirectory() as d, \
                 patch.object(pod.urllib.request, "urlopen", urlopen), \
                 patch.object(pod, "can_manage", return_value=(True, "ok")), \
-                patch.object(pod, "terminate_self", terminate), \
+                patch.object(pod, "stop_self", stop), \
                 patch.dict("os.environ", self.env(d)):
             pod.watchdog(now=lambda: clock[0], sleep=sleep)
         self.assertEqual(len(calls), 2)
@@ -153,6 +182,31 @@ class WatchdogLoopTests(unittest.TestCase):
         self.assertEqual(asked[0].full_url, "http://127.0.0.1:8000/metrics?format=prometheus")
         self.assertEqual(asked[0].get_header("Accept"), "text/plain")
         self.assertEqual(asked[0].get_header("Authorization"), "Bearer sk-SYNTHETIC")
+
+    def test_a_resumed_pod_is_not_stopped_by_the_clock_it_was_stopped_with(self):
+        # Stopped at 3600, started again at 86400 in a new container (no
+        # mark): a new hour. A restart of the same container carries on the
+        # old, expired clock.
+        for marked, stops_at in ((False, 86400 + HOUR), (True, 86400)):
+            with self.subTest(restarted_container=marked), \
+                    tempfile.TemporaryDirectory() as d, \
+                    patch.object(pod, "CONTAINER_MARK", Path(d) / "mark"), \
+                    patch.object(pod.urllib.request, "urlopen",
+                                 lambda request, timeout: io.BytesIO((METRICS % ("5", "5")).encode())), \
+                    patch.object(pod, "can_manage", return_value=(True, "ok")), \
+                    patch.dict("os.environ", self.env(d)):
+                Path(d, "watchdog-p1.json").write_text(json.dumps(
+                    {"pod_id": "p1", "started": 0, "last_activity": 0, "checked": HOUR}))
+                if marked:
+                    (Path(d) / "mark").touch()
+                clock = [86400.0]
+                stopped = []
+                with patch.object(pod, "stop_self",
+                                  lambda pod_id, key: stopped.append(clock[0]) or "stopped"):
+                    pod.watchdog(now=lambda: clock[0],
+                                 sleep=lambda s: clock.__setitem__(0, clock[0] + s))
+                self.assertGreaterEqual(stopped[0], stops_at)
+                self.assertLess(stopped[0], stops_at + 2 * pod.WATCHDOG_POLL_S)
 
     def test_a_streaming_pod_is_never_stopped(self):
         clock = [0.0]
@@ -170,18 +224,18 @@ class WatchdogLoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, \
                 patch.object(pod.urllib.request, "urlopen", urlopen), \
                 patch.object(pod, "can_manage", return_value=(True, "ok")), \
-                patch.object(pod, "terminate_self") as terminate, \
+                patch.object(pod, "stop_self") as stop, \
                 patch.dict("os.environ", self.env(d)):
             with self.assertRaises(StopIteration):
                 pod.watchdog(now=lambda: clock[0], sleep=sleep)
-        terminate.assert_not_called()
+        stop.assert_not_called()
 
     def test_reports_a_key_runpod_refuses(self):
         with tempfile.TemporaryDirectory() as d, \
                 patch.object(pod, "can_manage", return_value=(False, "HTTP 403")), \
                 patch.object(pod, "phase") as phase, \
                 patch.object(pod.urllib.request, "urlopen", side_effect=OSError), \
-                patch.object(pod, "terminate_self", return_value="terminated"), \
+                patch.object(pod, "stop_self", return_value="stopped"), \
                 patch.dict("os.environ", self.env(d, RPCTL_IDLE_TTL_S="60")):
             clock = [0.0]
 
@@ -479,8 +533,8 @@ class ReviewFixTests(unittest.TestCase):
             with patch.object(pod, "PREPARING", flag), \
                     patch.object(pod.urllib.request, "urlopen", side_effect=OSError), \
                     patch.object(pod, "can_manage", return_value=(True, "ok")), \
-                    patch.object(pod, "terminate_self",
-                                 side_effect=lambda *a: stopped.append(clock[0]) or "terminated"), \
+                    patch.object(pod, "stop_self",
+                                 side_effect=lambda *a: stopped.append(clock[0]) or "stopped"), \
                     patch.dict("os.environ", env), patch("sys.stdout", io.StringIO()):
                 try:
                     pod.watchdog(now=lambda: clock[0], sleep=sleep)
