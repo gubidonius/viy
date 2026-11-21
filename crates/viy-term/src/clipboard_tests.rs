@@ -359,13 +359,17 @@ async fn a_stuck_clipboard_is_given_up_on_after_five_seconds() {
     // The stuck thread is left behind: the next copy goes to a new one.
     assert!(!clip.busy());
     let next = clip.copy("next", false).unwrap();
-    // Both threads wait on the gate; the stuck one goes first.
+    // Both threads wait on the gate. Which one it lets through first is not
+    // fixed: the 5 s pass at once on the paused clock, maybe before the stuck
+    // thread reached the gate.
     release.send(()).unwrap();
     release.send(()).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     // The stuck thread's late answer is dropped; the new one's comes.
     assert_eq!(clip.done().await.id(), next);
-    assert_eq!(fake.log(), ["set Clipboard stuck", "set Clipboard next"]);
+    let mut log = fake.log();
+    log.sort();
+    assert_eq!(log, ["set Clipboard next", "set Clipboard stuck"]);
 }
 
 #[test]
