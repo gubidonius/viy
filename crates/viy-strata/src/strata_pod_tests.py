@@ -362,7 +362,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual((cfg["host"], cfg["port"], cfg["api_key"]), ("127.0.0.1", 8000, "sk-SYNTHETIC"))
         self.assertEqual(cfg["model_name"], "flash")
         self.assertEqual(cfg["tokenizer"], "/v/pack/tokenizer")
-        self.assertEqual(cfg["mcp_servers"], [])
+        # no MCP servers: the key absent, as Strata's server wants (a list stops it)
+        self.assertNotIn("mcp_servers", cfg)
         self.assertFalse(cfg["lazy_load"])
 
     def test_ram_one_slot_and_no_draft_head(self):

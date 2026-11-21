@@ -517,12 +517,24 @@ async fn up_until(
     say(
         report,
         Tone::Dim,
-        if volume_is_new {
-            "\nFresh volume: this boot must download ~56GB of weights.\nWeights and successful \
-             compilation caches are retained for later boots."
-        } else {
-            "\nReusing the network volume; checking model and compilation caches.\nImage pulls, \
-             missing files, and new hardware/configuration can add startup time."
+        match (engine::name(cfg), volume_is_new) {
+            (engine::EngineName::Vllm, true) => {
+                "\nFresh volume: this boot must download ~56GB of weights.\nWeights and \
+                 successful compilation caches are retained for later boots."
+            }
+            (engine::EngineName::Vllm, false) => {
+                "\nReusing the network volume; checking model and compilation caches.\nImage \
+                 pulls, missing files, and new hardware/configuration can add startup time."
+            }
+            // Strata's first boot prepares the volume (kb d169).
+            (engine::EngineName::Strata, true) => {
+                "\nFresh volume: this boot prepares it (Strata's release, the model, its pack \
+                 and draft head; about 8 minutes).\nLater boots start Strata from the volume."
+            }
+            (engine::EngineName::Strata, false) => {
+                "\nReusing the network volume; Strata starts from it.\nImage pulls and a new \
+                 release or model (prepared again) can add startup time."
+            }
         },
     );
     let w = wait_for(env, cfg, &rp, &pod_id);

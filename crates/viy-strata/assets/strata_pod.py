@@ -329,7 +329,7 @@ def settings(ready, environ=os.environ):
            "model_name": get("STRATA_MODEL_NAME") or "model",
            "log": get("STRATA_ENGINE_LOG") or "/workspace/strata-engine.log",
            "host": get("STRATA_HOST") or "127.0.0.1", "port": int(get("RPCTL_PORT") or 8000),
-           "api_key": get("VLLM_API_KEY", ""), "lazy_load": False, "mcp_servers": []}
+           "api_key": get("VLLM_API_KEY", ""), "lazy_load": False}
     if parallel > 1:
         cfg["parallel"] = parallel
     return cfg
