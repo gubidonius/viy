@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "d528c14e31dbbbe904d11bfe82f2302e08dd0e61",
+ "rpctl_commit": "d3a72e00647c8692987b6c3582085b971ccd16a0",
  "generator": "tools/fixtures.py config/layering",
  "about": "rpctl config.load() for synthetic layers: DEFAULTS < global < MODEL_PROFILE profile < project < environment",
  "cases": [

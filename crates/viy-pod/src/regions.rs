@@ -272,6 +272,12 @@ pub fn note_pod(paths: &Paths, pod: &Value, now: f64) -> io::Result<()> {
     save_backups(paths, &data)
 }
 
+/// True when `pod` runs on a backup volume, by [`note_pod`]'s test: one
+/// `backups.json` records (rpctl `on_backup`).
+pub fn on_backup(paths: &Paths, pod: &Value) -> bool {
+    pod_volume_id(pod).is_some_and(|vid| load_backups(paths).contains_key(vid))
+}
+
 /// Marks the new backup `volume_id` as replacing `old_id`, which goes once
 /// `viy up` serves on the new one ([`retire_replaced`]).
 pub fn mark_replaces(paths: &Paths, volume_id: &str, old_id: &str) -> io::Result<()> {

@@ -27,12 +27,12 @@ struct Fixture {
 }
 
 /// An empty input box as [`Fixture::screen`] shows it: the placeholder,
-/// the caret on its first letter (kb d152).
-const EMPTY: &str = "› ▮end word below..";
+/// the caret on its first letter (kb d159).
+const EMPTY: &str = "› ▮end word below...";
 
-/// The dotted rule above and below the input box, `width` cells wide.
+/// The dashed rule above and below the input box, `width` cells wide.
 fn rule(width: usize) -> String {
-    "⠂".repeat(width)
+    "╌".repeat(width)
 }
 
 fn fixture(width: u16, height: u16) -> Fixture {
@@ -151,7 +151,7 @@ fn an_idle_chat_is_the_input_between_two_rules_and_the_footer() {
 
 /// The empty box shows its placeholder and the rules in faint ink, the
 /// caret in the terminal's own; typing hides the placeholder, emptying
-/// the box brings it back, and shell mode has none (kb d152).
+/// the box brings it back, and shell mode has none (kb d159).
 #[test]
 fn the_placeholder_shows_while_the_box_is_empty() {
     let mut f = fixture(30, 7);

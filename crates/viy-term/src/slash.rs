@@ -137,7 +137,7 @@ pub const COMMANDS: &[Command] = &[
     // The pod's commands (kb d041, d068), with their subcommands' words.
     cmd(
         "up",
-        "[--timeout S]",
+        "[--backup] [--timeout S]",
         "create/resume the pod and wait for vLLM",
         &[],
     ),

@@ -235,11 +235,14 @@ fn cfg_at<'c>(cfg: &'c Config, key: &str) -> &'c str {
 /// `viy up`: resumes or reuses our pod, else creates one, and waits for
 /// vLLM within `timeout`. A Ctrl-C ends it, as rpctl's KeyboardInterrupt
 /// does: during the wait for vLLM, a booting pod's boot is recorded first,
-/// and a second Ctrl-C ends that too.
+/// and a second Ctrl-C ends that too. With `backup` (`viy up --backup`)
+/// DATA_CENTER_ID is skipped: a new pod goes on the backup volume, and an
+/// existing one is used only if it runs there (rpctl kb d035).
 pub async fn up(
     env: &Env<'_>,
     cfg: &mut Config,
     timeout: Duration,
+    backup: bool,
     interrupt: &Interrupt,
     report: Reporter<'_>,
     ask: Asker<'_>,
@@ -250,17 +253,19 @@ pub async fn up(
     let aborted = interrupt.when(|c| *c >= abort_at.load(Ordering::SeqCst));
     tokio::select! {
         biased;
-        result = up_until(env, cfg, timeout, interrupt, &abort_at, report, ask) => result,
+        result = up_until(env, cfg, timeout, backup, interrupt, &abort_at, report, ask) => result,
         () = aborted => Err(CommandError::Interrupted),
     }
 }
 
 /// [`up`]'s work; `abort_at` is raised around the wait, and while
 /// failover has new volumes to delete.
+#[allow(clippy::too_many_arguments)]
 async fn up_until(
     env: &Env<'_>,
     cfg: &mut Config,
     timeout: Duration,
+    backup: bool,
     interrupt: &Interrupt,
     abort_at: &AtomicU32,
     report: Reporter<'_>,
@@ -297,6 +302,9 @@ async fn up_until(
     };
     if let Some(existing) = existing {
         let cfg = &*cfg;
+        if backup {
+            check_backup_pod(env, cfg, &existing)?;
+        }
         let pod_id = text(&existing, "id").unwrap_or_default().to_string();
         regions::note_pod(env.paths, &existing, regions::now(env.time))?;
         let status = existing.get("desiredStatus");
@@ -404,7 +412,12 @@ async fn up_until(
                 .to_string(),
         ));
     }
-    let (volume_id, volume_is_new) = ensure_volume(env, cfg, &rp, report).await?;
+    // --backup: the primary volume is neither looked up nor made.
+    let (volume_id, volume_is_new) = if backup {
+        (String::new(), false)
+    } else {
+        ensure_volume(env, cfg, &rp, report).await?
+    };
     timeline.mark("pod requested", []);
     let user = User {
         report,
@@ -412,9 +425,12 @@ async fn up_until(
         interrupt,
         abort_at,
     };
-    let created = Creation::new(env, cfg, &rp, &vllm_key, pubkey.as_deref(), user)
-        .run(&volume_id, volume_is_new)
-        .await?;
+    let creation = Creation::new(env, cfg, &rp, &vllm_key, pubkey.as_deref(), user);
+    let created = if backup {
+        creation.run_on_backup().await?
+    } else {
+        creation.run(&volume_id, volume_is_new).await?
+    };
     // Time spent answering failover questions, or waiting between retries
     // for a free GPU, is the user's or RunPod's, not the boot's.
     started += created.waited;
@@ -532,6 +548,24 @@ async fn up_until(
         true,
     );
     Err(CommandError::Failed)
+}
+
+/// `viy up --backup` with a pod of ours already there: one on a backup
+/// volume is resumed or reused as `viy up` always does; any other is left
+/// alone, since only a new pod can go on the backup (rpctl
+/// `_check_backup_pod`).
+pub fn check_backup_pod(env: &Env<'_>, cfg: &Config, existing: &Value) -> Result<(), CommandError> {
+    if regions::on_backup(env.paths, existing) {
+        return Ok(());
+    }
+    Err(CommandError::Exit(format!(
+        "Pod {} named '{}' already exists ({}) and is not on the backup volume, so viy up \
+         --backup leaves it alone. viy down terminates it (the weights stay on the volume), then \
+         viy up --backup makes one on the backup; viy up alone resumes or reuses it.",
+        text(existing, "id").unwrap_or_default(),
+        cfg_at(cfg, "POD_NAME"),
+        shown(existing.get("desiredStatus")),
+    )))
 }
 
 fn wait_for<'a>(env: &Env<'a>, cfg: &'a Config, rp: &'a RunPod, pod_id: &'a str) -> PodWait<'a> {

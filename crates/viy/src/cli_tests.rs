@@ -194,7 +194,9 @@ fn namespace(cli: &Cli) -> Value {
         | Command::Down => {
             json!({})
         }
-        Command::Up { timeout } => json!({"timeout": timeout.to_string()}),
+        Command::Up { timeout, backup } => {
+            json!({"timeout": timeout.to_string(), "backup": backup})
+        }
         Command::Boots(a) => {
             json!({"action": word(&a.action), "boot": a.boot, "n": a.n.to_string()})
         }
@@ -265,7 +267,7 @@ fn is_resume_flag(arg: &str) -> bool {
 #[test]
 fn command_lines_parse_as_rps() {
     let fixture = fixtures::load("cli/parse").unwrap();
-    assert_eq!(fixture.cases.len(), 100);
+    assert_eq!(fixture.cases.len(), 104);
     for case in &fixture.cases {
         let argv: Vec<&str> = case["argv"]
             .as_array()

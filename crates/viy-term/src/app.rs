@@ -95,11 +95,11 @@ const WHEEL_ROWS: usize = 3;
 /// Queued messages shown above the input at most.
 const QUEUED_ROWS: usize = 3;
 
-/// The rules above and below the input box: one Braille dot a cell, at
-/// the cell's middle (the author's pick from mockups, kb d152).
-const RULE_DOT: char = '⠂';
-/// What the empty input box shows (the author's words, kb d152).
-const PLACEHOLDER: &str = "Send word below..";
+/// The rules above and below the input box: two short dashes a cell,
+/// at the row's middle (the author's pick from previews, kb d159).
+const RULE_DASH: char = '╌';
+/// What the empty input box shows (the author's words, kb d159).
+const PLACEHOLDER: &str = "Send word below...";
 /// How strongly the rules and the placeholder show: this much of the
 /// terminal's foreground over its background ([`crate::palette::faint`]).
 const INPUT_INK: f32 = 0.26;
@@ -1344,11 +1344,16 @@ impl App {
         }
         live.extend(question);
         live.extend(tail);
-        // The input box sits between two dotted rules (kb d152), in rows
+        // The input box sits between two dashed rules (kb d159), in rows
         // nothing else wants: they give way before any other row.
         let ruled = live.len() + fixed + 2 <= room;
         let ink = crate::palette::faint(INPUT_INK);
-        let rule = Line::from(RULE_DOT.to_string().repeat(usize::from(size.width)).fg(ink));
+        let rule = Line::from(
+            RULE_DASH
+                .to_string()
+                .repeat(usize::from(size.width))
+                .fg(ink),
+        );
         let mut bottom = live;
         if ruled {
             bottom.push(rule.clone());

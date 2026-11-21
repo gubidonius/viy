@@ -101,7 +101,8 @@ const HELP: &str = "  /help              show this
   /stats             last response timing
 
   The pod, as its viy subcommands, in the background (Ctrl-C stops them):
-  /up [--timeout S]  create/resume the pod and wait for vLLM
+  /up [--backup] [--timeout S]  create/resume the pod and wait for vLLM;
+                     --backup: on the backup volume, skipping DATA_CENTER_ID
   /status            pod state, GPU, hourly cost, vLLM readiness
   /stop              stop the pod (resumable; ends GPU billing)
   /down              terminate the pod (weights stay on the volume)

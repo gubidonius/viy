@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "d528c14e31dbbbe904d11bfe82f2302e08dd0e61",
+ "rpctl_commit": "d3a72e00647c8692987b6c3582085b971ccd16a0",
  "generator": "tools/fixtures.py cli/parse",
  "about": "rpctl __main__.build_parser().parse_args(argv): the exit status and, on success, the namespace without fn, values as strings",
  "cases": [
@@ -58,7 +58,8 @@
    "exit": 0,
    "args": {
     "cmd": "up",
-    "timeout": "2700"
+    "timeout": "2700",
+    "backup": false
    }
   },
   {
@@ -70,7 +71,8 @@
    "exit": 0,
    "args": {
     "cmd": "up",
-    "timeout": "30"
+    "timeout": "30",
+    "backup": false
    }
   },
   {
@@ -81,7 +83,8 @@
    "exit": 0,
    "args": {
     "cmd": "up",
-    "timeout": "30"
+    "timeout": "30",
+    "backup": false
    }
   },
   {
@@ -93,7 +96,8 @@
    "exit": 0,
    "args": {
     "cmd": "up",
-    "timeout": "30"
+    "timeout": "30",
+    "backup": false
    }
   },
   {
@@ -105,8 +109,54 @@
    "exit": 0,
    "args": {
     "cmd": "up",
-    "timeout": "abc"
+    "timeout": "abc",
+    "backup": false
    }
+  },
+  {
+   "argv": [
+    "up",
+    "--backup"
+   ],
+   "exit": 0,
+   "args": {
+    "cmd": "up",
+    "timeout": "2700",
+    "backup": true
+   }
+  },
+  {
+   "argv": [
+    "up",
+    "--backup",
+    "--timeout",
+    "30"
+   ],
+   "exit": 0,
+   "args": {
+    "cmd": "up",
+    "timeout": "30",
+    "backup": true
+   }
+  },
+  {
+   "argv": [
+    "up",
+    "--back"
+   ],
+   "exit": 0,
+   "args": {
+    "cmd": "up",
+    "timeout": "2700",
+    "backup": true
+   }
+  },
+  {
+   "argv": [
+    "up",
+    "--backup=1"
+   ],
+   "exit": 2
   },
   {
    "argv": [

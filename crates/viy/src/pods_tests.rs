@@ -114,7 +114,13 @@ fn each_backend_has_its_own_commands() {
         )
     };
     assert_eq!(
-        run_with("OpenAI", Command::Up { timeout: 60 }),
+        run_with(
+            "OpenAI",
+            Command::Up {
+                timeout: 60,
+                backup: false,
+            },
+        ),
         (
             None,
             "The 'openai' backend is a hosted endpoint: there is nothing to start. viy status \
@@ -125,6 +131,23 @@ fn each_backend_has_its_own_commands() {
     for (backend, command, verb) in [
         ("openai", Command::Down, "down"),
         ("openai", Command::Logs { follow: false }, "logs"),
+        // only a pod has a backup volume (rpctl test_backends_without_a_pod_refuse_it)
+        (
+            "openai",
+            Command::Up {
+                timeout: 60,
+                backup: true,
+            },
+            "up --backup",
+        ),
+        (
+            "local",
+            Command::Up {
+                timeout: 60,
+                backup: true,
+            },
+            "up --backup",
+        ),
         (
             "local",
             Command::Tunnel(TunnelArgs {

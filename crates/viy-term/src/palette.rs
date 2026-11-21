@@ -1,7 +1,7 @@
 //! The terminal's default colours, asked once at start (OSC 10 and 11, as
 //! Codex's `terminal_probe` does), for what blends into whatever the
 //! terminal shows: the header's ghost (`header.rs`), and the input box's
-//! dotted rules and placeholder ([`faint`]).
+//! dashed rules and placeholder ([`faint`]).
 //!
 //! The question goes out right after raw mode is on and before the chat
 //! reads any input: OSC 10 (foreground), OSC 11 (background), then DA1,

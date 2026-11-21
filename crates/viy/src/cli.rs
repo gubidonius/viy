@@ -44,6 +44,11 @@ pub enum Command {
     Up {
         #[arg(long, default_value_t = 2700, help = "seconds to wait for readiness")]
         timeout: u64,
+        #[arg(
+            long,
+            help = "create the pod on the backup volume in its region, skipping DATA_CENTER_ID"
+        )]
+        backup: bool,
     },
     #[command(about = "pod state, GPU, hourly cost, vLLM readiness")]
     Status,

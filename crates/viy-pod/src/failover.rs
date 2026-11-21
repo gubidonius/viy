@@ -22,6 +22,10 @@
 //!
 //! Questions go to an [`Asker`]; with nobody to ask, the backup is tried
 //! and nothing is made or deleted.
+//!
+//! `viy up --backup` ([`Creation::run_on_backup`]) starts at the backup
+//! step, FAILOVER or not: the backup is tried without a question, and
+//! DATA_CENTER_ID is never asked, for any type, nor retried (rpctl kb d035).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -148,6 +152,9 @@ pub struct Creation<'a> {
     /// Whether a request was sent, which "Creating pod in" announces.
     tried: bool,
     waited: Duration,
+    /// `viy up --backup` asked for the backup: it is tried without a
+    /// question, and DATA_CENTER_ID is neither asked nor retried.
+    requested: bool,
 }
 
 impl<'a> Creation<'a> {
@@ -174,6 +181,7 @@ impl<'a> Creation<'a> {
             body: Value::Null,
             tried: false,
             waited: Duration::ZERO,
+            requested: false,
         }
     }
 
@@ -260,23 +268,61 @@ impl<'a> Creation<'a> {
                         );
                         return Ok(self.created(won.pod, &won.volume_id, won.created, &won.region));
                     }
-                    Err(Stop::Declined(message)) => {
-                        self.say(
-                            Tone::Dim,
-                            format!("{message} No pod was created; nothing is billing."),
-                        );
-                        return Err(CommandError::Failed);
-                    }
-                    Err(Stop::Command(error)) => return Err(error),
-                    Err(Stop::NoCapacity(message)) => (message, true),
-                    Err(Stop::Refused(error)) => (error.to_string(), is_capacity_error(&error)),
+                    Err(stop) => self.stopped(stop)?,
                 }
             } else {
                 (refused.to_string(), is_capacity_error(&refused))
             };
+        self.fail(message, capacity)
+    }
+
+    /// `viy up --backup`: failover from its backup step, DATA_CENTER_ID
+    /// never asked (rpctl `_create_pod` with `backup`). The region it ran
+    /// in is the boot's only; the next `viy up` starts from the primary.
+    pub async fn run_on_backup(mut self) -> Result<Created, CommandError> {
+        self.requested = true;
+        // Only dataCenterIds and networkVolumeId differ between requests.
+        self.body = build_pod_body(self.cfg, self.vllm_key, "", self.pubkey)
+            .map_err(|e| CommandError::Exit(e.to_string()))?;
+        let (message, capacity) = match self.failover("").await {
+            Ok(won) => {
+                self.say(
+                    Tone::Ok,
+                    format!(
+                        "  pod created in {} on the backup volume {}",
+                        won.region, won.volume_id
+                    ),
+                );
+                return Ok(self.created(won.pod, &won.volume_id, won.created, &won.region));
+            }
+            Err(stop) => self.stopped(stop)?,
+        };
+        self.fail(message, capacity)
+    }
+
+    /// How failover ended without a pod: the message to show and whether
+    /// it was for lack of capacity, or the error to end `up` with at once.
+    fn stopped(&self, stop: Stop) -> Result<(String, bool), CommandError> {
+        match stop {
+            Stop::Declined(message) => {
+                self.say(
+                    Tone::Dim,
+                    format!("{message} No pod was created; nothing is billing."),
+                );
+                Err(CommandError::Failed)
+            }
+            Stop::Command(error) => Err(error),
+            Stop::NoCapacity(message) => Ok((message, true)),
+            Stop::Refused(error) => Ok((error.to_string(), is_capacity_error(&error))),
+        }
+    }
+
+    /// Says why no pod was created, and what to try.
+    fn fail(&self, message: String, capacity: bool) -> Result<Created, CommandError> {
+        let primary = &self.primary;
         self.say(Tone::Error, message);
         let hint = if capacity {
-            let first = if regions::failover_enabled(self.cfg) {
+            let first = if self.requested || regions::failover_enabled(self.cfg) {
                 "No region took the pod".to_string()
             } else {
                 format!("No GPU free in {primary} (FAILOVER=0: no backup offered)")
@@ -447,9 +493,10 @@ impl<'a> Creation<'a> {
     }
 
     /// The types GPU_PREFERRED leaves, asked for in DATA_CENTER_ID: the
-    /// pod, or None when none is free there or nothing was left out.
+    /// pod, or None when none is free there, nothing was left out, or
+    /// there is no primary volume to ask on (`viy up --backup`).
     async fn others_in_primary(&mut self, volume_id: &str) -> Result<Option<Won>, Stop> {
-        if self.tiers.is_none() {
+        if self.tiers.is_none() || volume_id.is_empty() {
             return Ok(None);
         }
         let primary = self.primary.clone();
@@ -521,7 +568,7 @@ impl<'a> Creation<'a> {
             } else {
                 format!("{primary} has no GPU free. Try the backup volume in {region}?")
             };
-            if !self.ask(question, true).await {
+            if !self.requested && !self.ask(question, true).await {
                 if let Some(won) = self.others_in_primary(primary_volume).await? {
                     return Ok(won);
                 }
@@ -532,10 +579,13 @@ impl<'a> Creation<'a> {
             if let Some(won) = self.in_backup(backup, region, first).await? {
                 return Ok(won);
             }
+            let either = if self.requested { "" } else { " either" };
             self.say(
                 Tone::Warn,
-                format!("The backup region {region} has no {gpu} free either."),
+                format!("The backup region {region} has no {gpu} free{either}."),
             );
+        } else if self.requested {
+            self.say(Tone::Warn, "There is no backup volume yet.");
         } else {
             self.say(
                 Tone::Warn,
@@ -668,15 +718,22 @@ impl<'a> Creation<'a> {
         if ask == Ask::Preferred {
             place.push_str(" for a preferred GPU type, before trying the other types");
         }
-        let also: Vec<&str> = [Some(primary.as_str()), old.map(|(_, region)| region)]
+        // The regions `grab` retries besides the candidates: the primary
+        // only with its volume, which `viy up --backup` leaves out.
+        let primary_retried = (!primary_volume.is_empty()).then_some(primary.as_str());
+        let also: Vec<&str> = [primary_retried, old.map(|(_, region)| region)]
             .into_iter()
             .flatten()
             .collect();
         let retry = if minutes != 0.0 {
+            let elsewhere = if also.is_empty() {
+                String::new()
+            } else {
+                format!(" and in {}", also.join(" and "))
+            };
             format!(
-                ", retrying refusals there and in {} for up to {} min; new volumes left unused \
+                ", retrying refusals there{elsewhere} for up to {} min; new volumes left unused \
                  are deleted",
-                also.join(" and "),
                 short(minutes)
             )
         } else {

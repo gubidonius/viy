@@ -573,6 +573,8 @@ CLI_CASES = [
     ["init"], ["init", "x"], ["migrate"],
     ["up"], ["up", "--timeout", "30"], ["up", "--timeout=30"], ["up", "--time", "30"],
     ["up", "--timeout", "abc"],
+    ["up", "--backup"], ["up", "--backup", "--timeout", "30"], ["up", "--back"],
+    ["up", "--backup=1"],
     ["status"], ["stop"], ["down"], ["down", "now"],
     ["boots"], ["boots", "show"], ["boots", "show", "abc"], ["boots", "list", "-n", "3"],
     ["boots", "-n5"], ["boots", "abc"], ["boots", "show", "a", "b"], ["boots", "-n", "x"],
@@ -2048,6 +2050,25 @@ FAILOVER_CASES = [
          world=dict(volumes=[PRIM, BK], stock=[_dc("CA-MTL-3", False)]), answers=[True]),
     dict(name="nowhere_free_without_a_backup", world=dict(volumes=[PRIM], stock=[]),
          answers=None),
+    # rp up --backup (rpctl kb d035): the primary is never asked nor retried.
+    dict(name="backup_flag_takes_the_backup_without_asking", backup=True,
+         world=dict(free=["US-MO-1", "EUR-IS-1"], volumes=[PRIM, BK]), answers=[]),
+    dict(name="backup_flag_with_failover_off", backup=True, config={"FAILOVER": "0"},
+         world=dict(free=["US-MO-1"], volumes=[PRIM, BK]), answers=[]),
+    dict(name="backup_flag_full_backup_offers_the_switch_without_the_primary", backup=True,
+         world=dict(volumes=[PRIM, BK], later={"CA-MTL-3": 1},
+                    stock=[_dc("US-MO-1", False), _dc("CA-MTL-3", True), _dc("EUR-IS-1", True)]),
+         answers=[True]),
+    dict(name="backup_flag_without_a_backup_asks_to_make_one", backup=True,
+         world=dict(free=["CA-MTL-3", "EUR-IS-1"], volumes=[PRIM],
+                    stock=[_dc("EUR-IS-1", True), _dc("CA-MTL-3", True)]),
+         answers=[True]),
+    dict(name="backup_flag_no_to_the_switch_creates_nothing", backup=True,
+         world=dict(volumes=[PRIM, BK], stock=[_dc("CA-MTL-3", True)]), answers=[False]),
+    dict(name="backup_flag_nowhere_free_exits", backup=True,
+         world=dict(volumes=[PRIM, BK], stock=[_dc("CA-MTL-3", False)]), answers=[]),
+    dict(name="backup_flag_without_a_terminal_moves_nothing", backup=True,
+         world=dict(volumes=[PRIM, BK], stock=[_dc("CA-MTL-3", True)]), answers=None),
     dict(name="stock_unreadable", world=dict(volumes=[PRIM, BK], stock_error=500),
          answers=[True]),
     dict(name="stock_counts_hosts_at_or_above_the_cuda_floor",
@@ -2254,12 +2275,19 @@ clock = [0.0]
 regions.time = types.SimpleNamespace(time=lambda: NOW + clock[0], monotonic=lambda: clock[0],
                                      sleep=lambda s: clock.__setitem__(0, clock[0] + s))
 fake = regions.time
-d = list(regions.failover.__defaults__)
-d[-2], d[-1] = fake.sleep, fake.monotonic
-regions.failover.__defaults__ = tuple(d)
-d = list(regions.sample_stock.__defaults__)
-d[-1] = fake.sleep
-regions.sample_stock.__defaults__ = tuple(d)
+def _defaults(fn, **values):
+    # These parameters' defaults, replaced by name: rpctl d3a72e0 added
+    # `requested` after failover's sleep and clock.
+    import inspect
+    named = [p.name for p in inspect.signature(fn).parameters.values()
+             if p.default is not inspect.Parameter.empty
+             and p.kind is not inspect.Parameter.KEYWORD_ONLY]
+    d = list(fn.__defaults__)
+    for name, value in values.items():
+        d[named.index(name)] = value
+    fn.__defaults__ = tuple(d)
+_defaults(regions.failover, sleep=fake.sleep, clock=fake.monotonic)
+_defaults(regions.sample_stock, sleep=fake.sleep)
 TONE = {pod.C_DIM: "dim", pod.C_OK: "ok", pod.C_WARN: "warn", pod.C_ERR: "error", "": "plain"}
 said, asked, sent, replies, presses = [], [], [], [], []
 pod._say = lambda msg, color="": said.append([TONE[color], msg.replace(HOME, "$HOME")])
@@ -2416,8 +2444,13 @@ for case in json.loads(sys.argv[2]):
     rp = Client(API_KEY)
     try:
         if call == "create_pod":
-            got = pod._create_pod(rp, cfg, cfg["VLLM_API_KEY"], "ssh-ed25519 AAAAsynthetic",
-                                  "prim", case.get("volume_is_new", False))
+            if case.get("backup"):
+                # rp up --backup: no primary volume, the primary never asked.
+                got = pod._create_pod(rp, cfg, cfg["VLLM_API_KEY"], "ssh-ed25519 AAAAsynthetic",
+                                      None, False, backup=True)
+            else:
+                got = pod._create_pod(rp, cfg, cfg["VLLM_API_KEY"], "ssh-ed25519 AAAAsynthetic",
+                                      "prim", case.get("volume_is_new", False))
             result = {"ok": list(got)}
         elif call == "retire_replaced":
             result = {"ok": regions.retire_replaced(rp, cfg, case["volume"],
@@ -2462,7 +2495,8 @@ def gen_pod_failover(snap):
                               json.dumps(FAILOVER_CASES), repr(FO_NOW), API_KEY, FULL, json.dumps(FO_CONFIG)],
                              cwd=tmp, env=env, check=True, capture_output=True, text=True)
     return {
-        "about": "rpctl's pod creation with region failover (pod._create_pod on volume 'prim' "
+        "about": "rpctl's pod creation with region failover (pod._create_pod on volume 'prim', "
+                 "or with `backup` as rp up --backup on no primary volume, "
                  "with the user's answers, the default without a terminal), "
                  "regions.retire_replaced, regions.expire, regions.cmd_backup, regions.rank "
                  "and regions.is_capacity_error, config keys over DEFAULTS and FO_CONFIG, "

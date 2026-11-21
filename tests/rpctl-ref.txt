@@ -1,6 +1,6 @@
 # The rpctl commit viy ports from. Change it only together with regenerated
 # fixtures (docs/implementation-plan.md 3.1); tools/refsnap.sh extracts it.
-commit: d528c14e31dbbbe904d11bfe82f2302e08dd0e61
+commit: d3a72e00647c8692987b6c3582085b971ccd16a0
 branch: leak-protection
-pinned: 2026-08-01
-subject: MTP_DRAFT_HEAD_QUANTIZATION: a quantized lm_head copy for the MTP drafter, empty by default (viy kb d146)
+pinned: 2026-08-05
+subject: rp up --backup: boot on the backup volume, skipping DATA_CENTER_ID (kb d035)

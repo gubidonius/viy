@@ -280,9 +280,9 @@ pub(crate) async fn work(
         return other_backend(command, backend, env, cfg, interrupt, report).await;
     }
     match command {
-        Command::Up { timeout } => {
+        Command::Up { timeout, backup } => {
             let timeout = Duration::from_secs(*timeout);
-            commands::up(env, cfg, timeout, interrupt, report, ask).await
+            commands::up(env, cfg, timeout, *backup, interrupt, report, ask).await
         }
         Command::Logs { follow } => {
             commands::logs(env, cfg, *follow, interrupt.next(), report).await
@@ -343,12 +343,16 @@ async fn other_backend(
     }
     let work = async {
         match (backend, command) {
+            // Only a pod has a backup volume to go to.
+            (_, Command::Up { backup: true, .. }) => {
+                Err(backend::not_supported(backend, "up --backup"))
+            }
             (Backend::Openai, Command::Up { .. }) => {
                 backend::openai_up(report);
                 Ok(())
             }
             (Backend::Openai, Command::Status) => backend::openai_status(env, cfg, report).await,
-            (Backend::Local, Command::Up { timeout }) => {
+            (Backend::Local, Command::Up { timeout, .. }) => {
                 local::up(env, cfg, Duration::from_secs(*timeout), report).await
             }
             (Backend::Local, Command::Status) => local::status(env, cfg, report).await,

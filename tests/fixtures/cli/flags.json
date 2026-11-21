@@ -1,5 +1,5 @@
 {
- "rpctl_commit": "d528c14e31dbbbe904d11bfe82f2302e08dd0e61",
+ "rpctl_commit": "d3a72e00647c8692987b6c3582085b971ccd16a0",
  "generator": "tools/fixtures.py cli/flags",
  "about": "rpctl __main__.build_parser(): the program (name \"\") and each subcommand in order, with its help, description and arguments (option strings, nargs, whether a store_true flag, const, default, type, choices, required, hidden, help; values as strings). Help and usage layout are argparse's and not recorded (flags.md F31)",
  "cases": [
@@ -39,6 +39,20 @@
      "required": false,
      "hidden": false,
      "help": "seconds to wait for readiness"
+    },
+    {
+     "flags": [
+      "--backup"
+     ],
+     "nargs": 0,
+     "flag": true,
+     "const": true,
+     "default": false,
+     "type": null,
+     "choices": null,
+     "required": false,
+     "hidden": false,
+     "help": "create the pod on the backup volume in its region, skipping DATA_CENTER_ID"
     }
    ]
   },

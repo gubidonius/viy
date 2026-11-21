@@ -362,7 +362,13 @@ async fn run_case(case: &Value) -> Replayed {
                 user,
             );
             let volume_is_new = case["volume_is_new"] == true;
-            match creation.run("prim", volume_is_new).await {
+            // `viy up --backup`: no primary volume (rpctl kb d035).
+            let created = if case["backup"] == true {
+                creation.run_on_backup().await
+            } else {
+                creation.run("prim", volume_is_new).await
+            };
+            match created {
                 Ok(created) => {
                     assert_eq!(
                         json!(created.region),

@@ -211,6 +211,7 @@ async fn run_up(home: &mut Home, told: &Told) -> Result<(), CommandError> {
         &env,
         &mut home.cfg,
         Duration::from_secs(60),
+        false,
         &Interrupt::never(),
         &told.reporter(),
         &nobody,
@@ -254,6 +255,7 @@ async fn up_interrupted(
         &env,
         &mut home.cfg,
         Duration::from_secs(60),
+        false,
         &interrupt,
         &report,
         &nobody,
@@ -1150,6 +1152,7 @@ async fn failover_through_up_boots_on_the_backup_with_answers_off_the_clock() {
         &env,
         &mut cfg,
         Duration::from_secs(60),
+        false,
         &Interrupt::never(),
         &told.reporter(),
         &ask,
@@ -1175,6 +1178,120 @@ async fn failover_through_up_boots_on_the_backup_with_answers_off_the_clock() {
         serde_json::from_str(&std::fs::read_to_string(home.paths.backups_file()).unwrap()).unwrap();
     // Used from when the pod was created, after the half minute's answer.
     assert_eq!(backups["bk"]["last_used"], json!(1_784_194_230.0));
+}
+
+/// `viy up --backup` (rpctl kb d035): no question, no request in the
+/// primary region, and the primary volume neither looked up nor made.
+#[tokio::test(start_paused = true)]
+async fn up_backup_boots_on_the_backup_without_the_primary() {
+    let backup = json!({"id": "bk", "name": "qwen38-weights-backup", "dataCenterId": "US-MO-1"});
+    let volumes = json!([
+        {"id": "vol222", "name": "qwen38-weights", "dataCenterId": "EUR-IS-1"},
+        backup,
+    ]);
+    let mut home = Home::new(None, move |r| {
+        let url = r.url.as_str();
+        let body: Value = r
+            .body
+            .as_deref()
+            .and_then(|b| serde_json::from_slice(b).ok())
+            .unwrap_or_default();
+        if url.contains("/logs") {
+            boot_log()
+        } else if url.ends_with("/health") {
+            Reply::answer(200, "")
+        } else if url.ends_with("/v1/pods") && r.method == Method::GET {
+            json_reply(json!([]))
+        } else if url.ends_with("/v1/pods") && body["dataCenterIds"] == json!(["US-MO-1"]) {
+            json_reply(json!({"id": "pod111", "costPerHr": 1.89, "networkVolumeId": "bk"}))
+        } else if url.ends_with("/v1/pods") {
+            panic!("--backup asked {}", body["dataCenterIds"])
+        } else if url.ends_with("/v1/networkvolumes") && r.method == Method::GET {
+            json_reply(volumes.clone())
+        } else if url.ends_with("/pods/pod111") {
+            json_reply(pod("RUNNING"))
+        } else {
+            panic!("unexpected {} {url}", r.method)
+        }
+    });
+    home.cfg.set("CUDA_VERSIONS", "");
+    let told = Told::default();
+    let env = home.env();
+    let mut cfg = home.cfg.clone();
+    up(
+        &env,
+        &mut cfg,
+        Duration::from_secs(60),
+        true,
+        &Interrupt::never(),
+        &told.reporter(),
+        &nobody,
+    )
+    .await
+    .unwrap();
+    let texts = told.texts();
+    assert!(texts.contains(&"  pod created in US-MO-1 on the backup volume bk".to_string()));
+    assert!(
+        !texts.iter().any(|t| t.contains("Try the backup")),
+        "{texts:?}"
+    );
+    assert_eq!(home.state()["volume_id"], "bk");
+    let records = Records::new(&home.paths);
+    let row = records.history(1).pop().unwrap();
+    let record = records.read(row["boot_id"].as_str().unwrap()).unwrap();
+    assert_eq!(record["config"]["DATA_CENTER_ID"], "US-MO-1");
+    assert_eq!(cfg.get("DATA_CENTER_ID"), Some("EUR-IS-1"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn up_backup_leaves_a_pod_off_the_backup_alone() {
+    // Any request but the listing panics: nothing is resumed or made.
+    let home = Home::new(None, |r| {
+        let url = r.url.as_str();
+        if url.ends_with("/v1/pods") && r.method == Method::GET {
+            let mut ours = pod("EXITED");
+            ours["networkVolumeId"] = json!("vol222");
+            json_reply(json!([ours]))
+        } else {
+            panic!("unexpected {} {url}", r.method)
+        }
+    });
+    let told = Told::default();
+    let env = home.env();
+    let mut cfg = home.cfg.clone();
+    let error = up(
+        &env,
+        &mut cfg,
+        Duration::from_secs(60),
+        true,
+        &Interrupt::never(),
+        &told.reporter(),
+        &nobody,
+    )
+    .await
+    .unwrap_err();
+    let CommandError::Exit(message) = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(
+        message,
+        "Pod pod111 named 'qwen-pod' already exists (EXITED) and is not on the backup volume, \
+         so viy up --backup leaves it alone. viy down terminates it (the weights stay on the \
+         volume), then viy up --backup makes one on the backup; viy up alone resumes or reuses \
+         it."
+    );
+}
+
+#[test]
+fn a_pod_on_a_recorded_backup_passes_the_backup_check() {
+    let home = Home::new(None, |_| panic!("no request"));
+    let env = home.env();
+    let backup = json!({"id": "bk", "name": "qwen38-weights-backup", "dataCenterId": "US-MO-1"});
+    regions::touch(&home.paths, &backup, 1_784_194_200.0).unwrap();
+    let on = json!({"id": "pod111", "networkVolumeId": "bk"});
+    assert!(check_backup_pod(&env, &home.cfg, &on).is_ok());
+    let off = json!({"id": "pod111", "networkVolume": {"id": "vol222"}});
+    assert!(check_backup_pod(&env, &home.cfg, &off).is_err());
 }
 
 #[tokio::test(start_paused = true)]
