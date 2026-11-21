@@ -163,6 +163,39 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // on drivers >= the lowest value here), rp up asks again without it.
     ("CUDA_VERSIONS", "13.0"),
     ("VLLM_PORT", "8000"),
+    // --- the serving engine, viy only (docs/strata-engine.md) -------------
+    // vllm: everything above. strata: Strata serves a GGUF model from its
+    // own release image; VLLM_IMAGE, TOOL_CALL_PARSER, GPU_MEMORY_UTILIZATION
+    // and the MTP and cache keys are then ignored (kb d162).
+    ("ENGINE", "vllm"),
+    // Strata's release, by tag and digest; a new one is measured before it
+    // is pinned here (kb d163, d170).
+    (
+        "STRATA_IMAGE",
+        "ghcr.io/niko1221/strata:0.2.16-cuda13@sha256:acc0feffeef9d4123e3928537300357908937de530d53771053b6db57129a0c1",
+    ),
+    // For a GGUF repo, the files of MODEL_REPO to fetch (`hf download
+    // --include`), e.g. Q5_K_M/*. Empty: the whole repo.
+    ("MODEL_FILES", ""),
+    // Batch slots, and each slot verifying MTP proposals: two requests at
+    // once without queueing, 147 tok/s together (kb d166).
+    ("STRATA_PARALLEL", "2"),
+    ("STRATA_BATCH_MTP", "1"),
+    // The n-gram table: mmap (paged in as prompts need it, the fastest
+    // cold boot) or ram (read in at load). direct is refused: 13 MB/s
+    // random reads from network storage (kb f157).
+    ("STRATA_PLE_IO", "mmap"),
+    // 1: once serving, read the table's file into the page cache in the
+    // background.
+    ("STRATA_PLE_WARM", "1"),
+    // VRAM Strata keeps free; with 0.6 GiB free it warned that requests
+    // could stall (2026-08-06).
+    ("STRATA_VRAM_RESERVE_MIB", "1536"),
+    ("STRATA_KV", "int8"),
+    // The host RAM a Strata pod asks for (minRamPerGpu): the model's
+    // experts and table live in RAM. RunPod lists RTX PRO 6000 hosts from
+    // 62 GB. Not sent for vLLM, whose pod body stays rpctl's (kb d003).
+    ("MIN_RAM_GB", "150"),
     // --- transport --------------------------------------------------------
     // 1 = reach vLLM only through an SSH tunnel to the pod's direct TCP port.
     // RunPod's https://<pod>-<port>.proxy.runpod.net endpoints terminate TLS at

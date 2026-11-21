@@ -9,6 +9,8 @@ use viy_config::Config;
 use viy_config::Paths;
 use viy_config::config::PROFILE_KEYS;
 use viy_config::profiles;
+use viy_pod::engine;
+use viy_pod::engine::EngineName;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ModelAction {
@@ -100,14 +102,34 @@ pub fn cmd_model(
                 return Ok(());
             }
             say!("profile {name}  ({}):", path.display());
+            // The keys this profile's engine does not read (kb d162): its own
+            // ENGINE, else the one the rest of the config sets.
+            let mut engine_cfg = Config::defaults();
+            let written = data.get("ENGINE").map(String::as_str);
+            engine_cfg.set("ENGINE", written.or(cfg.get("ENGINE")).unwrap_or(""));
+            let engine = match EngineName::resolve(&engine_cfg) {
+                Ok(engine) => Some(engine),
+                Err(message) => {
+                    say!("  ! {message}");
+                    None
+                }
+            };
+            let line = |key: &str, value: &str| match engine {
+                Some(engine)
+                    if !value.is_empty() && engine::ignored_keys(engine).contains(&key) =>
+                {
+                    format!("  {key}={value}  (ignored with ENGINE={})", engine.as_str())
+                }
+                _ => format!("  {key}={value}"),
+            };
             for key in PROFILE_KEYS {
                 if let Some(value) = data.get(*key) {
-                    say!("  {key}={value}");
+                    say!("{}", line(key, value));
                 }
             }
             for (key, value) in &data {
                 if !PROFILE_KEYS.contains(&key.as_str()) {
-                    say!("  {key}={value}");
+                    say!("{}", line(key, value));
                 }
             }
         }

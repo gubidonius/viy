@@ -124,6 +124,7 @@ fn the_layers_merge_as_rpctl_merges_them() {
                     "BACKUP_VOLUME_TYPE",
                 ]
                 .contains(&k.as_str())
+                    && !ENGINE_KEYS.contains(&k.as_str())
             });
             assert_eq!(ours, expected, "{name} under {marker}");
         }
@@ -133,13 +134,24 @@ fn the_layers_merge_as_rpctl_merges_them() {
 /// rpctl's 112 keys (111 plus MTP_DRAFT_HEAD_QUANTIZATION at d528c14) but
 /// CHAT_AUTOSAVE: viy always saves chats, as Codex (kb d083); and viy's own
 /// CHAT_HEADER, the chat's header art, and CLIENT_TAG (kb d137),
-/// GPU_PREFERRED (kb d138) and BACKUP_VOLUME_TYPE (kb d139).
+/// GPU_PREFERRED (kb d138), BACKUP_VOLUME_TYPE (kb d139) and the serving
+/// engine's ENGINE_KEYS (kb d162).
 #[test]
 fn defaults_are_rpctls_keys_but_chat_autosave() {
-    assert_eq!(DEFAULTS.len(), 115);
-    assert_eq!(Config::defaults().iter().count(), 115);
+    assert_eq!(DEFAULTS.len(), 115 + ENGINE_KEYS.len());
+    assert_eq!(Config::defaults().iter().count(), 115 + ENGINE_KEYS.len());
+    assert_eq!(Config::defaults().get("ENGINE"), Some("vllm"));
     assert!(Config::defaults().get("CHAT_AUTOSAVE").is_none());
     assert_eq!(Config::defaults().get("CHAT_HEADER"), Some("1"));
+}
+
+#[test]
+fn the_engine_keys_are_engine_and_stratas() {
+    assert_eq!(ENGINE_KEYS[0], "ENGINE");
+    assert_eq!(&ENGINE_KEYS[1..], STRATA_KEYS);
+    for key in ENGINE_KEYS {
+        assert!(DEFAULTS.iter().any(|(k, _)| k == key), "{key}");
+    }
 }
 
 #[test]

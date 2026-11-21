@@ -26,6 +26,27 @@ pub use boot::build_boot_script;
 pub use boot::build_pod_body;
 pub use boot::build_vllm_args;
 
+/// The config keys only vLLM reads: its arguments and the boot script's
+/// cache and warmup switches. Another engine ignores them, which `viy model
+/// show` says. Not MAX_NUM_SEQS, which explore's parallel default reads
+/// too.
+pub const OWN_KEYS: &[&str] = &[
+    "VLLM_IMAGE",
+    "GPU_MEMORY_UTILIZATION",
+    "MAX_IMAGES_PER_PROMPT",
+    "TOOL_CALL_PARSER",
+    "PREFIX_CACHING",
+    "KV_CACHE_DTYPE",
+    "MTP_SPECULATIVE_TOKENS",
+    "MTP_DRAFT_HEAD_QUANTIZATION",
+    "TRUST_REMOTE_CODE",
+    "SAFETENSORS_LOAD_STRATEGY",
+    "WEIGHTS_PREWARM",
+    "MM_WARMUP",
+    "STARTUP_CACHE",
+    "MODEL_CACHE_MODE",
+];
+
 /// The vLLM engine.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Vllm;

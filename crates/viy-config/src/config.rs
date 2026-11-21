@@ -39,6 +39,39 @@ pub const PROFILE_KEYS: &[&str] = &[
     "ENDPOINT_URL",
     "ENDPOINT_MODEL",
     "LOCAL_VLLM_PORT",
+    // viy's own (kb d162): which engine serves the model, and what it
+    // fetches. Not STRATA_IMAGE or MIN_RAM_GB: `viy model add` would copy
+    // them, and a profile would keep an image pinned before a newer one.
+    "ENGINE",
+    "MODEL_FILES",
+];
+
+/// The serving engine's keys, viy only (kb d162): `ENGINE`, and what
+/// `ENGINE=strata` reads that vLLM does not ([`STRATA_KEYS`]).
+pub const ENGINE_KEYS: &[&str] = &[
+    "ENGINE",
+    "STRATA_IMAGE",
+    "MODEL_FILES",
+    "STRATA_PARALLEL",
+    "STRATA_BATCH_MTP",
+    "STRATA_PLE_IO",
+    "STRATA_PLE_WARM",
+    "STRATA_VRAM_RESERVE_MIB",
+    "STRATA_KV",
+    "MIN_RAM_GB",
+];
+
+/// The keys only `ENGINE=strata` reads; vLLM ignores them.
+pub const STRATA_KEYS: &[&str] = &[
+    "STRATA_IMAGE",
+    "MODEL_FILES",
+    "STRATA_PARALLEL",
+    "STRATA_BATCH_MTP",
+    "STRATA_PLE_IO",
+    "STRATA_PLE_WARM",
+    "STRATA_VRAM_RESERVE_MIB",
+    "STRATA_KV",
+    "MIN_RAM_GB",
 ];
 
 /// The ask_claude keys a project file may only make stricter.

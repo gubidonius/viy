@@ -20,6 +20,16 @@ pub fn for_config(cfg: &Config) -> Result<&'static dyn Engine, String> {
     }
 }
 
+/// The config keys the engine `name` does not read: the other engine's own.
+/// Strata's are viy-config's `STRATA_KEYS` until viy-strata lists them
+/// (WP 9.24).
+pub fn ignored_keys(name: EngineName) -> &'static [&'static str] {
+    match name {
+        EngineName::Vllm => viy_config::config::STRATA_KEYS,
+        EngineName::Strata => viy_vllm::OWN_KEYS,
+    }
+}
+
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;

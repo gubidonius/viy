@@ -39,6 +39,25 @@ fn vllms_body_through_the_seam_is_viy_vllms_own() {
 }
 
 #[test]
+fn each_engine_ignores_the_others_keys() {
+    assert!(ignored_keys(EngineName::Vllm).contains(&"STRATA_PARALLEL"));
+    assert!(!ignored_keys(EngineName::Vllm).contains(&"VLLM_IMAGE"));
+    assert!(ignored_keys(EngineName::Strata).contains(&"VLLM_IMAGE"));
+    assert!(!ignored_keys(EngineName::Strata).contains(&"MODEL_FILES"));
+    // what both read is in neither list
+    for key in [
+        "MODEL_REPO",
+        "MAX_MODEL_LEN",
+        "POD_NAME",
+        "CUDA_VERSIONS",
+        "ENGINE",
+    ] {
+        assert!(!ignored_keys(EngineName::Vllm).contains(&key), "{key}");
+        assert!(!ignored_keys(EngineName::Strata).contains(&key), "{key}");
+    }
+}
+
+#[test]
 fn strata_is_refused_until_it_is_built() {
     assert_eq!(
         for_config(&with_engine("strata")).err(),
