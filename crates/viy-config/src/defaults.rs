@@ -168,11 +168,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // own release image; VLLM_IMAGE, TOOL_CALL_PARSER, GPU_MEMORY_UTILIZATION
     // and the MTP and cache keys are then ignored (kb d162).
     ("ENGINE", "vllm"),
-    // Strata's release, by tag and digest; a new one is measured before it
-    // is pinned here (kb d163, d170).
+    // The image of a Strata pod: RunPod's stock one, which their hosts have
+    // (4-56 s to the container; Strata's own ghcr.io image took 932.7 s).
+    // Strata runs from its pinned release archives on the volume (kb d172).
     (
         "STRATA_IMAGE",
-        "ghcr.io/niko1221/strata:0.2.16-cuda13@sha256:acc0feffeef9d4123e3928537300357908937de530d53771053b6db57129a0c1",
+        "runpod/pytorch:1.0.3-cu1281-torch280-ubuntu2404",
     ),
     // For a GGUF repo, the files of MODEL_REPO to fetch (`hf download
     // --include`), e.g. Q5_K_M/*. Empty: the whole repo.
