@@ -193,6 +193,12 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // could stall (2026-08-06).
     ("STRATA_VRAM_RESERVE_MIB", "1536"),
     ("STRATA_KV", "int8"),
+    // off: Strata maps its expert arena (85.55 GiB in host RAM) without
+    // transparent huge pages (STRATA_NO_ARENA_THP=1); auto: Strata asks for
+    // them when enough free 2 MiB blocks show. One boot spent about 245 s
+    // before reading the experts on a host whose memory compaction mostly
+    // failed (kb f169); Strata warns compaction can stall its load (kb d175).
+    ("STRATA_HUGE_PAGES", "off"),
     // The host RAM a Strata pod asks for (minRamPerGpu): the model's
     // experts and table live in RAM. RunPod lists RTX PRO 6000 hosts from
     // 62 GB. Not sent for vLLM, whose pod body stays rpctl's (kb d003).

@@ -34,6 +34,10 @@ pub const PLE_IO: &[&str] = &["mmap", "ram"];
 /// Strata's KV formats.
 pub const KV: &[&str] = &["int8", "q4_0", "k8v4", "fp16"];
 
+/// The expert arena's transparent huge pages: `auto` leaves the choice to
+/// Strata, `off` sets its `STRATA_NO_ARENA_THP` (kb d175).
+pub const HUGE_PAGES: &[&str] = &["auto", "off"];
+
 fn one_of<'a>(
     cfg: &'a Config,
     key: &'static str,
@@ -131,6 +135,10 @@ pub fn settings(cfg: &Config) -> Result<Vec<(&'static str, String)>, BadValue> {
         (
             "STRATA_KV",
             one_of(cfg, "STRATA_KV", KV, "int8, q4_0, k8v4 or fp16")?.to_string(),
+        ),
+        (
+            "STRATA_HUGE_PAGES",
+            one_of(cfg, "STRATA_HUGE_PAGES", HUGE_PAGES, "auto or off")?.to_string(),
         ),
         ("STRATA_HOST", host.to_string()),
         (

@@ -76,6 +76,7 @@ fn the_settings_are_exported_before_the_script() {
         "export STRATA_PLE_WARM=1",
         "export STRATA_VRAM_RESERVE_MIB=1536",
         "export STRATA_KV=int8",
+        "export STRATA_HUGE_PAGES=off",
         "export STRATA_HOST=127.0.0.1",
         "export RPCTL_PORT=8000",
         "export RPCTL_CACHE_DIR=/workspace/rpctl-cache",
@@ -130,6 +131,11 @@ fn bad_settings_are_refused_before_a_pod_is_made() {
             "STRATA_KV",
             "bf16",
             r#"STRATA_KV must be int8, q4_0, k8v4 or fp16, not "bf16""#,
+        ),
+        (
+            "STRATA_HUGE_PAGES",
+            "on",
+            r#"STRATA_HUGE_PAGES must be auto or off, not "on""#,
         ),
         (
             "STRATA_PARALLEL",
@@ -214,5 +220,5 @@ fn strata_pod_passes_its_tests() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("Ran 38 tests"), "{stderr}");
+    assert!(stderr.contains("Ran 39 tests"), "{stderr}");
 }

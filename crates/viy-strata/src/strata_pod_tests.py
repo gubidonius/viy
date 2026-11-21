@@ -345,7 +345,8 @@ READY = {"version": "0.2.16", "repo": "org/M-GGUF", "files": "Q5_K_M/*",
 ENV = {"STRATA_PARALLEL": "2", "STRATA_BATCH_MTP": "1", "STRATA_PLE_IO": "mmap",
        "STRATA_VRAM_RESERVE_MIB": "1536", "STRATA_KV": "int8", "STRATA_MAX_CONTEXT": "131072",
        "STRATA_MODEL_NAME": "flash", "STRATA_HOST": "127.0.0.1", "RPCTL_PORT": "8000",
-       "VLLM_API_KEY": "sk-SYNTHETIC", "STRATA_ENGINE_LOG": "/workspace/strata-engine.log"}
+       "VLLM_API_KEY": "sk-SYNTHETIC", "STRATA_ENGINE_LOG": "/workspace/strata-engine.log",
+       "STRATA_HUGE_PAGES": "off"}
 
 
 class SettingsTests(unittest.TestCase):
@@ -365,6 +366,13 @@ class SettingsTests(unittest.TestCase):
         # no MCP servers: the key absent, as Strata's server wants (a list stops it)
         self.assertNotIn("mcp_servers", cfg)
         self.assertFalse(cfg["lazy_load"])
+        # the expert arena without transparent huge pages, through the config's env
+        self.assertEqual(cfg["env"], {"STRATA_NO_ARENA_THP": "1"})
+
+    def test_huge_pages_auto_leaves_strata_to_choose(self):
+        for env in (dict(ENV, STRATA_HUGE_PAGES="auto"),
+                    {k: v for k, v in ENV.items() if k != "STRATA_HUGE_PAGES"}):
+            self.assertNotIn("env", pod.settings(READY, env))
 
     def test_ram_one_slot_and_no_draft_head(self):
         ready = dict(READY, mtp=None)
@@ -381,7 +389,8 @@ class SettingsTests(unittest.TestCase):
         self.assertNotIn("--ple-io", cfg["args"])
 
     def test_direct_and_unknown_formats_are_refused(self):
-        for key, value in (("STRATA_PLE_IO", "direct"), ("STRATA_KV", "bf16")):
+        for key, value in (("STRATA_PLE_IO", "direct"), ("STRATA_KV", "bf16"),
+                           ("STRATA_HUGE_PAGES", "on")):
             with self.assertRaises(SystemExit):
                 pod.settings(READY, dict(ENV, **{key: value}))
 

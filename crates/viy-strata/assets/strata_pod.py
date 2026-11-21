@@ -42,6 +42,7 @@ REST = "https://rest.runpod.io/v1"
 HF_HUB = "huggingface_hub[hf_xet]==2.4.0"
 PLE_TENSOR = "per_layer_token_embd"
 KV_FORMATS = ("int8", "q4_0", "k8v4", "fp16")
+HUGE_PAGES = ("auto", "off")
 RUN_CONFIG = Path("/run/strata-run.json")
 # While this file exists the volume is being prepared, which the idle watchdog counts as
 # activity for at most PREPARE_GRACE_S from its creation (the hard cap still applies).
@@ -311,6 +312,9 @@ def settings(ready, environ=os.environ):
     kv = get("STRATA_KV") or "int8"
     if kv not in KV_FORMATS:
         raise SystemExit(f"strata_pod: STRATA_KV must be one of {', '.join(KV_FORMATS)}, not {kv!r}")
+    huge = get("STRATA_HUGE_PAGES") or "auto"
+    if huge not in HUGE_PAGES:
+        raise SystemExit(f"strata_pod: STRATA_HUGE_PAGES must be auto or off, not {huge!r}")
     args = ["--pack", ready["pack"], "--native", ready["trunk"]]
     if ready.get("ple"):
         args += ["--ple-gguf", ready["ple"]]
@@ -332,6 +336,11 @@ def settings(ready, environ=os.environ):
            "api_key": get("VLLM_API_KEY", ""), "lazy_load": False}
     if parallel > 1:
         cfg["parallel"] = parallel
+    if huge == "off":
+        # The engine's environment, as Strata's own setup writes it (setup_config.py):
+        # the expert arena without transparent huge pages, whose compaction can stall
+        # the load on a host short of free 2 MiB blocks (Strata #2126).
+        cfg["env"] = {"STRATA_NO_ARENA_THP": "1"}
     return cfg
 
 

@@ -58,6 +58,7 @@ pub const ENGINE_KEYS: &[&str] = &[
     "STRATA_PLE_WARM",
     "STRATA_VRAM_RESERVE_MIB",
     "STRATA_KV",
+    "STRATA_HUGE_PAGES",
     "MIN_RAM_GB",
 ];
 
@@ -71,6 +72,7 @@ pub const STRATA_KEYS: &[&str] = &[
     "STRATA_PLE_WARM",
     "STRATA_VRAM_RESERVE_MIB",
     "STRATA_KV",
+    "STRATA_HUGE_PAGES",
     "MIN_RAM_GB",
 ];
 
