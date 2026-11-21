@@ -162,6 +162,8 @@ struct Summary {
     /// The newest line summarised so far.
     newest: Option<DateTime<Utc>>,
     failure: Option<String>,
+    /// When the host first said it cannot mount the network volume.
+    volume_refused_since: Option<DateTime<Utc>>,
     /// The last fetch met RunPod's rate limit, which holds until then:
     /// the log is out of reach, and what it showed last is stale.
     limited_until: Option<Instant>,
@@ -224,6 +226,10 @@ impl Progress {
     }
 }
 
+/// How long a host may refuse to mount the network volume before the wait
+/// ends: two of its retries and a little.
+const VOLUME_REFUSED_FOR_S: i64 = 60;
+
 /// Lines of an image pull. A pull writes a "<layer> Downloading" line
 /// several times a second, so the 30-line window rarely holds anything else.
 const PULL_WORDS: [&str; 8] = [
@@ -276,6 +282,30 @@ impl Summary {
                     "SSH setup failed; run viy logs for the installation/daemon error.".into(),
                 );
                 return;
+            }
+            // A host that cannot mount the network volume says so every
+            // ~26 s and never starts the container (EUR-IS-1, 2026-08-08:
+            // for 10 and 4 minutes on two hosts while the volume existed,
+            // kb f160); a minute of it ends the wait, which would otherwise
+            // bill until the timeout.
+            if source == Some("system")
+                && line.contains("network volume")
+                && line.contains("must exist")
+                && let Some(at) = entry.time()
+            {
+                let since = *self.volume_refused_since.get_or_insert(at);
+                if at - since >= chrono::TimeDelta::seconds(VOLUME_REFUSED_FOR_S) {
+                    self.failure = Some(format!(
+                        "RunPod's host cannot mount the network volume ({}), so the container \
+                         never starts. The pod is billing: viy down, then viy up again for \
+                         another host.",
+                        line.rsplit("error creating container: ")
+                            .next()
+                            .unwrap_or(line)
+                            .trim()
+                    ));
+                    return;
+                }
             }
             // Lines come oldest first, so a later boot clears an earlier ready.
             if line.contains("=== boot ")

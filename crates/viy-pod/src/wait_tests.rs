@@ -1240,6 +1240,49 @@ async fn image_pull_is_reported_not_hidden_behind_sshd() {
     );
 }
 
+/// A host that cannot mount the network volume ends the wait after a
+/// minute of saying so; a single such line does not (kb f160).
+#[tokio::test]
+async fn a_host_that_cannot_mount_the_volume_ends_the_wait() {
+    let refused = |times: &[&str]| {
+        let body: String = times
+            .iter()
+            .map(|ts| {
+                format!(
+                    "data: {}\n",
+                    json!({"ts": ts, "source": "system", "line": "error creating container: cant \
+                        create container; network volume \"vol222\" must exist"})
+                )
+            })
+            .collect();
+        Reply::answer(200, body)
+    };
+    let once = refused(&["2026-08-08T06:52:05Z"]);
+    let minute = refused(&[
+        "2026-08-08T06:52:05Z",
+        "2026-08-08T06:52:31Z",
+        "2026-08-08T06:52:57Z",
+        "2026-08-08T06:53:23Z",
+    ]);
+    for (reply, fails) in [(once, false), (minute, true)] {
+        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))));
+        let progress = Progress::new(&rp, "pod111", true);
+        progress.refresh().await;
+        match progress.poll() {
+            Err(WaitError::Startup(message)) => {
+                assert!(fails);
+                assert_eq!(
+                    message,
+                    "RunPod's host cannot mount the network volume (cant create container; \
+                     network volume \"vol222\" must exist), so the container never starts. The \
+                     pod is billing: viy down, then viy up again for another host."
+                );
+            }
+            other => assert!(!fails, "{other:?}"),
+        }
+    }
+}
+
 /// A Strata pod's boot: its watch helper's "model ready" marks it ready,
 /// and a later "starting Strata" (a restarted container) clears that.
 #[tokio::test]
