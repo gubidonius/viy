@@ -209,6 +209,22 @@ async fn a_vllm_that_never_serves_is_left_running() {
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
 }
 
+/// The local backend runs vLLM; an engine viy cannot run starts nothing.
+#[tokio::test(start_paused = true)]
+async fn up_refuses_an_engine_it_cannot_run() {
+    let machine = Machine::new(200, []);
+    let mut cfg = machine.cfg.clone();
+    cfg.set("ENGINE", "strata");
+    let error = up(&machine.env(), &mut cfg, Duration::from_secs(10), &|_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.24)"
+    );
+    assert!(!machine.paths.local_state_file().exists());
+}
+
 #[tokio::test(start_paused = true)]
 async fn up_finds_a_running_vllm_or_says_where_vllm_is_missing() {
     let machine = Machine::new(200, []);

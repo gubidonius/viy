@@ -44,6 +44,7 @@ use crate::api::shown;
 use crate::api::spoken;
 use crate::bootreport::Outcome;
 use crate::bootreport::Timeline;
+use crate::engine;
 use crate::failover::Creation;
 use crate::failover::User;
 use crate::idle;
@@ -271,6 +272,9 @@ async fn up_until(
     report: Reporter<'_>,
     ask: Asker<'_>,
 ) -> Result<(), CommandError> {
+    // An engine viy cannot run stops `up` before a pod is resumed or reused
+    // and before a volume is made, so nothing billed is left behind.
+    engine::for_config(cfg).map_err(CommandError::Exit)?;
     let _lock = PodLock::exclusive(env.paths, "up")?;
     let mut started = Instant::now();
     let mut started_wall = env.time.now();

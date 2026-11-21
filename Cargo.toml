@@ -3,6 +3,7 @@ members = [
     "crates/viy",
     "crates/viy-agent",
     "crates/viy-config",
+    "crates/viy-engine",
     "crates/viy-exec",
     "crates/viy-http",
     "crates/viy-pod",
@@ -11,6 +12,7 @@ members = [
     "crates/viy-testkit",
     "crates/viy-time",
     "crates/viy-tools",
+    "crates/viy-vllm",
 ]
 resolver = "3"
 
@@ -27,6 +29,7 @@ repository = "https://github.com/gubidonius/viy"
 # Internal
 viy-agent = { path = "crates/viy-agent", version = "0.3.0" }
 viy-config = { path = "crates/viy-config", version = "0.3.0" }
+viy-engine = { path = "crates/viy-engine", version = "0.3.0" }
 viy-exec = { path = "crates/viy-exec", version = "0.3.0" }
 viy-http = { path = "crates/viy-http", version = "0.3.0" }
 viy-pod = { path = "crates/viy-pod", version = "0.3.0" }
@@ -35,6 +38,7 @@ viy-term = { path = "crates/viy-term", version = "0.3.0" }
 viy-testkit = { path = "crates/viy-testkit", version = "0.3.0" }
 viy-time = { path = "crates/viy-time", version = "0.3.0" }
 viy-tools = { path = "crates/viy-tools", version = "0.3.0" }
+viy-vllm = { path = "crates/viy-vllm", version = "0.3.0" }
 
 # External crates are added when a work package first needs one, each version
 # recorded as a fact (ROADMAP phase 0).

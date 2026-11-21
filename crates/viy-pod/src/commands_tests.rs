@@ -585,6 +585,26 @@ async fn tunnel_mode_without_an_ssh_key_creates_nothing() {
     assert!(!home.sent().iter().any(|r| r.starts_with("POST")));
 }
 
+/// An engine viy cannot run is refused before RunPod is asked anything:
+/// no stopped pod resumed, no volume made and left behind.
+#[tokio::test(start_paused = true)]
+async fn up_refuses_an_engine_it_cannot_run_before_asking_runpod() {
+    for (engine, said) in [
+        (
+            "strata",
+            "ENGINE=strata is not built yet (docs/strata-engine.md, WP 9.24)",
+        ),
+        ("vlm", "unknown ENGINE 'vlm'; supported: strata, vllm"),
+    ] {
+        let mut home = Home::new(tracked(false), runpod("EXITED"));
+        home.cfg.set("ENGINE", engine);
+        let told = Told::default();
+        let error = run_up(&mut home, &told).await.unwrap_err();
+        assert_eq!(error.to_string(), said);
+        assert_eq!(home.sent(), Vec::<String>::new());
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn up_creates_nothing_when_runpod_cannot_say_whether_a_pod_exists() {
     let mut home = Home::new(None, |_| Reply::answer(503, "down"));

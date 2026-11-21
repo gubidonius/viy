@@ -28,7 +28,8 @@ fn main() -> Result<(), String> {
         return Err("VLLM_API_KEY is not set in viy's config".into());
     }
     let pubkey = viy_pod::ssh::find_ssh_pubkey(&paths).map_err(|e| e.to_string())?;
-    let mut body = viy_pod::boot::build_pod_body(&cfg, &key, volume, pubkey.as_deref())
+    let mut body = viy_pod::engine::for_config(&cfg)?
+        .pod_body(&cfg, &key, volume, pubkey.as_deref())
         .map_err(|e| e.to_string())?;
     body["dataCenterIds"] = json!([region]);
     body["networkVolumeId"] = json!(volume);

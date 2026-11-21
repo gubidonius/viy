@@ -2789,6 +2789,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "viy-engine"
+version = "0.3.0"
+dependencies = [
+ "pretty_assertions",
+ "serde_json",
+ "thiserror 2.0.21",
+ "viy-config",
+]
+
+[[package]]
 name = "viy-exec"
 version = "0.3.0"
 dependencies = [
@@ -2820,11 +2830,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "viy-config",
+ "viy-engine",
  "viy-exec",
  "viy-http",
  "viy-protocol",
  "viy-testkit",
  "viy-time",
+ "viy-vllm",
 ]
 
 [[package]]
@@ -2912,6 +2924,17 @@ dependencies = [
  "viy-exec",
  "viy-http",
  "viy-protocol",
+ "viy-testkit",
+]
+
+[[package]]
+name = "viy-vllm"
+version = "0.3.0"
+dependencies = [
+ "pretty_assertions",
+ "serde_json",
+ "viy-config",
+ "viy-engine",
  "viy-testkit",
 ]
 

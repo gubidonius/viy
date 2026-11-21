@@ -1,15 +1,16 @@
-//! The pod: RunPod REST (v2, read as v1) and GraphQL, pod tracking by `POD_NAME`, the boot
-//! script and create-pod body built byte for byte like rpctl's, the embedded
-//! `startup.py`, the SSH tunnel with its pinned host key, readiness waits, the
-//! boot report, regions and backup, the network volume, idle stamp, reap and
-//! shutdown, and the `runpod`, `openai` and `local` backends (ROADMAP
-//! phase 2). The pod side itself is not ported (kb d003).
+//! The pod: RunPod REST (v2, read as v1) and GraphQL, pod tracking by `POD_NAME`, the
+//! create-pod body from the engine `ENGINE` names ([`engine`]; vLLM's boot
+//! script, embedded `startup.py` and stage table are in viy-vllm, kb d171), the SSH tunnel
+//! with its pinned host key, readiness waits, the boot report, regions and
+//! backup, the network volume, idle stamp, reap and shutdown, and the
+//! `runpod`, `openai` and `local` backends (ROADMAP phase 2). The pod side
+//! itself is not ported (kb d003).
 
 pub mod api;
 pub mod backend;
-pub mod boot;
 pub mod bootreport;
 pub mod commands;
+pub mod engine;
 pub mod failover;
 pub mod idle;
 pub mod local;

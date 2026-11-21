@@ -12,6 +12,7 @@ use serde_json::json;
 use viy_config::Config;
 use viy_config::config::gpu_type_list;
 use viy_config::config::tunnel_enabled;
+pub use viy_engine::BadNumber;
 
 /// rpctl's `startup.py` at the pinned commit, unchanged: the boot script
 /// writes it to `/run/rpctl-startup.py`, which applies the boot-time
@@ -30,16 +31,6 @@ pub const HOSTKEY: &str = "/workspace/.sshd/ssh_host_ed25519_key";
 /// persisted identity.
 pub const RUNTIME_HOSTKEY_DIR: &str = "/run/rpctl-sshd";
 pub const RUNTIME_HOSTKEY: &str = "/run/rpctl-sshd/ssh_host_ed25519_key";
-
-/// A config value the create-pod body needs as a number but that is not
-/// one. rp stops with Python's exception here; viy names the key (kb d047).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{key} must be {kind}, not {value:?}")]
-pub struct BadNumber {
-    pub key: &'static str,
-    pub value: String,
-    kind: &'static str,
-}
 
 /// The value of `key`; every key boot.py indexes is in DEFAULTS.
 fn at<'a>(cfg: &'a Config, key: &str) -> &'a str {

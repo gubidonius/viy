@@ -1,5 +1,5 @@
 """rpctl's tests of startup.py, run on the copy viy embeds
-(crates/viy-pod/assets/startup.py, kb d003). startup.py stays Python, so its
+(crates/viy-vllm/assets/startup.py, kb d003). startup.py stays Python, so its
 tests do too; the Rust test boot_tests.rs::startup_py_passes_its_tests runs
 this file with python3 under cargo test.
 
@@ -10,7 +10,7 @@ Only the import differs. The hash in test_foreground_cache_code_is_unchanged
 is rpctl's approved value (flags.md F17): a different hash means the
 foreground cache code changed, which needs a measured boot first.
 
-    python3 -I crates/viy-pod/src/startup_tests.py
+    python3 -I crates/viy-vllm/src/startup_tests.py
 """
 import hashlib
 import importlib.util

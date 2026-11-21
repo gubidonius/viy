@@ -629,7 +629,7 @@ fn the_real_create_requests_fit_v2s_size_limit() {
         "rpa_SYNTHETICWATCHDOG000000000000",
     );
     let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAISYNTHETICSYNTHETICSYNTHETICSYNTHETIC x";
-    let body = crate::boot::build_pod_body(&cfg, "sk-SYNTHETIC", "vol222", Some(key)).unwrap();
+    let body = viy_vllm::build_pod_body(&cfg, "sk-SYNTHETIC", "vol222", Some(key)).unwrap();
     for request in crate::wire::pod_requests(&body) {
         let size = request.to_string().len();
         assert!(size < 102_400, "{size} bytes");

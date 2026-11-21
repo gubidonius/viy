@@ -95,7 +95,7 @@ fn a_volume_reads_data_center_as_v1s_id() {
     );
 }
 
-/// rpctl's create body, as `boot::build_pod_body` and failover make it.
+/// rpctl's create body, as `viy_vllm::build_pod_body` and failover make it.
 fn v1_body() -> Value {
     json!({
         "name": "qwen38-abliterated", "imageName": "vllm/vllm-openai:v0.33.0",

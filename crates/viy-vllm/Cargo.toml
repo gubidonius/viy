@@ -1,0 +1,25 @@
+[package]
+name = "viy-vllm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "viy's vLLM engine: the vLLM arguments, the pod's boot script and the embedded startup.py"
+license-file.workspace = true
+repository.workspace = true
+
+[lib]
+name = "viy_vllm"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+viy-config = { workspace = true }
+viy-engine = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+viy-testkit = { workspace = true }

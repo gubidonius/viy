@@ -30,9 +30,9 @@ use viy_http::Request;
 use viy_http::user_agent;
 
 use crate::backend::Backend;
-use crate::boot::build_vllm_args;
 use crate::commands::CommandError;
 use crate::commands::Env;
+use crate::engine;
 use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
@@ -42,6 +42,7 @@ use crate::wait::Probe;
 use crate::wait::Step;
 use crate::wait::WaitError;
 use crate::wait::wait_with_clock;
+use viy_vllm::build_vllm_args;
 
 /// vLLM's /health is asked this often while it loads.
 const POLL: Duration = Duration::from_secs(3);
@@ -149,6 +150,8 @@ pub async fn up(
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
     let print = |text: String| say(report, Tone::Plain, text);
+    // The local backend runs vLLM; an engine viy cannot run starts nothing.
+    engine::for_config(cfg).map_err(CommandError::Exit)?;
     if let Some(pid) = alive(env.paths) {
         print(format!(
             "local vLLM already running (pid {pid}) at {}",

@@ -47,11 +47,11 @@ use viy_protocol::Question;
 
 use crate::api::RunPod;
 use crate::api::RunPodError;
-use crate::boot::build_pod_body;
 use crate::commands::CommandError;
 use crate::commands::Env;
 use crate::commands::Interrupt;
 use crate::commands::alert;
+use crate::engine;
 use crate::notice::Asker;
 use crate::notice::Reporter;
 use crate::notice::Tone;
@@ -220,7 +220,9 @@ impl<'a> Creation<'a> {
     ) -> Result<Created, CommandError> {
         let primary = self.primary.clone();
         // Only dataCenterIds and networkVolumeId differ between requests.
-        self.body = build_pod_body(self.cfg, self.vllm_key, volume_id, self.pubkey)
+        self.body = engine::for_config(self.cfg)
+            .map_err(CommandError::Exit)?
+            .pod_body(self.cfg, self.vllm_key, volume_id, self.pubkey)
             .map_err(|e| CommandError::Exit(e.to_string()))?;
         let first = self.first();
         let mut refused = match self
@@ -282,7 +284,9 @@ impl<'a> Creation<'a> {
     pub async fn run_on_backup(mut self) -> Result<Created, CommandError> {
         self.requested = true;
         // Only dataCenterIds and networkVolumeId differ between requests.
-        self.body = build_pod_body(self.cfg, self.vllm_key, "", self.pubkey)
+        self.body = engine::for_config(self.cfg)
+            .map_err(CommandError::Exit)?
+            .pod_body(self.cfg, self.vllm_key, "", self.pubkey)
             .map_err(|e| CommandError::Exit(e.to_string()))?;
         let (message, capacity) = match self.failover("").await {
             Ok(won) => {

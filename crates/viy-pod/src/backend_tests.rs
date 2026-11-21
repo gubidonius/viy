@@ -16,8 +16,8 @@ use viy_testkit::scratch::ScratchDir;
 use viy_testkit::time::FakeTime;
 
 use super::*;
-use crate::boot::build_vllm_args;
 use crate::notice::Report;
+use viy_vllm::build_vllm_args;
 
 fn cfg_with(pairs: &[(&str, &str)]) -> Config {
     let mut cfg = Config::defaults();

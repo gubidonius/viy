@@ -1,0 +1,24 @@
+[package]
+name = "viy-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "viy's seam between the pod code and the serving engines (vLLM, Strata)"
+license-file.workspace = true
+repository.workspace = true
+
+[lib]
+name = "viy_engine"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+viy-config = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

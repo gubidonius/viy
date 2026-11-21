@@ -28,10 +28,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 viy-config = { workspace = true }
+viy-engine = { workspace = true }
 viy-exec = { workspace = true }
 viy-http = { workspace = true }
 viy-protocol = { workspace = true }
 viy-time = { workspace = true }
+viy-vllm = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

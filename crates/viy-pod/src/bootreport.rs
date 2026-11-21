@@ -66,54 +66,20 @@ pub const BOOT_KEYS: [&str; 26] = [
     "MAX_POD_HOURS",
 ];
 
-/// (key, label, the log text that ends the stage). Each stage runs from the
-/// end of the previous one; a missing marker folds its time into the next
-/// stage, so a vLLM that rewords a line shows as one stage absorbing
-/// another.
-pub const STAGES: [(&str, &str, &str); 9] = [
-    ("pull", "GPU allocation + image pull", "=== boot "),
-    (
-        "prepare",
-        "boot script (caches, sshd)",
-        "RPCTL_PHASE starting vLLM",
-    ),
-    ("imports", "vLLM CLI imports", "non-default args"),
-    ("api_init", "config, processor, engine spawn", "world_size="),
-    (
-        "engine_init",
-        "engine: CUDA + processor init",
-        "Starting to load model",
-    ),
-    ("weights", "weights to GPU", "Model loading took"),
-    (
-        "compile",
-        "encoder profiling + compile",
-        "torch.compile took",
-    ),
-    ("engine", "KV cache + CUDA graphs", "init engine (profile"),
-    ("api", "API server warmup", "HTTP server started"),
-];
+/// vLLM's stages, from viy-vllm with the boot script that prints their
+/// markers (kb d171).
+pub use viy_vllm::stages::STAGES;
 
 /// The last stage, measured on this machine: up to the local 200.
 pub const LOCAL_STAGE: (&str, &str) = ("endpoint", "SSH tunnel / local endpoint");
 
-/// What to check when a stage is the biggest share of an overrun.
+/// What to check when a stage is the biggest share of an overrun: the
+/// engine's own stages from its crate, the local one here.
 fn hint(key: &str) -> &'static str {
-    match key {
-        "pull" => {
-            "the host had to download the image; keep VLLM_IMAGE on the stock Docker Hub \
-             vllm/vllm-openai image"
-        }
-        "prepare" => "something in the boot script ran in the foreground before vLLM",
-        "imports" => "vLLM's Python imports; check for a new image or new vLLM arguments",
-        "api_init" => "API-server config/processor load; check for new vLLM arguments",
-        "engine_init" => "engine CUDA and processor init",
-        "weights" => "network-volume read; check the 'weights prewarmed' line in viy logs",
-        "compile" => "compile cache missed; the first boot on a new GPU type compiles once",
-        "engine" => "KV-cache profiling or CUDA graph capture (warmup after a compile miss)",
-        "api" => "API-server warmup; check MM_WARMUP is 0",
-        "endpoint" => "sshd or the tunnel came up late",
-        _ => "",
+    if key == LOCAL_STAGE.0 {
+        "sshd or the tunnel came up late"
+    } else {
+        viy_vllm::stages::hint(key)
     }
 }
 

@@ -521,7 +521,7 @@ impl RunPod {
         }
     }
 
-    /// A pod from rpctl's v1 create body ([`crate::boot::build_pod_body`]):
+    /// A pod from rpctl's v1 create body (`viy_vllm::build_pod_body`):
     /// one v2 request per GPU type of its `gpuTypeIds`, in order, until one
     /// is placed. A type refused for capacity (400) or not open to this
     /// account (403) passes to the next, as RunPod's v2 guide has it; any
