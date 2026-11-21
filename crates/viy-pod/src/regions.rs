@@ -207,6 +207,17 @@ pub fn log_failure(
     append(paths, &paths.up_failures_file(), &row);
 }
 
+/// The refused pod creations logged at or after `since` (ISO time). A
+/// refused resume (role `resume`, kb d176) is one host's GPU, not a
+/// region's capacity, so it is left out.
+pub(crate) fn refused_creations(paths: &Paths, since: &str) -> Vec<Value> {
+    rows(&paths.up_failures_file())
+        .into_iter()
+        .filter(|r| text(r, "at").unwrap_or("") >= since)
+        .filter(|r| text(r, "role") != Some("resume"))
+        .collect()
+}
+
 // ------------------------------------------------------------ backup volume
 
 pub fn backup_name(cfg: &Config) -> String {
@@ -874,10 +885,7 @@ pub async fn backup(
     }
 
     let month = iso(now - f64::from(HISTORY_DAYS) * DAY_S);
-    let refused: Vec<Value> = rows(&env.paths.up_failures_file())
-        .into_iter()
-        .filter(|r| text(r, "at").unwrap_or("") >= month.as_str())
-        .collect();
+    let refused = refused_creations(env.paths, &month);
     if !refused.is_empty() {
         let mut by: IndexMap<String, usize> = IndexMap::new();
         for row in refused

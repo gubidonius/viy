@@ -407,6 +407,177 @@ async fn up_resumes_a_stopped_pod_and_records_its_boot() {
     assert_eq!(home.exec.sent()[0].argv()[1], "capture-boot");
 }
 
+/// A stopped pod whose host's GPUs are taken: RunPod refuses the start
+/// with 400 (kb f175, f181), so `up` logs the refusal, terminates the
+/// stopped pod and creates one on the network volume, as with no pod.
+#[tokio::test(start_paused = true)]
+async fn up_replaces_a_stopped_pod_whose_gpu_is_taken() {
+    let deleted = Arc::new(Mutex::new(false));
+    let gone = Arc::clone(&deleted);
+    let mut home = Home::new(tracked(false), move |r: &viy_http::Request| {
+        let url = r.url.as_str();
+        if url.ends_with("/pods/pod111") && r.method == Method::DELETE {
+            *gone.lock().unwrap() = true;
+            Reply::answer(204, "")
+        } else if url.ends_with("/pods/pod111") {
+            assert!(!*gone.lock().unwrap(), "pod111 read after its delete");
+            json_reply(json!({
+                "id": "pod111", "name": "qwen-pod", "desiredStatus": "EXITED",
+                "costPerHr": 1.89, "gpu": {"id": "NVIDIA A100-SXM4-80GB"},
+                "machine": {"dataCenterId": "EUR-IS-1"}, "networkVolumeId": "vol222",
+            }))
+        } else if url.ends_with("/pods/pod111/start") {
+            Reply::answer(
+                400,
+                json!({"detail": "There are not enough free GPUs on the host machine to start \
+                                  this pod.", "status": 400, "title": "Bad Request"})
+                .to_string(),
+            )
+        } else if url.ends_with("/pods/pod333") {
+            json_reply(
+                json!({"id": "pod333", "name": "qwen-pod", "desiredStatus": "RUNNING",
+                              "costPerHr": 1.89}),
+            )
+        } else if url.ends_with("/v1/pods") && r.method == Method::POST {
+            assert!(
+                *gone.lock().unwrap(),
+                "created before the stopped pod was terminated"
+            );
+            json_reply(json!({"id": "pod333", "costPerHr": 1.89}))
+        } else {
+            empty_runpod(Reply::Hang)(r)
+        }
+    });
+    let told = Told::default();
+    run_up(&mut home, &told).await.unwrap();
+    assert!(*deleted.lock().unwrap());
+    let sent = home.sent();
+    assert_eq!(
+        sent[..3],
+        [
+            "GET https://rest.runpod.io/v1/pods/pod111",
+            "POST https://rest.runpod.io/v1/pods/pod111/start",
+            "DELETE https://rest.runpod.io/v1/pods/pod111",
+        ]
+    );
+    assert_eq!(
+        sent.iter()
+            .filter(|r| *r == "POST https://rest.runpod.io/v1/pods")
+            .count(),
+        1,
+        "{sent:?}"
+    );
+    let notices = told.notices();
+    assert_eq!(
+        notices[..2],
+        [
+            (
+                Tone::Dim,
+                "Resuming stopped pod pod111 (named 'qwen-pod')...".into()
+            ),
+            (
+                Tone::Warn,
+                "Pod pod111 cannot be resumed: its host has no GPU free now.".into()
+            ),
+        ]
+    );
+    assert!(
+        notices[2]
+            .1
+            .contains("not enough free GPUs on the host machine"),
+        "{notices:?}"
+    );
+    assert_eq!(
+        notices[3],
+        (Tone::Dim, "Terminated pod111; creating a new pod.".into())
+    );
+    assert!(
+        told.texts()
+            .contains(&"vLLM is serving. Startup took 0s. Run viy chat".to_string()),
+        "{notices:?}"
+    );
+    assert_eq!(home.state()["pod_id"], "pod333");
+    let log = std::fs::read_to_string(home.paths.up_failures_file()).unwrap();
+    let row: Value = serde_json::from_str(log.trim()).unwrap();
+    assert_eq!(row["role"], "resume");
+    assert_eq!(row["region"], "EUR-IS-1");
+    assert_eq!(row["volume_id"], "vol222");
+    assert_eq!(row["status_code"], 400);
+    assert_eq!(row["capacity"], true);
+    assert_eq!(row["gpu_types"], json!(["NVIDIA A100-SXM4-80GB"]));
+    // `viy backup` counts refused creations; this was none.
+    assert_eq!(
+        regions::refused_creations(&home.paths, ""),
+        Vec::<Value>::new()
+    );
+    let records = Records::new(&home.paths);
+    let row = records.history(1).pop().unwrap();
+    let record = records.read(row["boot_id"].as_str().unwrap()).unwrap();
+    let events: Vec<&str> = record["timeline"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["event"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        events[..3],
+        ["viy up started", "resume refused", "pod requested"]
+    );
+}
+
+/// The stopped pod is gone by the time `up` terminates it (the reaper or
+/// the other tool got there first): a 404 is as good as the delete.
+#[tokio::test(start_paused = true)]
+async fn up_goes_on_when_the_refused_pod_is_already_gone() {
+    let mut home = Home::new(tracked(false), |r: &viy_http::Request| {
+        let url = r.url.as_str();
+        if url.ends_with("/pods/pod111") && r.method == Method::DELETE {
+            Reply::answer(404, json!({"detail": "pod not found"}).to_string())
+        } else if url.ends_with("/pods/pod111/start") {
+            Reply::answer(
+                400,
+                json!({"detail": "There are not enough free GPUs on the host machine to start \
+                                  this pod."})
+                .to_string(),
+            )
+        } else if url.ends_with("/pods/pod111") {
+            json_reply(pod("EXITED"))
+        } else if url.ends_with("/pods/pod333") {
+            json_reply(json!({"id": "pod333", "name": "qwen-pod", "desiredStatus": "RUNNING"}))
+        } else if url.ends_with("/v1/pods") && r.method == Method::POST {
+            json_reply(json!({"id": "pod333", "costPerHr": 1.89}))
+        } else {
+            empty_runpod(Reply::Hang)(r)
+        }
+    });
+    run_up(&mut home, &Told::default()).await.unwrap();
+    assert_eq!(home.state()["pod_id"], "pod333");
+}
+
+/// A start refused for another reason is not taken for a lost GPU: the
+/// stopped pod stays, nothing is created.
+#[tokio::test(start_paused = true)]
+async fn up_keeps_a_stopped_pod_whose_start_fails_otherwise() {
+    let mut home = Home::new(tracked(false), |r: &viy_http::Request| {
+        if r.url.ends_with("/start") {
+            Reply::answer(500, json!({"detail": "internal error"}).to_string())
+        } else {
+            runpod("EXITED")(r)
+        }
+    });
+    let error = run_up(&mut home, &Told::default()).await.unwrap_err();
+    assert!(matches!(error, CommandError::RunPod(_)), "{error:?}");
+    assert!(
+        !home
+            .sent()
+            .iter()
+            .any(|r| r.starts_with("DELETE") || r == "POST https://rest.runpod.io/v1/pods"),
+        "{:?}",
+        home.sent()
+    );
+    assert_eq!(home.state()["pod_id"], "pod111");
+}
+
 #[tokio::test(start_paused = true)]
 async fn up_reuses_a_running_pod_without_a_record() {
     let mut home = Home::new(tracked(false), runpod("RUNNING"));

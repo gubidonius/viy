@@ -328,7 +328,12 @@ async fn up_until(
         }
         Err(error) => return Err(error.into()),
     };
-    if let Some(existing) = existing {
+    // A stopped pod whose host has no GPU free is terminated and `up` goes
+    // on to create a pod, as with no pod at all (kb f175, f181).
+    'adopt: {
+        let Some(existing) = existing else {
+            break 'adopt;
+        };
         let cfg = &*cfg;
         if backup {
             check_backup_pod(env, cfg, &existing)?;
@@ -345,8 +350,15 @@ async fn up_until(
                 Tone::Dim,
                 format!("Resuming stopped pod {pod_id} (named '{name}')..."),
             );
-            rp.start_pod(&pod_id).await?;
-            timeline.mark("resume requested", [("pod_id", json!(pod_id))]);
+            match rp.start_pod(&pod_id).await {
+                Ok(()) => timeline.mark("resume requested", [("pod_id", json!(pod_id))]),
+                Err(error) if regions::is_capacity_error(&error) => {
+                    retire_stopped(env, cfg, &rp, &existing, &error, report).await?;
+                    timeline.mark("resume refused", [("pod_id", json!(pod_id))]);
+                    break 'adopt;
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
             say(
                 report,
@@ -709,6 +721,61 @@ pub async fn ensure_volume(
     profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", &id)?;
     say(report, Tone::Ok, format!("  volume id: {id}"));
     Ok((id, true))
+}
+
+/// A stopped pod RunPod will not start because its host's GPUs are taken
+/// (`400`, kb f175): stopped pods keep their host (kb f174), so it cannot
+/// be resumed now and may not be for a long time. It is logged with the
+/// create refusals, its forward ended and the pod terminated, then the pod
+/// state forgotten, so `up` goes on as with no pod.
+async fn retire_stopped(
+    env: &Env<'_>,
+    cfg: &Config,
+    rp: &RunPod,
+    pod: &Value,
+    error: &RunPodError,
+    report: Reporter<'_>,
+) -> Result<(), CommandError> {
+    let pod_id = text(pod, "id").unwrap_or_default();
+    let region = pod
+        .get("machine")
+        .and_then(|m| text(m, "dataCenterId"))
+        .unwrap_or_else(|| cfg_at(cfg, "DATA_CENTER_ID"));
+    let volume_id = tracked::pod_volume_id(pod).unwrap_or_default();
+    // An array of type ids, as the create refusals log theirs.
+    let gpus = json!(
+        pod.get("gpu")
+            .and_then(|gpu| gpu.get("id"))
+            .into_iter()
+            .collect::<Vec<_>>()
+    );
+    regions::log_failure(
+        env.paths, env.time, cfg, region, "resume", volume_id, &gpus, error,
+    );
+    say(
+        report,
+        Tone::Warn,
+        format!("Pod {pod_id} cannot be resumed: its host has no GPU free now."),
+    );
+    say(report, Tone::Dim, error.to_string());
+    // The forward goes before the state file, as in `down`, or its pid is
+    // lost and the ssh holds the port the new pod's tunnel needs.
+    let ssh = env.ssh(cfg);
+    let mut said = |notice| report(Report::Notice(notice));
+    tunnel::stop(&ssh, true, &mut said).await?;
+    tunnel::kill_strays(&ssh).await?;
+    match rp.delete_pod(pod_id).await {
+        // Gone already: terminated by the reaper or the other tool.
+        Err(error) if error.status_code() != Some(404) => return Err(error.into()),
+        _ => {}
+    }
+    state::clear(env.paths)?;
+    say(
+        report,
+        Tone::Dim,
+        format!("Terminated {pod_id}; creating a new pod."),
+    );
+    Ok(())
 }
 
 /// After readiness only: a new backup that just served deletes the one it
