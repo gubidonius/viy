@@ -205,9 +205,6 @@ and the student must hold out until dawn.
         RunPod has root on the host. The host key lives on their volume too,
         so the pinning means nothing against them. Don't send a rented GPU
         anything you couldn't let its owner read.</li>
-        <li><b>Plans.</b> A later version may obfuscate the text the model
-        reads and writes, so it is harder to read on the pod. But running the
-        model on a GPU you own is much safer.</li>
       </ul>
     </details></td>
   </tr>
