@@ -31,6 +31,20 @@
 //! {"type":"error","message":"..."}          the line was refused
 //! ```
 //!
+//! Under `viy chat --json --answer-questions` ([`crate::chat_json`]) a
+//! question waits for the caller instead:
+//!
+//! ```text
+//! {"type":"question.requested","question_id":"q1","prompt":"...","reason":[...],
+//!  "options":[...],"answers":["yes","no"],"default":"no"}
+//! {"type":"question.resolved","question_id":"q1","by":"<mode, or null>"}
+//! ```
+//!
+//! answered by the caller's `answer` line, or closed by the engine
+//! (`question.resolved`: the chat mode answered it, or the turn that asked
+//! is gone; a `question` item the caller's answer made before that still
+//! stands in the output, but the engine took no answer).
+//!
 //! Every item has `id` and `type`:
 //!
 //! ```text
@@ -39,6 +53,7 @@
 //! command_execution  command, aggregated_output, exit_code, status
 //! tool_call          tool, arguments, output, detail, status
 //! question           prompt, reason, options, answer, answered_by
+//!                    (`unattended`, or `caller` under --answer-questions)
 //! error              code, message
 //! ```
 //!
@@ -58,9 +73,11 @@ use std::io::Write;
 use serde_json::Value;
 use serde_json::json;
 use viy_protocol::Answer;
+use viy_protocol::Choices;
 use viy_protocol::EventMsg;
 use viy_protocol::NoticeLevel;
 use viy_protocol::Op;
+use viy_protocol::Question;
 use viy_protocol::ToolCallStatus;
 use viy_protocol::TurnOutcome;
 use viy_term::sanitize::needs_json_escape;
@@ -84,6 +101,10 @@ pub struct JsonEvents<W: Write> {
     running: HashMap<String, VecDeque<Running>>,
     /// The context in use and its budget, from the last token count.
     context: Option<(u64, u64)>,
+    /// Questions go to the caller (`viy chat --json --answer-questions`)
+    /// instead of taking their unattended answers; by id, those waiting.
+    caller_answers: bool,
+    waiting: HashMap<String, Question>,
 }
 
 impl<W: Write> JsonEvents<W> {
@@ -95,11 +116,82 @@ impl<W: Write> JsonEvents<W> {
             reasoning: String::new(),
             running: HashMap::new(),
             context: None,
+            caller_answers: false,
+            waiting: HashMap::new(),
         }
+    }
+
+    /// Questions to the caller: a `question.requested` line, answered with
+    /// [`JsonEvents::answer`] (kb d180).
+    pub fn caller_answers(mut self) -> Self {
+        self.caller_answers = true;
+        self
+    }
+
+    /// The caller's (or, at the end of its input, the unattended) answer
+    /// to a waiting question, told as a `question` item: the answer to give
+    /// the engine, or why there is none.
+    pub fn answer(
+        &mut self,
+        question_id: &str,
+        answer: Option<Answer>,
+        by: &str,
+    ) -> io::Result<Result<Op, String>> {
+        let Some(question) = self.waiting.get(question_id) else {
+            return Ok(Err(format!("no question {question_id:?} is waiting")));
+        };
+        let answer = answer.unwrap_or(question.unattended);
+        // The unattended answer is always taken: nobody left to ask.
+        if by != "unattended" && !offers(question, answer) {
+            return Ok(Err(format!(
+                "{} is not an answer to question {question_id:?}",
+                answer_name(answer)
+            )));
+        }
+        let question = self
+            .waiting
+            .remove(question_id)
+            .unwrap_or_else(|| unreachable!());
+        self.question_item(&question, answer, by)?;
+        Ok(Ok(Op::QuestionAnswer {
+            id: question_id.to_string(),
+            answer,
+        }))
+    }
+
+    /// The questions still waiting, oldest first (`q9` before `q10`, as
+    /// the engine orders them).
+    pub fn waiting(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.waiting.keys().cloned().collect();
+        ids.sort_by_key(|id| (id.len(), id.clone()));
+        ids
+    }
+
+    /// A line the caller sent that is not taken.
+    pub fn refused(&mut self, message: &str) -> io::Result<()> {
+        self.line(&json!({"type": "error", "message": message}))
+    }
+
+    fn question_item(&mut self, question: &Question, answer: Answer, by: &str) -> io::Result<()> {
+        let id = self.item_id();
+        let reason: Vec<&str> = question.reason.iter().map(|n| n.message.as_str()).collect();
+        self.completed(json!({
+            "id": id,
+            "type": "question",
+            "prompt": question.prompt,
+            "reason": reason,
+            "options": question.options,
+            "answer": answer_name(answer),
+            "answered_by": by,
+        }))
     }
 
     pub fn into_inner(self) -> W {
         self.out
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.out.flush()
     }
 
     fn line(&mut self, value: &Value) -> io::Result<()> {
@@ -223,25 +315,36 @@ impl<W: Write> JsonEvents<W> {
                 }))?;
             }
             EventMsg::TokenCount(t) => self.context = Some((t.used, t.budget)),
+            EventMsg::QuestionRequest(e) if self.caller_answers => {
+                self.flush_text()?;
+                let q = &e.question;
+                let reason: Vec<&str> = q.reason.iter().map(|n| n.message.as_str()).collect();
+                let answers: Vec<String> = answers(q).into_iter().map(answer_name).collect();
+                self.line(&json!({
+                    "type": "question.requested",
+                    "question_id": e.question_id,
+                    "prompt": q.prompt,
+                    "reason": reason,
+                    "options": q.options,
+                    "answers": answers,
+                    "default": answer_name(q.default),
+                }))?;
+                self.waiting.insert(e.question_id.clone(), q.clone());
+            }
+            EventMsg::QuestionResolved(e) => {
+                // Answered by the chat mode, or nothing waits for it now.
+                if self.waiting.remove(&e.question_id).is_some() {
+                    self.line(&json!({
+                        "type": "question.resolved",
+                        "question_id": e.question_id,
+                        "by": e.by,
+                    }))?;
+                }
+            }
             EventMsg::QuestionRequest(e) => {
                 self.flush_text()?;
                 let answer = e.question.unattended;
-                let id = self.item_id();
-                let reason: Vec<&str> = e
-                    .question
-                    .reason
-                    .iter()
-                    .map(|n| n.message.as_str())
-                    .collect();
-                self.completed(json!({
-                    "id": id,
-                    "type": "question",
-                    "prompt": e.question.prompt,
-                    "reason": reason,
-                    "options": e.question.options,
-                    "answer": answer_name(answer),
-                    "answered_by": "unattended",
-                }))?;
+                self.question_item(&e.question, answer, "unattended")?;
                 return Ok(Some(Op::QuestionAnswer {
                     id: e.question_id.clone(),
                     answer,
@@ -291,6 +394,41 @@ impl<W: Write> JsonEvents<W> {
             _ => {}
         }
         Ok(None)
+    }
+}
+
+/// The answers `question` takes, in the order its choices list them.
+fn answers(question: &Question) -> Vec<Answer> {
+    match question.choices {
+        Choices::YesNo => vec![Answer::Yes, Answer::No],
+        Choices::YesNoAlways => vec![Answer::Yes, Answer::No, Answer::Always],
+        Choices::YesNoCancel => vec![Answer::Yes, Answer::No, Answer::Cancel],
+        // A pick may be declined, as `q` does at the terminal.
+        Choices::Pick => (0..question.options.len())
+            .filter_map(|i| u32::try_from(i).ok().map(Answer::Pick))
+            .chain([Answer::No])
+            .collect(),
+        // A kind added later: yes or no, until it is named here.
+        _ => vec![Answer::Yes, Answer::No],
+    }
+}
+
+fn offers(question: &Question, answer: Answer) -> bool {
+    answers(question).contains(&answer)
+}
+
+/// The caller's word for an answer, as [`answer_name`] writes it.
+pub fn parse_answer(word: &str) -> Option<Answer> {
+    match word.trim() {
+        "yes" => Some(Answer::Yes),
+        "no" => Some(Answer::No),
+        "always" => Some(Answer::Always),
+        "cancel" => Some(Answer::Cancel),
+        other => other
+            .strip_prefix("option ")
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .filter(|n| *n >= 1)
+            .map(|n| Answer::Pick(n - 1)),
     }
 }
 

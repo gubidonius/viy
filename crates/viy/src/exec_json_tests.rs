@@ -310,3 +310,54 @@ fn a_notice_comes_after_the_text_before_it() {
     assert_eq!(lines[2]["item"]["id"], "item_0");
     assert_eq!(lines[3]["item"]["type"], "error");
 }
+
+/// Under caller answers a pick may be declined, as `q` at the terminal,
+/// and the unattended answer is always taken; waiting questions come back
+/// oldest first.
+#[test]
+fn caller_answers_picks_and_order() {
+    let mut json = JsonEvents::new(Vec::new()).caller_answers();
+    let pick = Question {
+        kind: None,
+        prompt: "Which chat?".into(),
+        choices: viy_protocol::Choices::Pick,
+        default: Answer::Pick(0),
+        unattended: Answer::No,
+        reason: Vec::new(),
+        options: vec!["a".into(), "b".into()],
+    };
+    for id in ["q10", "q9"] {
+        let none = json
+            .event(&EventMsg::QuestionRequest(QuestionRequestEvent {
+                question_id: id.into(),
+                question: pick.clone(),
+            }))
+            .unwrap();
+        assert_eq!(none, None, "waits for the caller");
+    }
+    assert_eq!(json.waiting(), ["q9", "q10"]);
+    assert!(
+        json.answer("q9", Some(Answer::Pick(5)), "caller")
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        json.answer("q9", Some(Answer::No), "caller").unwrap(),
+        Ok(Op::QuestionAnswer {
+            id: "q9".into(),
+            answer: Answer::No
+        })
+    );
+    assert_eq!(
+        json.answer("q10", None, "unattended").unwrap(),
+        Ok(Op::QuestionAnswer {
+            id: "q10".into(),
+            answer: Answer::No
+        })
+    );
+    let raw = String::from_utf8(json.into_inner()).unwrap();
+    let first: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    assert_eq!(first["type"], "question.requested");
+    assert_eq!(first["answers"], json!(["option 1", "option 2", "no"]));
+    assert_eq!(first["default"], "option 1");
+}

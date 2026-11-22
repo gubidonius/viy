@@ -5,6 +5,7 @@
 //! [`pods`], `viy shutdown` in [`shutdown`].
 
 pub mod chat;
+pub mod chat_json;
 pub mod cli;
 pub mod dev;
 pub mod exec;
@@ -217,6 +218,12 @@ fn dispatch(
                 err,
             };
             sessions_cli::cmd_delete(args, &paths()?, asking, out)
+        }
+        Command::Chat(args) if args.json => {
+            let paths = paths()?;
+            let cfg = config(&paths)?;
+            let stdin = Box::new(std::io::BufReader::new(std::io::stdin()));
+            chat_json::cmd_chat_json(args, &paths, cfg, &cwd()?, stdin, out, err)
         }
         Command::Chat(_) | Command::Resume(_) | Command::Fork(_) => {
             let paths = paths()?;

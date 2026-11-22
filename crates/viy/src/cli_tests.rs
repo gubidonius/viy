@@ -159,8 +159,11 @@ fn subcommands_and_flags_are_rps() {
         );
         // `init --kb` and the flags that need it are viy's own (kb d112),
         // and so are `migrate --finish` and `--dry-run` (kb d135).
-        let viy_own =
-            |a: &clap::Arg| (name == "init" || name == "migrate") && a.get_long().is_some();
+        // So are `chat --json` and `--answer-questions` (kb d180).
+        let viy_own = |a: &clap::Arg| {
+            ((name == "init" || name == "migrate") && a.get_long().is_some())
+                || (name == "chat" && matches!(a.get_long(), Some("json" | "answer-questions")))
+        };
         let args: Vec<Value> = sub
             .get_arguments()
             .filter(|a| !matches!(a.get_action(), clap::ArgAction::Help))

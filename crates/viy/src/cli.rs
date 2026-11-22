@@ -355,6 +355,17 @@ pub struct ChatArgs {
     pub url: Option<String>,
     #[arg(long, help = "initial system prompt")]
     pub system: Option<String>,
+    #[arg(
+        long,
+        help = "a chat for another program: JSON lines in on stdin, out on stdout"
+    )]
+    pub json: bool,
+    #[arg(
+        long,
+        requires = "json",
+        help = "with --json: the caller answers safeguard questions (otherwise no)"
+    )]
+    pub answer_questions: bool,
 }
 
 /// Which saved chat a session command takes, as Codex's.
