@@ -28,7 +28,6 @@ use viy_exec::Command;
 use viy_exec::Spawn;
 use viy_exec::exit_text;
 
-use crate::api::RunPod;
 use crate::api::truthy;
 use crate::notice::Alert;
 use crate::notice::Notice;
@@ -37,11 +36,13 @@ use crate::notice::Tone;
 use crate::process;
 use crate::ssh::Ssh;
 use crate::ssh::port_open;
-use crate::ssh::ssh_endpoint;
 use crate::state;
 use crate::state::key;
 use crate::tracked;
 use crate::tracked::ResolveError;
+use viy_provider::Provider;
+
+use crate::provider::RunPodProvider;
 
 /// `tunnel.log` starts over past this size.
 const TUNNEL_LOG_MAX: u64 = 256 * 1024;
@@ -164,7 +165,7 @@ pub fn tunnel_log_tail(ssh: &Ssh<'_>, n: usize) -> String {
 /// `quiet` keeps the success lines to itself.
 pub async fn start(
     ssh: &Ssh<'_>,
-    rp: &RunPod,
+    seam: &dyn Provider,
     ip: &str,
     port: u16,
     quiet: bool,
@@ -196,7 +197,7 @@ pub async fn start(
         ));
         return Ok(false);
     }
-    if !ssh.preflight(rp, ip, port, &mut *say).await? {
+    if !ssh.preflight(seam, ip, port, &mut *say).await? {
         return Ok(false);
     }
     let log = open_tunnel_log(ssh, ip, port)?;
@@ -319,7 +320,7 @@ pub enum TunnelError {
 /// The tracked pod's id and SSH endpoint.
 pub async fn resolve_target(
     ssh: &Ssh<'_>,
-    rp: &RunPod,
+    seam: &RunPodProvider,
     say: Say<'_>,
 ) -> Result<(String, String, u16), TunnelError> {
     let unreachable = |say: Say<'_>, error: &dyn std::fmt::Display| {
@@ -327,7 +328,7 @@ pub async fn resolve_target(
         say(Notice::new(Tone::Dim, error.to_string()));
         TunnelError::Failed
     };
-    let found = tracked::resolve(rp, ssh.paths, ssh.cfg, |multiple| {
+    let found = tracked::resolve(seam.client(), ssh.paths, ssh.cfg, |multiple| {
         say(Notice::new(Tone::Warn, multiple.to_string()));
     })
     .await;
@@ -339,20 +340,16 @@ pub async fn resolve_target(
                 ssh.cfg.get("POD_NAME").unwrap_or("")
             )));
         }
-        Err(ResolveError::RunPod(e)) => return Err(unreachable(say, &e)),
+        Err(ResolveError::Provider(e)) => return Err(unreachable(say, &e)),
         Err(ResolveError::State(e)) => return Err(e.into()),
     };
-    let id = pod
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let id = pod.id.clone();
     // A pod from the list can lack its port mappings; the detail has them.
-    let pod = match rp.get_pod(&id).await {
+    let pod = match Provider::pod(seam, &id).await {
         Ok(detail) => detail.unwrap_or(pod),
         Err(e) => return Err(unreachable(say, &e)),
     };
-    let Some((ip, port)) = ssh_endpoint(&pod) else {
+    let Some((ip, port)) = pod.ssh else {
         say(Notice::new(
             Tone::Warn,
             "The pod has no TCP port for SSH yet; it appears about a minute after boot. Try again shortly.",
@@ -475,7 +472,7 @@ impl Guard {
     pub async fn check(
         &mut self,
         ssh: &Ssh<'_>,
-        rp: &RunPod,
+        seam: &dyn Provider,
         say: Say<'_>,
     ) -> Result<(), GuardError> {
         let tunnel = running(ssh)?;
@@ -513,8 +510,8 @@ impl Guard {
         }
         self.restarts += 1;
         // A restarted pod can come back on another mapping.
-        if let Ok(Some(pod)) = rp.get_pod(&self.pod_id).await
-            && let Some((ip, port)) = ssh_endpoint(&pod)
+        if let Ok(Some(pod)) = seam.pod(&self.pod_id).await
+            && let Some((ip, port)) = pod.ssh
         {
             (self.ip, self.port) = (ip, port);
         }
@@ -525,7 +522,7 @@ impl Guard {
                 self.restarts, self.max_restarts
             ),
         ));
-        if !start(ssh, rp, &self.ip, self.port, false, &mut *say).await? {
+        if !start(ssh, seam, &self.ip, self.port, false, &mut *say).await? {
             return Err(GuardError::GaveUp {
                 message: "Could not restart the SSH tunnel. The pod is still billing: viy tunnel \
                           -b to retry, or viy stop."
@@ -561,7 +558,7 @@ pub enum Action {
 pub async fn command(
     ssh: &Ssh<'_>,
     action: Action,
-    connect: impl FnOnce() -> Result<RunPod, String>,
+    connect: impl FnOnce() -> Result<RunPodProvider, String>,
     interrupted: impl Future<Output = ()>,
     say: Say<'_>,
 ) -> Result<(), TunnelError> {
@@ -594,8 +591,9 @@ pub async fn command(
         ));
         return Ok(());
     }
-    let rp = connect().map_err(TunnelError::Exit)?;
-    let (pod_id, ip, port) = resolve_target(ssh, &rp, &mut *say).await?;
+    let runpod = connect().map_err(TunnelError::Exit)?;
+    let (pod_id, ip, port) = resolve_target(ssh, &runpod, &mut *say).await?;
+    let seam: &dyn Provider = &runpod;
     if !tracked::tunnel_only(ssh.paths, ssh.cfg)? {
         say(Notice::new(
             Tone::Warn,
@@ -609,13 +607,13 @@ pub async fn command(
         ));
     }
     if action == Action::Background {
-        if !start(ssh, &rp, &ip, port, false, &mut *say).await? {
+        if !start(ssh, seam, &ip, port, false, &mut *say).await? {
             return Err(TunnelError::Failed);
         }
         say(Notice::new(Tone::Dim, "Stop it with:  viy tunnel --stop"));
         return Ok(());
     }
-    foreground(ssh, &rp, &pod_id, ip, port, interrupted, say).await
+    foreground(ssh, seam, &pod_id, ip, port, interrupted, say).await
 }
 
 /// The foreground forward, reconnecting with a backoff of 2 s doubling to
@@ -623,14 +621,14 @@ pub async fn command(
 /// or `interrupted` resolves.
 pub async fn foreground(
     ssh: &Ssh<'_>,
-    rp: &RunPod,
+    seam: &dyn Provider,
     pod_id: &str,
     mut ip: String,
     mut port: u16,
     interrupted: impl Future<Output = ()>,
     say: Say<'_>,
 ) -> Result<(), TunnelError> {
-    if !ssh.preflight(rp, &ip, port, &mut *say).await? {
+    if !ssh.preflight(seam, &ip, port, &mut *say).await? {
         return Err(TunnelError::Failed);
     }
     let local = local(ssh);
@@ -680,8 +678,8 @@ pub async fn foreground(
             ));
             tokio::time::sleep(Duration::from_secs(delay)).await;
             delay = (delay * 2).min(30);
-            if let Ok(Some(pod)) = rp.get_pod(pod_id).await
-                && let Some(endpoint) = ssh_endpoint(&pod)
+            if let Ok(Some(pod)) = seam.pod(pod_id).await
+                && let Some(endpoint) = pod.ssh
                 && endpoint != (ip.clone(), port)
             {
                 (ip, port) = endpoint;

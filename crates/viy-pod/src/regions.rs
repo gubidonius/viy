@@ -34,6 +34,8 @@ use viy_config::config::gpu_type_list;
 use viy_config::redact::Redactor;
 use viy_time::TimeProvider;
 
+use viy_provider::Pod;
+
 use crate::api::RunPod;
 use crate::api::RunPodError;
 use crate::api::shown;
@@ -274,9 +276,14 @@ pub fn forget(paths: &Paths, volume_id: &str) -> io::Result<()> {
 
 /// Called with a live pod: if it runs on a backup volume, that backup is
 /// in use.
-pub fn note_pod(paths: &Paths, pod: &Value, now: f64) -> io::Result<()> {
+pub fn note_pod(paths: &Paths, pod: &Pod, now: f64) -> io::Result<()> {
+    note_volume(paths, pod.volume.as_deref(), now)
+}
+
+/// [`note_pod`] for the volume a pod mounts.
+fn note_volume(paths: &Paths, volume: Option<&str>, now: f64) -> io::Result<()> {
     let mut data = load_backups(paths);
-    let Some(record) = pod_volume_id(pod).and_then(|vid| data.get_mut(vid)) else {
+    let Some(record) = volume.and_then(|vid| data.get_mut(vid)) else {
         return Ok(());
     };
     if let Some(record) = record.as_object_mut() {
@@ -287,8 +294,10 @@ pub fn note_pod(paths: &Paths, pod: &Value, now: f64) -> io::Result<()> {
 
 /// True when `pod` runs on a backup volume, by [`note_pod`]'s test: one
 /// `backups.json` records (rpctl `on_backup`).
-pub fn on_backup(paths: &Paths, pod: &Value) -> bool {
-    pod_volume_id(pod).is_some_and(|vid| load_backups(paths).contains_key(vid))
+pub fn on_backup(paths: &Paths, pod: &Pod) -> bool {
+    pod.volume
+        .as_deref()
+        .is_some_and(|vid| load_backups(paths).contains_key(vid))
 }
 
 /// Marks the new backup `volume_id` as replacing `old_id`, which goes once
@@ -930,7 +939,7 @@ pub async fn expire(
             .any(|p| text(p, "desiredStatus") != Some("EXITED") || text(p, "name") != Some(ours))
         {
             match kind {
-                Kind::Backup => note_pod(paths, &json!({"networkVolumeId": vid}), now)?,
+                Kind::Backup => note_volume(paths, Some(&vid), now)?,
                 Kind::Primary => {
                     let mut data = load_primaries(paths);
                     if let Some(r) = data.get_mut(&vid).and_then(Value::as_object_mut) {

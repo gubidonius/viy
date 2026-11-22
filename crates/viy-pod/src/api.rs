@@ -135,6 +135,16 @@ pub struct LogEntry {
     pub line: String,
 }
 
+impl From<viy_provider::LogLine> for LogEntry {
+    fn from(line: viy_provider::LogLine) -> Self {
+        Self {
+            ts: line.time,
+            source: line.source,
+            line: line.text,
+        }
+    }
+}
+
 impl LogEntry {
     /// When the line was written. System lines carry whole seconds
     /// ("...:52Z"), container lines nanoseconds ("...:52.771976788Z"):

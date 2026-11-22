@@ -9,6 +9,8 @@ use viy_testkit::runpod_v1::V1;
 use viy_testkit::scratch::ScratchDir;
 
 use super::*;
+use crate::api::RunPod;
+use crate::provider::pod_of;
 
 /// The fixture's synthetic key (tools/fixtures.py API_KEY).
 const API_KEY: &str = "rpa_SYNTHETICKEY0000";
@@ -66,9 +68,9 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
                 let rp = RunPod::new(API_KEY, http.clone());
                 resolve(&rp, &paths, &cfg, |n| said.push(n.to_string()))
                     .await
-                    .map(|pod| pod.unwrap_or(Value::Null))
+                    .map(|pod| Picked::Pod(pod.map(Box::new)))
                     .map_err(|e| match e {
-                        ResolveError::RunPod(e) => e,
+                        ResolveError::Provider(e) => e,
                         ResolveError::State(e) => panic!("{name}: {e}"),
                     })
             }
@@ -79,7 +81,7 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
                 })
                 .await
                 .unwrap();
-                Ok(url.map_or(Value::Null, Value::from))
+                Ok(Picked::Url(url.map_or(Value::Null, Value::from)))
             }
         };
 
@@ -91,8 +93,17 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
         assert_eq!(json!(sent), case["sent"], "{name}: requests");
         assert_eq!(json!(said), case["said"], "{name}: notices");
         match outcome {
-            // rpctl's pod as far as v2 still says it (kb d151).
-            Ok(value) => assert_eq!(value, as_v2_tells_it(&case["ok"]), "{name}"),
+            // rpctl's pod as far as v2 still says it (kb d151), as the
+            // provider seam reads it.
+            Ok(Picked::Pod(pod)) => {
+                let ok = as_v2_tells_it(&case["ok"]);
+                assert_eq!(
+                    pod.map(|p| *p),
+                    ok.is_object().then(|| pod_of(&ok)),
+                    "{name}"
+                );
+            }
+            Ok(Picked::Url(url)) => assert_eq!(url, case["ok"], "{name}"),
             Err(e) => {
                 assert_eq!(
                     canonical_error(&e.to_string()),
@@ -100,11 +111,11 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
                     "{name}"
                 );
                 assert_eq!(
-                    e.status_code().map(u64::from),
+                    e.status.map(u64::from),
                     case["status_code"].as_u64(),
                     "{name}"
                 );
-                assert_eq!(e.transient(), case["transient"], "{name}");
+                assert_eq!(e.transient, case["transient"], "{name}");
             }
         }
         let after = fs::read_to_string(paths.pod_state_file()).ok();
@@ -168,7 +179,7 @@ async fn an_answer_without_an_id_never_clears_the_cache() {
         let state = state::load(&paths).unwrap();
         match get {
             Some(_) => {
-                assert_eq!(pod.as_ref().and_then(pod_id), Some("pod111"), "{get:?}");
+                assert_eq!(pod.map(|p| p.id).as_deref(), Some("pod111"), "{get:?}");
                 assert_eq!(state.pod_id(), Some("pod111"), "{get:?}");
                 assert_eq!(state.tunnel_only(), Some(true), "{get:?}");
             }
@@ -189,7 +200,7 @@ fn the_tunnel_url_uses_the_local_port() {
 
 /// rpctl test_regions.py AdoptTests: what `up` recorded when it created a
 /// pod belongs to that pod only (rpctl b642713).
-async fn adopt(get: Reply, list: Option<Value>) -> (Option<Value>, PodState, Paths, ScratchDir) {
+async fn adopt(get: Reply, list: Option<Value>) -> (Option<Pod>, PodState, Paths, ScratchDir) {
     let dir = ScratchDir::new("pod-tracked").unwrap();
     let paths = Paths::under(dir.path());
     state::save(
@@ -234,7 +245,7 @@ async fn the_same_pod_keeps_what_up_recorded() {
 async fn another_pod_adopted_by_name_drops_it() {
     let pods = json!([{"id": "new", "name": "p", "desiredStatus": "RUNNING", "costPerHr": 0.79}]);
     let (found, state, paths, _dir) = adopt(Reply::answer(404, "{}"), Some(pods)).await;
-    assert_eq!(found.as_ref().and_then(pod_id), Some("new"));
+    assert_eq!(found.map(|p| p.id).as_deref(), Some("new"));
     assert_eq!(state.pod_id(), Some("new"));
     for k in CREATED_KEYS {
         assert_eq!(state.get(k), None, "{k}");
@@ -259,10 +270,34 @@ async fn a_terminated_cached_pod_counts_as_another() {
     assert_eq!(state.get(key::TUNNEL_ONLY), None);
 }
 
+/// What resolve or base_url gave.
+enum Picked {
+    Pod(Option<Box<Pod>>),
+    Url(Value),
+}
+
 /// A pod rpctl returned, as viy reads RunPod's v2 answer for it.
 fn as_v2_tells_it(pod: &Value) -> Value {
     match pod {
         Value::Object(_) => crate::wire::pod(viy_testkit::runpod_v1::v2_pod(pod.clone())),
         other => other.clone(),
+    }
+}
+
+/// pod.json keeps the price as RunPod sent it, a whole number or a string
+/// too, as rp's cache does: the commands read the seam's `Pod`, the file
+/// stays RunPod's while rp shares it (WP 9.37b).
+#[tokio::test]
+async fn the_cache_keeps_runpods_price_as_sent() {
+    for cost in [json!(1), json!("0.79"), json!(2.5)] {
+        let pods =
+            json!([{"id": "new", "name": "p", "desiredStatus": "RUNNING", "costPerHr": cost}]);
+        let (found, state, _, _dir) = adopt(Reply::answer(404, "{}"), Some(pods)).await;
+        assert_eq!(state.get(key::COST_PER_HR), Some(&cost), "{cost}");
+        assert_eq!(
+            found.unwrap().cost_per_hour,
+            cost.as_f64().or(Some(0.79)),
+            "{cost}"
+        );
     }
 }

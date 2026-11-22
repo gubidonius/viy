@@ -102,7 +102,7 @@ enum Stop {
 impl From<CommandError> for Stop {
     fn from(error: CommandError) -> Self {
         // No failover path returns the seam's `CommandError::Provider` yet;
-        // WP 9.37b, which moves failover onto the seam, must map it here too,
+        // WP 9.37c, which moves failover onto the seam, must map it here too,
         // or a capacity refusal would end `up` instead of trying on.
         match error {
             CommandError::RunPod(e) => Self::Refused(e),

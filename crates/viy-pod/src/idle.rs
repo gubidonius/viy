@@ -263,10 +263,11 @@ pub async fn reap(
             result?;
         }
     }
-    let found = match commands::resolve(rp, env, cfg, report).await {
+    let found = match commands::resolve(&seam, env, cfg, report).await {
         Ok(found) => found,
-        Err(ResolveError::RunPod(error)) => {
-            print(format!("could not reach RunPod: {}", first_line(&error)));
+        Err(ResolveError::Provider(error)) => {
+            let first = error.message.lines().next().unwrap_or_default();
+            print(format!("could not reach RunPod: {first}"));
             return Ok(());
         }
         Err(ResolveError::State(error)) => return Err(error.into()),
@@ -281,16 +282,14 @@ pub async fn reap(
     };
     // The pod through the seam: its state in RunPod's word, which
     // `decide` reads as rp's `idle.decide` does.
-    let seen_pod = crate::provider::pod_of(&pod);
-    let desired = seen_pod.state_name.as_deref();
+    let desired = pod.state_name.as_deref();
     if desired != Some("EXITED") {
         // A stopped pod is not a use of its volume (kb d178).
         regions::note_pod(env.paths, &pod, now)?;
-        let volume = crate::tracked::pod_volume_id(&pod).unwrap_or_default();
+        let volume = pod.volume.as_deref().unwrap_or_default();
         let region = pod
-            .get("machine")
-            .and_then(|m| m.get("dataCenterId"))
-            .and_then(Value::as_str)
+            .region
+            .as_deref()
             .unwrap_or_else(|| cfg.get("DATA_CENTER_ID").unwrap_or(""));
         regions::note_primary(env.paths, cfg, volume, region, now)?;
     }
@@ -303,7 +302,7 @@ pub async fn reap(
         print("the pod is stopped".into());
         return Ok(());
     }
-    let id = pod.get("id").and_then(Value::as_str).unwrap_or_default();
+    let id = pod.id.as_str();
     let mut seen = Seen::load(env.paths, id, now);
     let activity = activity_seconds(env.paths);
     let (verdict, reason) = decide(now, desired, activity, &seen, limits(cfg));

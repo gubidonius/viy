@@ -19,6 +19,8 @@ use viy_testkit::sshd::ClosedPort;
 use viy_testkit::sshd::closed_port;
 
 use super::*;
+use crate::api::RunPod;
+use crate::provider::test_seam;
 use crate::tunnel;
 use crate::tunnel::TunnelError;
 
@@ -210,7 +212,7 @@ async fn replay(only: impl Fn(&str) -> bool) {
         }
         let exec = FakeExec::new(runs);
         let http = Arc::new(FakeHttp::new(http_replies(case)));
-        let rp = RunPod::new(API_KEY, Arc::new(V1::new(http.clone())));
+        let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http.clone()))));
         let ssh = Ssh {
             paths: &paths,
             cfg: &cfg,
@@ -466,7 +468,7 @@ async fn first_contact_scanning(
     let mut said = Vec::new();
     let checked = ssh
         .pin_checked_key(
-            &RunPod::new(API_KEY, Arc::new(V1::new(http))),
+            &test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http)))),
             "1.2.3.4",
             22,
             &mut |n| said.push(n.text),
@@ -480,9 +482,12 @@ async fn first_contact_scanning(
 #[tokio::test]
 async fn the_boot_log_line_is_read() {
     let http = Arc::new(FakeHttp::new([sse(&["noise", LINE])]));
-    let keys = logged_host_keys(&RunPod::new(API_KEY, Arc::new(V1::new(http))), "x")
-        .await
-        .unwrap();
+    let keys = logged_host_keys(
+        &test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http)))),
+        "x",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         keys,
         BTreeSet::from(["SHA256:4K6Kzir7pOvKk/6zcIBgF6hYkPIkyH5L0GTIdscicOo".to_string()])
@@ -552,7 +557,7 @@ async fn no_logged_fingerprint_falls_back_to_first_use() {
     let http = Arc::new(FakeHttp::new([sse(&[])]));
     let checked = ssh
         .pin_checked_key(
-            &RunPod::new(API_KEY, Arc::new(V1::new(http))),
+            &test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http)))),
             "1.2.3.4",
             22,
             &mut |_| {},
@@ -582,7 +587,7 @@ async fn ssh_refreshes_mapping() {
         )
     };
     let http = Arc::new(FakeHttp::new([pod(old_port), pod(new_port)]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(http)));
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http))));
     let mut watch = SshWatch::new(&rp, "id");
     assert_eq!(
         watch.probe().await,
@@ -601,7 +606,7 @@ async fn a_failed_call_keeps_the_last_endpoint_and_none_is_no_mapping() {
         ),
         Reply::answer(503, "upstream unavailable"),
     ]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(http)));
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http))));
     let mut watch = SshWatch::new(&rp, "id");
     assert_eq!(watch.probe().await, Err("no port mapping yet".to_string()));
     assert_eq!(

@@ -413,7 +413,7 @@ async fn tunnel_command(
         Action::Foreground
     };
     let ssh = env.ssh(cfg);
-    let connect = || commands::connect(env, cfg).map_err(|e| e.to_string());
+    let connect = || commands::provider(env, cfg).map_err(|e| e.to_string());
     let mut say = |notice| report(Report::Notice(notice));
     // The foreground tunnel ends on the first Ctrl-C itself, closing its
     // ssh; anything else, and a second one, ends at once.

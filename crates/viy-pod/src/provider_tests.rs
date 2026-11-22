@@ -292,3 +292,13 @@ fn a_volume_size_sent_as_a_string_is_read() {
     );
     assert_eq!(volume_of(&json!({"id": "v"})).name, None);
 }
+
+/// An empty region or GPU id stays as RunPod gave it, for the logs that
+/// record it; `viy status` shows either as ?.
+#[test]
+fn an_empty_region_and_gpu_stay_as_given() {
+    let pod = pod_of(&json!({"id": "p", "machine": {"dataCenterId": ""}, "gpu": {"id": ""}}));
+    assert_eq!(pod.region.as_deref(), Some(""));
+    assert_eq!(pod.gpu.as_deref(), Some(""));
+    assert_eq!(pod.gpu_name, None);
+}

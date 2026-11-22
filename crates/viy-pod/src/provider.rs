@@ -7,11 +7,12 @@
 //! RunPod's own settings
 //! (CLOUD_TYPE, GPU_TYPE_PRIORITY) from its configuration. `viy status`,
 //! `stop`, `down`'s sweep, the shutdown's running-pod check and the reaper
-//! go through it since WP 9.36; `up` and its path (tracked, wait, ssh,
-//! tunnel), adopt, create and failover in 9.37b; `up`'s resume and volumes
-//! moved in 9.37, the engines' requests in 9.38. What viy writes to files
-//! shared with rp (pod.json's `costPerHr` as RunPod sent it) stays read
-//! from RunPod's own answer on RunPod's side.
+//! go through it since WP 9.36; `up`'s resume and volumes since 9.37, the
+//! engines' requests since 9.38, the waits, ssh and the tunnel since 9.37b;
+//! create and failover move in 9.37c. Two stay RunPod's: `tracked` finds
+//! and caches the pod by RunPod's rules while rp shares `pod.json` (the
+//! commands get a [`Pod`]), and `capture-boot` records RunPod's host
+//! facts.
 
 use std::time::Duration;
 
@@ -32,6 +33,7 @@ use crate::api::RunPodError;
 use crate::regions::is_capacity_error;
 use crate::tracked::pod_volume_id;
 
+#[derive(Clone)]
 pub struct RunPodProvider {
     rp: RunPod,
     /// CLOUD_TYPE: SECURE or COMMUNITY.
@@ -84,12 +86,14 @@ pub fn pod_of(v1: &Value) -> Pod {
         v1.get("gpu")
             .and_then(|g| g.get(key))
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    // As RunPod gave it; `viy status`'s name is the type's display name,
+    // else its id, an empty one counting as none.
     let gpu = gpu_field("id");
-    // `viy status`'s rule: the type's display name, else its id.
-    let gpu_name = gpu_field("displayName").or_else(|| gpu.clone());
+    let gpu_name = gpu_field("displayName")
+        .filter(|s| !s.is_empty())
+        .or_else(|| gpu.clone().filter(|s| !s.is_empty()));
     Pod {
         id: text("id").unwrap_or_default(),
         name: text("name"),
@@ -105,10 +109,10 @@ pub fn pod_of(v1: &Value) -> Pod {
             _ => None,
         }
         .and_then(|n| u32::try_from(n).ok()),
+        // As RunPod gave it, an empty one too (`viy status` shows that as ?).
         region: machine
             .and_then(|m| m.get("dataCenterId"))
             .and_then(Value::as_str)
-            .filter(|r| !r.is_empty())
             .map(str::to_string),
         // The rules the tunnel and the waits use today.
         ssh: crate::ssh::ssh_endpoint(v1),
@@ -116,6 +120,13 @@ pub fn pod_of(v1: &Value) -> Pod {
         created_at: text("createdAt"),
         volume: pod_volume_id(v1).map(str::to_string),
     }
+}
+
+/// `rp` behind the seam with the default settings, for the tests of what
+/// takes a provider.
+#[cfg(test)]
+pub(crate) fn test_seam(rp: RunPod) -> RunPodProvider {
+    RunPodProvider::new(rp, &Config::defaults())
 }
 
 /// A volume as RunPod's v1 shape has it.
@@ -132,6 +143,18 @@ pub fn volume_of(v1: &Value) -> Volume {
             _ => None,
         },
     }
+}
+
+/// A pod's log through the seam, as the boot report and the waits read
+/// it (`LogEntry`).
+pub async fn log_entries(
+    seam: &dyn Provider,
+    id: &str,
+    tail: u32,
+    budget: Duration,
+) -> viy_provider::Result<Vec<crate::api::LogEntry>> {
+    let lines = seam.logs(id, tail, budget).await?;
+    Ok(lines.into_iter().map(Into::into).collect())
 }
 
 /// A RunPod error with what the commands decide on.

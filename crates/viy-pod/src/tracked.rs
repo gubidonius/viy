@@ -9,6 +9,11 @@
 //! API was unreachable (rpctl docs/architecture.md 4). Pinned by the
 //! pod/resolve fixture.
 //!
+//! The commands get the pod as the provider seam's [`Pod`] (WP 9.37b, kb
+//! d182), but the search and the cache stay RunPod's while `pod.json` is
+//! shared with rp: it keeps RunPod's own answer (`costPerHr` as RunPod
+//! sent it), byte for byte as before.
+//!
 //! Where rpctl stops on an answer without a string `id` (a `KeyError`;
 //! RunPod always sends one), viy keeps the pod it asked for by the cached
 //! id and skips such a pod in the name search, so a malformed answer never
@@ -26,9 +31,14 @@ use viy_config::config::tunnel_enabled;
 use viy_config::config::tunnel_local_port;
 use viy_http::HttpClient;
 
+use viy_provider::Pod;
+use viy_provider::ProviderError;
+
 use crate::api::RunPod;
 use crate::api::RunPodError;
 use crate::api::proxy_url;
+use crate::provider::error_of;
+use crate::provider::pod_of;
 use crate::state;
 use crate::state::PodState;
 use crate::state::key;
@@ -47,9 +57,15 @@ const PREDATES_TUNNEL_LABEL: &str =
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error(transparent)]
-    RunPod(#[from] RunPodError),
+    Provider(#[from] ProviderError),
     #[error(transparent)]
     State(#[from] io::Error),
+}
+
+impl From<RunPodError> for ResolveError {
+    fn from(error: RunPodError) -> Self {
+        Self::Provider(error_of(&error))
+    }
 }
 
 /// Several live pods carry `POD_NAME`; the first id is the one taken. A
@@ -76,6 +92,19 @@ impl fmt::Display for MultiplePods {
 /// id while that pod lives (stopped included), else the pod named
 /// `POD_NAME`, cached for next time.
 pub async fn resolve(
+    rp: &RunPod,
+    paths: &Paths,
+    cfg: &Config,
+    notice: impl FnMut(MultiplePods),
+) -> Result<Option<Pod>, ResolveError> {
+    Ok(resolve_v1(rp, paths, cfg, notice)
+        .await?
+        .as_ref()
+        .map(pod_of))
+}
+
+/// [`resolve`] in RunPod's own shape, which `pod.json` caches.
+async fn resolve_v1(
     rp: &RunPod,
     paths: &Paths,
     cfg: &Config,
@@ -154,7 +183,7 @@ pub async fn base_url(
         match resolve(&RunPod::configured(api_key, http, cfg), paths, cfg, notice).await {
             // resolve cached the pod it found.
             Ok(Some(_)) => state = state::load(paths)?,
-            Ok(None) | Err(ResolveError::RunPod(_)) => {}
+            Ok(None) | Err(ResolveError::Provider(_)) => {}
             Err(ResolveError::State(e)) => return Err(e),
         }
     }

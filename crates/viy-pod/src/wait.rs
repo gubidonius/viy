@@ -59,6 +59,7 @@ use crate::notice::Report;
 use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
+use crate::provider::log_entries;
 use crate::ssh::Ssh;
 use crate::ssh::SshWatch;
 use crate::ssh::ssh_endpoint;
@@ -66,6 +67,7 @@ use crate::tracked;
 use crate::tunnel;
 use crate::tunnel::Guard;
 use crate::tunnel::GuardError;
+use viy_provider::Provider;
 
 /// How long vLLM may report ready inside the pod while the local endpoint
 /// still fails before the wait says so out loud, rather than silently
@@ -140,9 +142,9 @@ pub fn redact_log(line: &str, cfg: &Config) -> String {
 /// What the pod's log says the boot is doing, for the wait's clock. The
 /// log is fetched in the background at most every 20 s (60 s past the boot
 /// budget), so a slow fetch (up to 8 s) never delays the next probe.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Progress {
-    rp: RunPod,
+    seam: Arc<dyn Provider>,
     pod_id: Arc<str>,
     started: Instant,
     /// An `RPCTL_ERROR` line ends the wait: sshd failed on the pod.
@@ -169,10 +171,20 @@ struct Summary {
     limited_until: Option<Instant>,
 }
 
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Progress")
+            .field("provider", &self.seam.name())
+            .field("pod_id", &self.pod_id)
+            .field("require_ssh", &self.require_ssh)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Progress {
-    pub fn new(rp: &RunPod, pod_id: &str, require_ssh: bool) -> Self {
+    pub fn new(seam: Arc<dyn Provider>, pod_id: &str, require_ssh: bool) -> Self {
         Self {
-            rp: rp.clone(),
+            seam,
             pod_id: pod_id.into(),
             started: Instant::now(),
             require_ssh,
@@ -208,10 +220,7 @@ impl Progress {
     }
 
     async fn refresh(&self) {
-        let fetched = self
-            .rp
-            .pod_logs(&self.pod_id, 30, Duration::from_secs(8))
-            .await;
+        let fetched = log_entries(&*self.seam, &self.pod_id, 30, Duration::from_secs(8)).await;
         let mut summary = self.summary();
         summary.fetching = false;
         match fetched {
@@ -220,7 +229,7 @@ impl Progress {
                 summary.summarise(&entries, self.require_ssh);
             }
             Err(error) => {
-                summary.limited_until = error.retry_after().map(|wait| Instant::now() + wait);
+                summary.limited_until = error.retry_after.map(|wait| Instant::now() + wait);
             }
         }
     }
@@ -472,14 +481,14 @@ impl Probe for SshProbe<'_> {
 /// Waits for the pod to publish a TCP mapping for port 22 and accept on
 /// it: its address, or `None` at the timeout.
 pub async fn wait_ssh(
-    rp: &RunPod,
+    seam: &dyn Provider,
     pod_id: &str,
     timeout: Duration,
     progress: Option<&Progress>,
     report: Reporter<'_>,
 ) -> Result<Option<(String, u16)>, WaitError> {
     let probe = SshProbe {
-        watch: SshWatch::new(rp, pod_id),
+        watch: SshWatch::new(seam, pod_id),
         progress,
     };
     wait_with_clock("waiting for sshd", timeout, SSH_POLL, probe, report).await
@@ -489,17 +498,17 @@ pub async fn wait_ssh(
 pub struct TunnelGuard<'a> {
     guard: Guard,
     ssh: Ssh<'a>,
-    rp: &'a RunPod,
+    seam: &'a dyn Provider,
 }
 
 impl<'a> TunnelGuard<'a> {
-    pub fn new(guard: Guard, ssh: Ssh<'a>, rp: &'a RunPod) -> Self {
-        Self { guard, ssh, rp }
+    pub fn new(guard: Guard, ssh: Ssh<'a>, seam: &'a dyn Provider) -> Self {
+        Self { guard, ssh, seam }
     }
 
     async fn check(&mut self, report: Reporter<'_>) -> Result<(), WaitError> {
         let mut said = |notice| report(Report::Notice(notice));
-        match self.guard.check(&self.ssh, self.rp, &mut said).await {
+        match self.guard.check(&self.ssh, self.seam, &mut said).await {
             Ok(()) => Ok(()),
             Err(GuardError::GaveUp { message, alert }) => {
                 report(Report::Alert(alert));
@@ -633,11 +642,12 @@ pub async fn wait_ready(
 }
 
 /// What a wait for a booting pod works with.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PodWait<'a> {
     /// Paths, config and the processes.
     pub ssh: Ssh<'a>,
-    pub rp: &'a RunPod,
+    /// The provider the pod runs on (kb d182).
+    pub seam: Arc<dyn Provider>,
     /// What reaches vLLM's /health.
     pub http: &'a dyn HttpClient,
     pub time: &'a dyn TimeProvider,
@@ -688,7 +698,7 @@ pub async fn await_endpoint(
     let started = Instant::now();
     let cfg = w.ssh.cfg;
     let tunnel_only = tracked::tunnel_only(w.ssh.paths, cfg)?;
-    let progress = Progress::new(w.rp, w.pod_id, tunnel_only);
+    let progress = Progress::new(Arc::clone(&w.seam), w.pod_id, tunnel_only);
     let api_key = cfg.get("VLLM_API_KEY");
     if !tunnel_only {
         let url = proxy_url(w.pod_id, cfg.get("VLLM_PORT").unwrap_or_default());
@@ -721,7 +731,7 @@ pub async fn await_endpoint(
         Tone::Dim,
         "Tunnel mode: no http port is exposed, so the endpoint is reached over SSH.",
     );
-    let waited = wait_ssh(w.rp, w.pod_id, timeout, Some(&progress), report).await;
+    let waited = wait_ssh(&*w.seam, w.pod_id, timeout, Some(&progress), report).await;
     let Some(endpoint) = settle(waited, timeline, report)? else {
         return Ok(None);
     };
@@ -756,7 +766,7 @@ pub async fn await_endpoint(
         ),
     );
     let mut said = |notice| report(Report::Notice(notice));
-    if !tunnel::start(&w.ssh, w.rp, &ip, port, false, &mut said).await? {
+    if !tunnel::start(&w.ssh, &*w.seam, &ip, port, false, &mut said).await? {
         timeline.mark("tunnel failed to start", []);
         return Ok(None);
     }
@@ -764,7 +774,7 @@ pub async fn await_endpoint(
     let url = tracked::local_url(cfg);
     say(report, Tone::Plain, format!("Endpoint: {url}"));
     let remaining = timeout.saturating_sub(started.elapsed());
-    let mut guard = TunnelGuard::new(Guard::new(w.pod_id, ip, port), w.ssh, w.rp);
+    let mut guard = TunnelGuard::new(Guard::new(w.pod_id, ip, port), w.ssh, &*w.seam);
     let waited = if remaining.is_zero() {
         Ok(false)
     } else {
@@ -872,10 +882,9 @@ async fn record_boot(
     timeline: &Timeline<'_>,
     report: Reporter<'_>,
 ) -> io::Result<bool> {
-    let entries =
-        w.rp.pod_logs(w.pod_id, 600, Duration::from_secs(8))
-            .await
-            .unwrap_or_default();
+    let entries = log_entries(&*w.seam, w.pod_id, 600, Duration::from_secs(8))
+        .await
+        .unwrap_or_default();
     let table = bootreport::table(engine::name(w.ssh.cfg));
     let (stages, details) =
         bootreport::measure(bootreport::latest_boot(&entries), started, ready, &table);

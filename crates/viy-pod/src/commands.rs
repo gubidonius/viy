@@ -40,7 +40,6 @@ use viy_time::TimeProvider;
 use crate::api::RunPod;
 use crate::api::RunPodError;
 use crate::api::proxy_url;
-use crate::api::shown;
 use crate::api::spoken;
 use crate::bootreport::Outcome;
 use crate::bootreport::Timeline;
@@ -57,7 +56,6 @@ use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
 use crate::provider::RunPodProvider;
-use crate::provider::pod_of;
 use crate::regions;
 use crate::ssh::Ssh;
 use crate::ssh::find_ssh_pubkey;
@@ -123,7 +121,7 @@ pub enum CommandError {
 impl From<ResolveError> for CommandError {
     fn from(error: ResolveError) -> Self {
         match error {
-            ResolveError::RunPod(e) => Self::RunPod(e),
+            ResolveError::Provider(e) => Self::Provider(e),
             ResolveError::State(e) => Self::Io(e),
         }
     }
@@ -210,14 +208,15 @@ pub fn provider(env: &Env<'_>, cfg: &Config) -> Result<RunPodProvider, CommandEr
     Ok(RunPodProvider::new(connect(env, cfg)?, cfg))
 }
 
-/// Our pod as RunPod has it, several of that name said as rpctl does.
+/// Our pod, several of that name said as rpctl does; found and cached by
+/// RunPod's rules while rp shares `pod.json` (`tracked`).
 pub(crate) async fn resolve(
-    rp: &RunPod,
+    seam: &RunPodProvider,
     env: &Env<'_>,
     cfg: &Config,
     report: Reporter<'_>,
-) -> Result<Option<Value>, ResolveError> {
-    tracked::resolve(rp, env.paths, cfg, |many| {
+) -> Result<Option<Pod>, ResolveError> {
+    tracked::resolve(seam.client(), env.paths, cfg, |many| {
         say(report, Tone::Warn, many.to_string());
     })
     .await
@@ -318,17 +317,18 @@ async fn up_until(
     let mut started = Instant::now();
     let mut started_wall = env.time.now();
     let mut timeline = Timeline::start(env.time);
-    let seam = provider(env, cfg)?;
-    // Tracking, the waits and failover are still the client's (WP 9.37b).
-    let rp = seam.client();
+    let runpod = Arc::new(provider(env, cfg)?);
+    let seam: Arc<dyn Provider> = runpod.clone();
+    // Failover and the backups are still the client's (WP 9.37c).
+    let rp = runpod.client();
     let vllm_key = profiles::ensure_vllm_api_key(cfg, env.paths)?;
 
     // Never create a duplicate: adopt any existing pod with our name first.
-    let existing = match resolve(rp, env, cfg, report).await {
+    let existing = match resolve(&runpod, env, cfg, report).await {
         Ok(existing) => existing,
-        Err(ResolveError::RunPod(error)) => {
+        Err(ResolveError::Provider(error)) => {
             // A 429 says when RunPod takes requests again (kb d140).
-            let when = error.retry_after().map_or_else(
+            let when = error.retry_after.map_or_else(
                 || "in a moment".to_string(),
                 |wait| format!("in {}", spoken(wait)),
             );
@@ -355,11 +355,10 @@ async fn up_until(
         if backup {
             check_backup_pod(env, cfg, &existing)?;
         }
-        let pod_id = text(&existing, "id").unwrap_or_default().to_string();
+        let pod_id = existing.id.clone();
         check_pod_engine(env, cfg, &pod_id)?;
         regions::note_pod(env.paths, &existing, regions::now(env.time))?;
-        let status = existing.get("desiredStatus");
-        let booting = text(&existing, "desiredStatus") == Some("EXITED");
+        let booting = existing.state == Some(PodState::Stopped);
         let name = cfg_at(cfg, "POD_NAME");
         if booting {
             say(
@@ -367,7 +366,7 @@ async fn up_until(
                 Tone::Dim,
                 format!("Resuming stopped pod {pod_id} (named '{name}')..."),
             );
-            match Provider::start(&seam, &pod_id).await {
+            match seam.start(&pod_id).await {
                 Ok(()) => {
                     timeline.mark("resume requested", [("pod_id", json!(pod_id))]);
                     // A new run: reap counts its idle time and cap from now.
@@ -382,7 +381,7 @@ async fn up_until(
                     }
                 }
                 Err(error) if error.capacity => {
-                    retire_stopped(env, cfg, &seam, &existing, &error, report).await?;
+                    retire_stopped(env, cfg, &*seam, &existing, &error, report).await?;
                     timeline.mark("resume refused", [("pod_id", json!(pod_id))]);
                     break 'adopt;
                 }
@@ -394,7 +393,7 @@ async fn up_until(
                 Tone::Dim,
                 format!(
                     "Pod {pod_id} named '{name}' already exists ({}); reusing it.",
-                    shown(status)
+                    existing.state_name.as_deref().unwrap_or("None")
                 ),
             );
         }
@@ -407,7 +406,7 @@ async fn up_until(
                  viy up) closes that route.",
             );
         }
-        let w = wait_for(env, cfg, rp, &pod_id);
+        let w = wait_for(env, cfg, &seam, &pod_id);
         abort_at.store(interrupt.count() + 2, Ordering::SeqCst);
         let ready = wait::await_recorded(
             &w,
@@ -446,7 +445,7 @@ async fn up_until(
                 )
                 .await;
             }
-            let volume_id = tracked::pod_volume_id(&existing).unwrap_or_default();
+            let volume_id = existing.volume.as_deref().unwrap_or_default();
             note_serving(env, cfg, volume_id, report);
             retire_replaced(env, cfg, rp, volume_id, report).await;
             return Ok(());
@@ -487,7 +486,7 @@ async fn up_until(
     let (volume_id, volume_is_new) = if backup {
         (String::new(), false)
     } else {
-        ensure_volume(env, cfg, &seam, report).await?
+        ensure_volume(env, cfg, &*seam, report).await?
     };
     timeline.mark("pod requested", []);
     let user = User {
@@ -579,7 +578,7 @@ async fn up_until(
             }
         },
     );
-    let w = wait_for(env, cfg, rp, &pod_id);
+    let w = wait_for(env, cfg, &seam, &pod_id);
     abort_at.store(interrupt.count() + 2, Ordering::SeqCst);
     let ready = wait::await_recorded(
         &w,
@@ -651,7 +650,7 @@ async fn up_until(
 /// volume is resumed or reused as `viy up` always does; any other is left
 /// alone, since only a new pod can go on the backup (rpctl
 /// `_check_backup_pod`).
-pub fn check_backup_pod(env: &Env<'_>, cfg: &Config, existing: &Value) -> Result<(), CommandError> {
+pub fn check_backup_pod(env: &Env<'_>, cfg: &Config, existing: &Pod) -> Result<(), CommandError> {
     if regions::on_backup(env.paths, existing) {
         return Ok(());
     }
@@ -659,16 +658,21 @@ pub fn check_backup_pod(env: &Env<'_>, cfg: &Config, existing: &Value) -> Result
         "Pod {} named '{}' already exists ({}) and is not on the backup volume, so viy up \
          --backup leaves it alone. viy down terminates it (the weights stay on the volume), then \
          viy up --backup makes one on the backup; viy up alone resumes or reuses it.",
-        text(existing, "id").unwrap_or_default(),
+        existing.id,
         cfg_at(cfg, "POD_NAME"),
-        shown(existing.get("desiredStatus")),
+        existing.state_name.as_deref().unwrap_or("None"),
     )))
 }
 
-fn wait_for<'a>(env: &Env<'a>, cfg: &'a Config, rp: &'a RunPod, pod_id: &'a str) -> PodWait<'a> {
+fn wait_for<'a>(
+    env: &Env<'a>,
+    cfg: &'a Config,
+    seam: &Arc<dyn Provider>,
+    pod_id: &'a str,
+) -> PodWait<'a> {
     PodWait {
         ssh: env.ssh(cfg),
-        rp,
+        seam: Arc::clone(seam),
         http: &**env.http,
         time: env.time,
         pod_id,
@@ -763,23 +767,18 @@ async fn retire_stopped(
     env: &Env<'_>,
     cfg: &Config,
     seam: &dyn Provider,
-    pod: &Value,
+    pod: &Pod,
     error: &ProviderError,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let pod_id = text(pod, "id").unwrap_or_default();
+    let pod_id = pod.id.as_str();
     let region = pod
-        .get("machine")
-        .and_then(|m| text(m, "dataCenterId"))
+        .region
+        .as_deref()
         .unwrap_or_else(|| cfg_at(cfg, "DATA_CENTER_ID"));
-    let volume_id = tracked::pod_volume_id(pod).unwrap_or_default();
+    let volume_id = pod.volume.as_deref().unwrap_or_default();
     // An array of type ids, as the create refusals log theirs.
-    let gpus = json!(
-        pod.get("gpu")
-            .and_then(|gpu| gpu.get("id"))
-            .into_iter()
-            .collect::<Vec<_>>()
-    );
+    let gpus = json!(pod.gpu.iter().collect::<Vec<_>>());
     regions::log_failure(
         env.paths, env.time, cfg, region, "resume", volume_id, &gpus, error,
     );
@@ -931,10 +930,10 @@ pub async fn volume(
 /// `viy status`: the pod's state, GPU, region, cost, endpoint and
 /// transport, the tunnel, and whether vLLM answers.
 pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result<(), CommandError> {
-    let rp = connect(env, cfg)?;
-    let pod = match resolve(&rp, env, cfg, report).await {
+    let seam = provider(env, cfg)?;
+    let pod = match resolve(&seam, env, cfg, report).await {
         Ok(pod) => pod,
-        Err(ResolveError::RunPod(error)) => {
+        Err(ResolveError::Provider(error)) => {
             say(
                 report,
                 Tone::Warn,
@@ -960,8 +959,6 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
         }
         return Ok(());
     };
-    // What it shows, through the provider seam's pod (kb d182).
-    let pod = pod_of(&pod);
     let pod_id = pod.id.as_str();
     let line = |text: String| say(report, Tone::Plain, text);
     let tunnelled = tracked::tunnel_only(env.paths, cfg)?;
@@ -980,7 +977,10 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
     line(format!("  gpu:       {gpu_name} x{count}"));
     line(format!(
         "  region:    {}",
-        pod.region.as_deref().unwrap_or("?")
+        pod.region
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .unwrap_or("?")
     ));
     line(format!(
         "  cost:      ${:.2}/hr",
@@ -1078,9 +1078,9 @@ async fn stop_pod(
 ) -> Result<(), CommandError> {
     let _lock = PodLock::exclusive(env.paths, "stop")?;
     let seam = provider(env, cfg)?;
-    let pod = match resolve(seam.client(), env, cfg, report).await {
+    let pod = match resolve(&seam, env, cfg, report).await {
         Ok(pod) => pod,
-        Err(ResolveError::RunPod(error)) => {
+        Err(ResolveError::Provider(error)) => {
             say(
                 report,
                 Tone::Warn,
@@ -1099,7 +1099,7 @@ async fn stop_pod(
         say(report, Tone::Dim, "No pod to stop.");
         return Ok(());
     };
-    let pod_id = text(&pod, "id").unwrap_or_default();
+    let pod_id = pod.id.as_str();
     // Nothing left to forward to.
     let mut said = |notice| report(Report::Notice(notice));
     tunnel::stop(&env.ssh(cfg), true, &mut said).await?;
@@ -1347,10 +1347,10 @@ pub async fn logs(
     interrupted: impl Future<Output = ()>,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let rp = connect(env, cfg)?;
-    let pod = match resolve(&rp, env, cfg, report).await {
+    let seam = provider(env, cfg)?;
+    let pod = match resolve(&seam, env, cfg, report).await {
         Ok(pod) => pod,
-        Err(ResolveError::RunPod(error)) => {
+        Err(ResolveError::Provider(error)) => {
             say(report, Tone::Warn, "Could not reach RunPod.");
             say(report, Tone::Dim, error.to_string());
             return Ok(());
@@ -1361,7 +1361,7 @@ pub async fn logs(
         say(report, Tone::Dim, "No pod tracked.");
         return Ok(());
     };
-    let pod_id = text(&pod, "id").unwrap_or_default();
+    let pod_id = pod.id.as_str();
     say(
         report,
         Tone::Dim,
@@ -1370,9 +1370,9 @@ pub async fn logs(
     let print = async {
         let mut seen: HashSet<(Option<String>, Option<String>, String)> = HashSet::new();
         loop {
-            let entries = rp.pod_logs(pod_id, 200, Duration::from_secs(8)).await?;
+            let entries = seam.logs(pod_id, 200, Duration::from_secs(8)).await?;
             for entry in &entries {
-                let identity = (entry.ts.clone(), entry.source.clone(), entry.line.clone());
+                let identity = (entry.time.clone(), entry.source.clone(), entry.text.clone());
                 if !seen.insert(identity) {
                     continue;
                 }
@@ -1381,19 +1381,19 @@ pub async fn logs(
                     Tone::Plain,
                     format!(
                         "{} [{}] {}",
-                        entry.ts.as_deref().unwrap_or(""),
+                        entry.time.as_deref().unwrap_or(""),
                         entry.source.as_deref().unwrap_or("?"),
-                        wait::redact_log(&entry.line, cfg)
+                        wait::redact_log(&entry.text, cfg)
                     ),
                 );
             }
             if !follow {
-                return Ok::<(), RunPodError>(());
+                return Ok::<(), ProviderError>(());
             }
             if seen.len() > 5000 {
                 seen = entries
                     .into_iter()
-                    .map(|e| (e.ts, e.source, e.line))
+                    .map(|e| (e.time, e.source, e.text))
                     .collect();
             }
             tokio::time::sleep(Duration::from_secs(2)).await;

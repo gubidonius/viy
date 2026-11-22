@@ -23,6 +23,7 @@ use viy_testkit::time::FakeTime;
 
 use super::*;
 use crate::bootreport::Records;
+use crate::provider::pod_of;
 
 const API_KEY: &str = "rpa_SYNTHETICKEY0000";
 const PROXY: &str = "https://pod111-18999.proxy.runpod.net";
@@ -1621,9 +1622,9 @@ fn a_pod_on_a_recorded_backup_passes_the_backup_check() {
     let backup = json!({"id": "bk", "name": "qwen38-weights-backup", "dataCenterId": "US-MO-1"});
     regions::touch(&home.paths, &backup, 1_784_194_200.0).unwrap();
     let on = json!({"id": "pod111", "networkVolumeId": "bk"});
-    assert!(check_backup_pod(&env, &home.cfg, &on).is_ok());
+    assert!(check_backup_pod(&env, &home.cfg, &pod_of(&on)).is_ok());
     let off = json!({"id": "pod111", "networkVolume": {"id": "vol222"}});
-    assert!(check_backup_pod(&env, &home.cfg, &off).is_err());
+    assert!(check_backup_pod(&env, &home.cfg, &pod_of(&off)).is_err());
 }
 
 #[tokio::test(start_paused = true)]

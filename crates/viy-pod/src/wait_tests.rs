@@ -22,8 +22,11 @@ use viy_testkit::sshd::free_port;
 use viy_testkit::time::FakeTime;
 
 use super::*;
+use crate::api::RunPod;
 use crate::bootreport::tests::entries;
 use crate::notice::ClockPrinter;
+use crate::provider::RunPodProvider;
+use crate::provider::test_seam;
 
 const API_KEY: &str = "rpa_SYNTHETICKEY0000";
 const VLLM_KEY: &str = "sk-SYNTHETICENDPOINT";
@@ -133,8 +136,12 @@ async fn summaries_and_masks_are_rpctls() {
                     Reply::answer(200, body)
                 });
                 let http = Arc::new(FakeHttp::new(replies));
-                let rp = RunPod::new(API_KEY, Arc::new(V1::new(http.clone())));
-                let progress = Progress::new(&rp, "pod111", case["require_ssh"].as_bool().unwrap());
+                let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http.clone()))));
+                let progress = Progress::new(
+                    Arc::new(rp.clone()),
+                    "pod111",
+                    case["require_ssh"].as_bool().unwrap(),
+                );
                 for (i, after) in case["after"].as_array().unwrap().iter().enumerate() {
                     // rpctl's summary is fetched on its first call, again
                     // only once 20 s have passed; one fetch each here.
@@ -397,8 +404,8 @@ fn a_terminal_redraws_the_clock_and_a_log_gets_its_changes() {
 #[tokio::test]
 async fn log_fetch_never_delays_the_health_poll() {
     let http = Arc::new(FakeHttp::new([Reply::Hang]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(http.clone())));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http.clone()))));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     let started = std::time::Instant::now();
     assert_eq!(progress.poll().unwrap(), "");
     assert!(started.elapsed() < Duration::from_millis(500));
@@ -426,8 +433,11 @@ async fn pod_ready_flag_follows_latest_boot() {
         "=== boot Sat Jun 20 ===",
     ]);
     for (reply, want) in [(ready, true), (rebooted, false)] {
-        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))));
-        let progress = Progress::new(&rp, "pod111", true);
+        let rp = test_seam(RunPod::new(
+            API_KEY,
+            Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))),
+        ));
+        let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
         progress.refresh().await;
         assert_eq!(progress.pod_ready(), want);
     }
@@ -436,8 +446,8 @@ async fn pod_ready_flag_follows_latest_boot() {
 #[tokio::test(start_paused = true)]
 async fn ready_in_pod_but_unreachable_warns() {
     let logs = RouteHttp::new(|_| log_reply(&["RPCTL_PHASE model ready; saving startup caches"]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(logs))));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(logs)))));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     let health = RouteHttp::new(|_| Reply::Fail(HttpError::Connect("refused".into())));
     let told = Told::default();
     let url = "http://127.0.0.1:18001";
@@ -555,7 +565,7 @@ impl Home {
     fn wait<'a>(
         &'a self,
         exec: &'a dyn viy_exec::ExecBackend,
-        rp: &'a RunPod,
+        rp: &RunPodProvider,
         http: &'a dyn HttpClient,
     ) -> PodWait<'a> {
         PodWait {
@@ -564,7 +574,7 @@ impl Home {
                 cfg: &self.cfg,
                 exec,
             },
-            rp,
+            seam: Arc::new(rp.clone()),
             http,
             time: &self.time,
             pod_id: "pod111",
@@ -584,12 +594,12 @@ fn events(timeline: &Timeline<'_>) -> Vec<String> {
 #[tokio::test(start_paused = true)]
 async fn a_proxied_pod_is_awaited_at_its_proxy_url() {
     let home = Home::new(false);
-    let rp = RunPod::new(
+    let rp = test_seam(RunPod::new(
         API_KEY,
         Arc::new(V1::new(Arc::new(RouteHttp::new(|_| {
             log_reply(&["loading"])
         })))),
-    );
+    ));
     let polls = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&polls);
     let health = RouteHttp::new(move |_| match counted.fetch_add(1, Ordering::SeqCst) {
@@ -648,7 +658,7 @@ async fn sshd_that_never_comes_up_ends_the_wait() {
             pod_reply(None)
         }
     }));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(api.clone())));
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(api.clone()))));
     let exec = FakeExec::new([]);
     let health = FakeHttp::new([]);
     let w = home.wait(&exec, &rp, &health);
@@ -698,7 +708,7 @@ async fn a_failed_sshd_setup_ends_the_wait_at_once() {
             pod_reply(None)
         }
     });
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api))));
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api)))));
     let exec = FakeExec::new([]);
     let health = FakeHttp::new([]);
     let w = home.wait(&exec, &rp, &health);
@@ -751,7 +761,7 @@ fn vllm_stand_in() -> (u16, Arc<AtomicU16>) {
 struct Pod {
     sshd: LocalSshd,
     home: Home,
-    rp: RunPod,
+    rp: RunPodProvider,
     vllm: Arc<AtomicU16>,
 }
 
@@ -780,7 +790,7 @@ impl Pod {
         Self {
             sshd,
             home,
-            rp: RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api)))),
+            rp: test_seam(RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api))))),
             vllm,
         }
     }
@@ -901,12 +911,12 @@ fn boot_log() -> String {
 async fn a_boot_is_reported_recorded_and_its_logs_collected() {
     let home = Home::new(true);
     let log = boot_log();
-    let rp = RunPod::new(
+    let rp = test_seam(RunPod::new(
         API_KEY,
         Arc::new(V1::new(Arc::new(RouteHttp::new(move |_| {
             Reply::answer(200, log.clone())
         })))),
-    );
+    ));
     let exec = FakeExec::new([Run::StandIn(Command::new("true"))]);
     let health = FakeHttp::new([]);
     let w = home.wait(&exec, &rp, &health);
@@ -982,10 +992,10 @@ async fn a_report_that_fails_only_says_so() {
     let home = Home::new(true);
     // The boots directory cannot be made: a file is in its way.
     fs::write(home.paths.boots_dir(), "").unwrap();
-    let rp = RunPod::new(
+    let rp = test_seam(RunPod::new(
         API_KEY,
         Arc::new(V1::new(Arc::new(RouteHttp::new(|_| log_reply(&[]))))),
-    );
+    ));
     let exec = FakeExec::new([]);
     let health = FakeHttp::new([]);
     let w = home.wait(&exec, &rp, &health);
@@ -1016,12 +1026,12 @@ fn ts(text: &str) -> DateTime<Utc> {
 #[tokio::test]
 async fn an_interrupted_boot_still_leaves_a_record() {
     let home = Home::new(false);
-    let rp = RunPod::new(
+    let rp = test_seam(RunPod::new(
         API_KEY,
         Arc::new(V1::new(Arc::new(RouteHttp::new(|_| {
             log_reply(&["loading"])
         })))),
-    );
+    ));
     let health = RouteHttp::new(|_| Reply::answer(503, ""));
     for booting in [false, true] {
         let exec = FakeExec::new([Run::StandIn(Command::new("true"))]);
@@ -1065,7 +1075,10 @@ async fn an_interrupted_boot_still_leaves_a_record() {
 fn the_wait_can_run_in_the_background() {
     fn send<T: Send>(_: &T) {}
     let home = Home::new(true);
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([])))));
+    let rp = test_seam(RunPod::new(
+        API_KEY,
+        Arc::new(V1::new(Arc::new(FakeHttp::new([])))),
+    ));
     let exec = FakeExec::new([]);
     let health = FakeHttp::new([]);
     let w = home.wait(&exec, &rp, &health);
@@ -1120,14 +1133,14 @@ async fn capture_writes_the_logs_masked_and_the_host() {
             pod_reply(Some(40122))
         }
     });
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api))));
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api)))));
     let exec = FakeExec::new([Run::stdout("vllm says hi\nkey sk-SYNTHETICENDPOINT\n")]);
     let ssh = Ssh {
         paths: &home.paths,
         cfg: &cfg,
         exec: &exec,
     };
-    capture_boot(&ssh, &rp, "20260716T093000Z-pod111", "pod111")
+    capture_boot(&ssh, rp.client(), "20260716T093000Z-pod111", "pod111")
         .await
         .unwrap();
     let id = "20260716T093000Z-pod111";
@@ -1191,14 +1204,14 @@ async fn capture_without_logs_or_ssh_says_why() {
             pod_reply(Some(40122))
         }
     });
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api))));
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(api)))));
     let exec = FakeExec::new([Run::exit(255, "", "Connection refused")]);
     let ssh = Ssh {
         paths: &home.paths,
         cfg: &home.cfg,
         exec: &exec,
     };
-    capture_boot(&ssh, &rp, "20260716T093000Z-pod111", "pod111")
+    capture_boot(&ssh, rp.client(), "20260716T093000Z-pod111", "pod111")
         .await
         .unwrap();
     let data = records.read("20260716T093000Z-pod111").unwrap();
@@ -1228,8 +1241,8 @@ async fn image_pull_is_reported_not_hidden_behind_sshd() {
         )
     };
     let http = Arc::new(FakeHttp::new([body(&downloading), body(&retried)]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(http)));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http))));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     progress.refresh().await;
     assert_eq!(
         progress.summary().result().unwrap(),
@@ -1267,8 +1280,11 @@ async fn a_host_that_cannot_mount_the_volume_ends_the_wait() {
         "2026-08-08T06:53:23Z",
     ]);
     for (reply, fails) in [(once, false), (minute, true)] {
-        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))));
-        let progress = Progress::new(&rp, "pod111", true);
+        let rp = test_seam(RunPod::new(
+            API_KEY,
+            Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))),
+        ));
+        let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
         progress.refresh().await;
         match progress.poll() {
             Err(WaitError::Startup(message)) => {
@@ -1292,8 +1308,11 @@ async fn a_strata_pod_is_ready_by_its_own_lines() {
     let ready = log_reply(&["RPCTL_PHASE starting Strata", "RPCTL_PHASE model ready"]);
     let restarted = log_reply(&["RPCTL_PHASE model ready", "RPCTL_PHASE starting Strata"]);
     for (reply, want) in [(ready, true), (restarted, false)] {
-        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))));
-        let progress = Progress::new(&rp, "pod111", true);
+        let rp = test_seam(RunPod::new(
+            API_KEY,
+            Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))),
+        ));
+        let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
         progress.refresh().await;
         assert_eq!(progress.pod_ready(), want);
     }
@@ -1330,8 +1349,8 @@ async fn old_pull_lines_do_not_take_the_progress_back() {
         body(pull.iter().cloned().chain([loading]).collect()),
         body(pull.iter().cloned().chain(refused).collect()),
     ]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(http)));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http))));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     let mut seen = Vec::new();
     for _ in 0..3 {
         progress.refresh().await;
@@ -1385,8 +1404,11 @@ async fn unauthorized_is_not_ready() {
 #[tokio::test]
 async fn ssh_failure_surfaces_from_platform_log() {
     let reply = log_reply(&["RPCTL_ERROR sshd setup or daemon failed (exit 23)"]);
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(
+        API_KEY,
+        Arc::new(V1::new(Arc::new(FakeHttp::new([reply])))),
+    ));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     progress.refresh().await;
     assert!(matches!(progress.poll(), Err(WaitError::Startup(_))));
 }
@@ -1413,8 +1435,8 @@ async fn a_rate_limited_wait_says_it_cannot_see_the_pod_not_the_last_stage() {
         )],
     };
     let http = Arc::new(FakeHttp::new([pull.clone(), limited, pull]));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(http.clone())));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(http.clone()))));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     let mut seen = Vec::new();
     progress.refresh().await;
     seen.push(progress.summary().result().unwrap());
@@ -1480,8 +1502,8 @@ async fn past_the_boot_budget_the_wait_asks_runpod_less_often() {
             Reply::answer(200, pod.to_string())
         })
     };
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(http))));
-    let progress = Progress::new(&rp, "pod111", true);
+    let rp = test_seam(RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(http)))));
+    let progress = Progress::new(Arc::new(rp.clone()), "pod111", true);
     let told = Told::default();
     let got = wait_ssh(
         &rp,

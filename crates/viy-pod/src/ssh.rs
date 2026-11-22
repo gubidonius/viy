@@ -31,7 +31,6 @@ use viy_config::Paths;
 use viy_exec::Command;
 use viy_exec::ExecBackend;
 
-use crate::api::RunPod;
 use crate::compile_regex;
 use crate::notice::Notice;
 use crate::notice::Say;
@@ -41,6 +40,8 @@ use crate::state::PodState;
 use crate::wait::LONG_WAIT_POD_EVERY;
 use crate::wait::SSH_POLL;
 use crate::wait::runpod_every;
+use viy_provider::Provider;
+use viy_provider::ProviderError;
 
 /// What the ssh and tunnel functions work with.
 #[derive(Clone, Copy)]
@@ -107,13 +108,13 @@ static FINGERPRINT: LazyLock<Regex> = LazyLock::new(|| compile_regex(r"(SHA256:[
 /// The fingerprints the pod printed for its sshd key, from RunPod's log
 /// API: a channel apart from the SSH connection.
 pub async fn logged_host_keys(
-    rp: &RunPod,
+    seam: &dyn Provider,
     pod_id: &str,
-) -> Result<BTreeSet<String>, crate::api::RunPodError> {
-    let entries = rp.pod_logs(pod_id, 5000, Duration::from_secs(10)).await?;
-    Ok(entries
+) -> Result<BTreeSet<String>, ProviderError> {
+    let lines = seam.logs(pod_id, 5000, Duration::from_secs(10)).await?;
+    Ok(lines
         .iter()
-        .filter_map(|e| LOGGED_HOST_KEY.captures(&e.line))
+        .filter_map(|e| LOGGED_HOST_KEY.captures(&e.text))
         .map(|m| m[1].to_string())
         .collect())
 }
@@ -263,19 +264,26 @@ impl Ssh<'_> {
     /// once per volume.
     pub async fn pin_checked_key(
         &self,
-        rp: &RunPod,
+        seam: &dyn Provider,
         ip: &str,
         port: u16,
         say: Say<'_>,
     ) -> io::Result<Checked> {
         let state = state::load(self.paths)?;
-        self.pin_checked(rp, &state, &host_key_alias(&state, self.cfg), ip, port, say)
-            .await
+        self.pin_checked(
+            seam,
+            &state,
+            &host_key_alias(&state, self.cfg),
+            ip,
+            port,
+            say,
+        )
+        .await
     }
 
     async fn pin_checked(
         &self,
-        rp: &RunPod,
+        seam: &dyn Provider,
         state: &PodState,
         alias: &str,
         ip: &str,
@@ -283,7 +291,7 @@ impl Ssh<'_> {
         say: Say<'_>,
     ) -> io::Result<Checked> {
         let logged = match state.pod_id() {
-            Some(pod_id) => logged_host_keys(rp, pod_id).await.unwrap_or_default(),
+            Some(pod_id) => logged_host_keys(seam, pod_id).await.unwrap_or_default(),
             None => BTreeSet::new(),
         };
         if logged.is_empty() {
@@ -338,7 +346,7 @@ impl Ssh<'_> {
     /// True when the pod lets us in.
     pub async fn preflight(
         &self,
-        rp: &RunPod,
+        seam: &dyn Provider,
         ip: &str,
         port: u16,
         say: Say<'_>,
@@ -350,7 +358,7 @@ impl Ssh<'_> {
         let first_contact = self.fingerprint_under(&alias).await?.is_none();
         let checked = if first_contact {
             Some(
-                self.pin_checked(rp, &state, &alias, ip, port, &mut *say)
+                self.pin_checked(seam, &state, &alias, ip, port, &mut *say)
                     .await?,
             )
         } else {
@@ -442,7 +450,7 @@ pub fn rate_limited(wait: Duration) -> String {
 /// probe, since a starting or restarted pod can change its mapping; past
 /// the boot budget, every [`LONG_WAIT_POD_EVERY`] (kb d141).
 pub struct SshWatch<'a> {
-    rp: &'a RunPod,
+    seam: &'a dyn Provider,
     pod_id: String,
     started: Instant,
     /// When RunPod was last asked.
@@ -453,9 +461,9 @@ pub struct SshWatch<'a> {
 }
 
 impl<'a> SshWatch<'a> {
-    pub fn new(rp: &'a RunPod, pod_id: impl Into<String>) -> Self {
+    pub fn new(seam: &'a dyn Provider, pod_id: impl Into<String>) -> Self {
         Self {
-            rp,
+            seam,
             pod_id: pod_id.into(),
             started: Instant::now(),
             asked: None,
@@ -476,13 +484,13 @@ impl<'a> SshWatch<'a> {
             .is_none_or(|at| at.elapsed() + SSH_POLL / 2 >= every)
         {
             self.asked = Some(Instant::now());
-            match self.rp.get_pod(&self.pod_id).await {
+            match self.seam.pod(&self.pod_id).await {
                 Ok(pod) => {
-                    self.endpoint = pod.as_ref().and_then(ssh_endpoint);
+                    self.endpoint = pod.and_then(|p| p.ssh);
                     self.limited_until = None;
                 }
                 Err(error) => {
-                    self.limited_until = error.retry_after().map(|wait| Instant::now() + wait);
+                    self.limited_until = error.retry_after.map(|wait| Instant::now() + wait);
                 }
             }
         }
