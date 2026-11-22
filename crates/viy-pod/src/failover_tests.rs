@@ -36,6 +36,7 @@ use super::*;
 use crate::api::RunPod;
 use crate::notice::Asking;
 use crate::notice::Report;
+use crate::provider::error_of;
 use crate::regions::Snapshot;
 
 /// tools/fixtures.py FO_NOW and API_KEY.
@@ -198,6 +199,11 @@ impl Replayed {
     }
 }
 
+/// A pod as the comparison shows it: its id, and all of it.
+fn seen(pod: &viy_provider::Pod) -> Value {
+    json!({"id": pod.id, "pod": format!("{pod:?}")})
+}
+
 /// Runs `case` in viy and checks it against what rpctl did.
 async fn replay(case: &Value) -> Replayed {
     let name = case["name"].as_str().unwrap_or_default().to_string();
@@ -211,9 +217,18 @@ async fn replay(case: &Value) -> Replayed {
         "{name}: questions"
     );
     assert_eq!(json!(replayed.said), viy(&case["said"]), "{name}: notices");
+    // rpctl's created pod as the provider seam reads RunPod's answer.
+    let mut expected = case.clone();
+    if case["call"].as_str().unwrap_or("create_pod") == "create_pod"
+        && let Some(pod) = expected["ok"].get_mut(0)
+    {
+        *pod = seen(&crate::provider::pod_of(&crate::wire::pod(
+            viy_testkit::runpod_v1::v2_pod(pod.clone()),
+        )));
+    }
     for key in ["ok", "exit", "interrupted", "error"] {
-        if !case[key].is_null() || !replayed.outcome[key].is_null() {
-            assert_eq!(replayed.outcome[key], case[key], "{name}: {key}");
+        if !expected[key].is_null() || !replayed.outcome[key].is_null() {
+            assert_eq!(replayed.outcome[key], expected[key], "{name}: {key}");
         }
     }
     if let Some(stdout) = case["stdout"].as_str() {
@@ -360,6 +375,7 @@ async fn run_case(case: &Value) -> Replayed {
                 &env,
                 &cfg,
                 &rp,
+                Some(&rp),
                 key,
                 Some("ssh-ed25519 AAAAsynthetic"),
                 user,
@@ -380,7 +396,7 @@ async fn run_case(case: &Value) -> Replayed {
                     );
                     let waited = created.waited.as_secs_f64();
                     assert_eq!(json!(waited), case["answer_wait"], "{name}: waited");
-                    json!({"ok": [created.pod, created.volume_id, created.volume_is_new]})
+                    json!({"ok": [seen(&created.pod), created.volume_id, created.volume_is_new]})
                 }
                 Err(CommandError::Failed) => json!({"exit": 1}),
                 Err(CommandError::Interrupted) => json!({"interrupted": true}),
@@ -929,10 +945,10 @@ fn a_region_rejection_of_the_backup_itself_still_stops() {
         "POST /pods -> HTTP 400\n... dataCenterIds/items/enum: value must be one of ...",
         Some(400),
     );
-    assert!(regions::is_region_rejected(&rejected));
+    assert!(regions::is_region_rejected(&error_of(&rejected)));
     assert!(!regions::is_capacity_error(&rejected));
     let full = RunPodError::new("There are no instances currently available", Some(500));
-    assert!(!regions::is_region_rejected(&full));
+    assert!(!regions::is_region_rejected(&error_of(&full)));
 }
 
 // ------------------------------------------- GPU_PREFERRED (kb d138)
@@ -1419,7 +1435,5 @@ fn a_refusal_through_the_seam_stays_a_refusal() {
     let Stop::Refused(error) = Stop::from(CommandError::Provider(seam.clone())) else {
         panic!("not a refusal");
     };
-    assert_eq!(error.to_string(), seam.message);
-    assert_eq!(error.status_code(), Some(400));
-    assert!(is_capacity_error(&error));
+    assert_eq!(error, seam);
 }

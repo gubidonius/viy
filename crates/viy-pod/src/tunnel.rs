@@ -320,7 +320,7 @@ pub enum TunnelError {
 /// The tracked pod's id and SSH endpoint.
 pub async fn resolve_target(
     ssh: &Ssh<'_>,
-    seam: &RunPodProvider,
+    seam: &dyn Provider,
     say: Say<'_>,
 ) -> Result<(String, String, u16), TunnelError> {
     let unreachable = |say: Say<'_>, error: &dyn std::fmt::Display| {
@@ -328,7 +328,7 @@ pub async fn resolve_target(
         say(Notice::new(Tone::Dim, error.to_string()));
         TunnelError::Failed
     };
-    let found = tracked::resolve(seam.client(), ssh.paths, ssh.cfg, |multiple| {
+    let found = tracked::resolve(seam, ssh.paths, ssh.cfg, |multiple| {
         say(Notice::new(Tone::Warn, multiple.to_string()));
     })
     .await;
@@ -345,7 +345,7 @@ pub async fn resolve_target(
     };
     let id = pod.id.clone();
     // A pod from the list can lack its port mappings; the detail has them.
-    let pod = match Provider::pod(seam, &id).await {
+    let pod = match seam.pod(&id).await {
         Ok(detail) => detail.unwrap_or(pod),
         Err(e) => return Err(unreachable(say, &e)),
     };
@@ -592,8 +592,8 @@ pub async fn command(
         return Ok(());
     }
     let runpod = connect().map_err(TunnelError::Exit)?;
-    let (pod_id, ip, port) = resolve_target(ssh, &runpod, &mut *say).await?;
     let seam: &dyn Provider = &runpod;
+    let (pod_id, ip, port) = resolve_target(ssh, seam, &mut *say).await?;
     if !tracked::tunnel_only(ssh.paths, ssh.cfg)? {
         say(Notice::new(
             Tone::Warn,

@@ -8,12 +8,11 @@
 //! (CLOUD_TYPE, GPU_TYPE_PRIORITY) from its configuration. `viy status`,
 //! `stop`, `down`'s sweep, the shutdown's running-pod check and the reaper
 //! go through it since WP 9.36; `up`'s resume and volumes since 9.37, the
-//! engines' requests since 9.38, the waits, ssh and the tunnel since 9.37b;
-//! since 9.37c failover asks with the engine's [`PodRequest`] through
-//! [`RunPodProvider::create_v1`] and reads the stock through [`Regions`].
-//! What stays RunPod's: `tracked` finds and caches the pod by RunPod's rules
-//! while rp shares `pod.json` (the commands get a [`Pod`]), the backup
-//! volumes and backups.json, and `capture-boot`'s host facts.
+//! engines' requests since 9.38, the waits, ssh and the tunnel since 9.37b,
+//! failover's requests and the stock (through [`Regions`]) since 9.37c, and
+//! the pod's tracking and `up`'s create since 9.40. What stays RunPod's:
+//! the backup volumes and backups.json that failover moves, and
+//! `capture-boot`'s host facts.
 
 use std::time::Duration;
 
@@ -48,8 +47,8 @@ pub struct RunPodProvider {
 }
 
 impl RunPodProvider {
-    /// The client, for what stays RunPod's: tracking the pod in pod.json and
-    /// the backup volumes.
+    /// The client, for what stays RunPod's: the backup volumes and
+    /// backups.json, and `capture-boot`'s host facts.
     pub fn client(&self) -> &RunPod {
         &self.rp
     }
@@ -67,16 +66,6 @@ impl RunPodProvider {
     /// (`viy_engine::pod::runpod_body`), with this provider's settings.
     pub fn body(&self, request: &PodRequest) -> Value {
         viy_engine::pod::runpod_body(&self.cloud, &self.gpu_priority, request)
-    }
-
-    /// [`Provider::create`] in RunPod's own shape, for what `up` stores
-    /// where rp reads it (pod.json's `costPerHr` as RunPod sent it): the
-    /// pod, or "RunPod created no pod" for an answer without its id.
-    pub async fn create_v1(&self, request: &PodRequest) -> Result<Value, RunPodError> {
-        match self.rp.create_pod(self.body(request)).await? {
-            Some(pod) if pod.get("id").and_then(Value::as_str).is_some() => Ok(pod),
-            _ => Err(RunPodError::new("RunPod created no pod", None)),
-        }
     }
 
     /// Whether the stock is read for SECURE cloud: CLOUD_TYPE, SECURE when
@@ -236,8 +225,10 @@ impl Provider for RunPodProvider {
 
     fn create<'a>(&'a self, request: &'a PodRequest) -> BoxFuture<'a, viy_provider::Result<Pod>> {
         Box::pin(async move {
-            let created = pod_of(&self.create_v1(request).await.map_err(err)?);
-            Some(created)
+            let created = self.rp.create_pod(self.body(request)).await.map_err(err)?;
+            created
+                .as_ref()
+                .map(pod_of)
                 .filter(|p| !p.id.is_empty())
                 .ok_or_else(|| without_id("pod"))
         })

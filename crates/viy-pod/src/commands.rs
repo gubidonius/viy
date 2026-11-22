@@ -208,37 +208,18 @@ pub fn provider(env: &Env<'_>, cfg: &Config) -> Result<RunPodProvider, CommandEr
     Ok(RunPodProvider::new(connect(env, cfg)?, cfg))
 }
 
-/// Our pod, several of that name said as rpctl does; found and cached by
-/// RunPod's rules while rp shares `pod.json` (`tracked`).
+/// Our pod as the provider has it, several of that name said as rpctl
+/// does.
 pub(crate) async fn resolve(
-    seam: &RunPodProvider,
+    seam: &dyn Provider,
     env: &Env<'_>,
     cfg: &Config,
     report: Reporter<'_>,
 ) -> Result<Option<Pod>, ResolveError> {
-    tracked::resolve(seam.client(), env.paths, cfg, |many| {
+    tracked::resolve(seam, env.paths, cfg, |many| {
         say(report, Tone::Warn, many.to_string());
     })
     .await
-}
-
-fn text<'v>(pod: &'v Value, key: &str) -> Option<&'v str> {
-    pod.get(key).and_then(Value::as_str)
-}
-
-/// A number RunPod sent as a number or a string, as Python's `float()`
-/// reads it; 0 when it is neither.
-fn number(value: Option<&Value>) -> f64 {
-    match value {
-        Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-        Some(Value::String(s)) => s.trim().parse().unwrap_or(0.0),
-        _ => 0.0,
-    }
-}
-
-/// Python's truthiness, for a value RunPod sent.
-fn truthy(value: Option<&Value>) -> bool {
-    crate::api::truthy(value.unwrap_or(&Value::Null))
 }
 
 fn cfg_at<'c>(cfg: &'c Config, key: &str) -> &'c str {
@@ -267,9 +248,12 @@ pub async fn up(
     // wait, whose own handling of the first records the boot.
     let abort_at = AtomicU32::new(interrupt.count() + 1);
     let aborted = interrupt.when(|c| *c >= abort_at.load(Ordering::SeqCst));
+    let work = up_until(
+        env, cfg, None, timeout, backup, interrupt, &abort_at, report, ask,
+    );
     tokio::select! {
         biased;
-        result = up_until(env, cfg, timeout, backup, interrupt, &abort_at, report, ask) => result,
+        result = work => result,
         () = aborted => Err(CommandError::Interrupted),
     }
 }
@@ -303,6 +287,7 @@ fn check_pod_engine(env: &Env<'_>, cfg: &Config, pod_id: &str) -> Result<(), Com
 async fn up_until(
     env: &Env<'_>,
     cfg: &mut Config,
+    given: Option<Arc<dyn Provider>>,
     timeout: Duration,
     backup: bool,
     interrupt: &Interrupt,
@@ -317,14 +302,26 @@ async fn up_until(
     let mut started = Instant::now();
     let mut started_wall = env.time.now();
     let mut timeline = Timeline::start(env.time);
-    let runpod = Arc::new(provider(env, cfg)?);
-    let seam: Arc<dyn Provider> = runpod.clone();
-    // The backup volumes are RunPod's own (docs/provider-seam.md 2).
-    let rp = runpod.client();
+    // RunPod from the config, or the provider given (the tests' second
+    // one); RunPod's own side is its failover and backup volumes
+    // (docs/provider-seam.md 2).
+    let (seam, runpod): (Arc<dyn Provider>, Option<Arc<RunPodProvider>>) = match given {
+        Some(seam) => (seam, None),
+        None => {
+            let runpod = Arc::new(provider(env, cfg)?);
+            (runpod.clone(), Some(runpod))
+        }
+    };
+    if backup && runpod.is_none() {
+        return Err(CommandError::Exit(format!(
+            "viy up --backup boots on RunPod's backup volume; {} has none.",
+            seam.name()
+        )));
+    }
     let vllm_key = profiles::ensure_vllm_api_key(cfg, env.paths)?;
 
     // Never create a duplicate: adopt any existing pod with our name first.
-    let existing = match resolve(&runpod, env, cfg, report).await {
+    let existing = match resolve(&*seam, env, cfg, report).await {
         Ok(existing) => existing,
         Err(ResolveError::Provider(error)) => {
             // A 429 says when RunPod takes requests again (kb d140).
@@ -332,11 +329,16 @@ async fn up_until(
                 || "in a moment".to_string(),
                 |wait| format!("in {}", spoken(wait)),
             );
+            let who = if runpod.is_some() {
+                "RunPod"
+            } else {
+                seam.name()
+            };
             say(
                 report,
                 Tone::Error,
                 format!(
-                    "Could not check RunPod for an existing pod, so not creating one (that \
+                    "Could not check {who} for an existing pod, so not creating one (that \
                      would risk a duplicate). Try again {when}."
                 ),
             );
@@ -406,7 +408,7 @@ async fn up_until(
                  viy up) closes that route.",
             );
         }
-        let w = wait_for(env, cfg, &seam, &pod_id);
+        let w = wait_for(env, cfg, &seam, runpod.is_some(), &pod_id);
         abort_at.store(interrupt.count() + 2, Ordering::SeqCst);
         let ready = wait::await_recorded(
             &w,
@@ -445,9 +447,12 @@ async fn up_until(
                 )
                 .await;
             }
-            let volume_id = existing.volume.as_deref().unwrap_or_default();
-            note_serving(env, cfg, volume_id, report);
-            retire_replaced(env, cfg, rp, volume_id, report).await;
+            // The primary's countdown and the backups are RunPod's reap's.
+            if let Some(runpod) = &runpod {
+                let volume_id = existing.volume.as_deref().unwrap_or_default();
+                note_serving(env, cfg, volume_id, report);
+                retire_replaced(env, cfg, runpod.client(), volume_id, report).await;
+            }
             return Ok(());
         }
         if booting {
@@ -495,7 +500,15 @@ async fn up_until(
         interrupt,
         abort_at,
     };
-    let creation = Creation::new(env, cfg, &runpod, &vllm_key, pubkey.as_deref(), user);
+    let creation = Creation::new(
+        env,
+        cfg,
+        &*seam,
+        runpod.as_deref(),
+        &vllm_key,
+        pubkey.as_deref(),
+        user,
+    );
     let created = if backup {
         creation.run_on_backup().await?
     } else {
@@ -512,8 +525,8 @@ async fn up_until(
     booted.set("DATA_CENTER_ID", &created.region);
     let cfg = &booted;
     let (pod, volume_id, volume_is_new) = (created.pod, created.volume_id, created.volume_is_new);
-    let pod_id = text(&pod, "id").unwrap_or_default().to_string();
-    let cost = pod.get("costPerHr");
+    let pod_id = pod.id.clone();
+    let cost = pod.cost_per_hour;
     timeline.mark("pod created", [("pod_id", json!(pod_id))]);
     // The transport is recorded now: the exposed ports and vLLM's bind
     // address are fixed for this pod's life, so a later TUNNEL flip must
@@ -524,7 +537,7 @@ async fn up_until(
         [
             (key::POD_ID, json!(pod_id)),
             (key::CREATED_AT, json!(created_at)),
-            (key::COST_PER_HR, cost.cloned().unwrap_or(Value::Null)),
+            (key::COST_PER_HR, json!(cost)),
             (key::TUNNEL_ONLY, json!(tunnel_enabled(cfg))),
             (key::VOLUME_ID, json!(volume_id)),
         ],
@@ -540,14 +553,11 @@ async fn up_until(
         }
     })?;
     say(report, Tone::Ok, format!("  pod id:   {pod_id}"));
-    if truthy(cost) {
+    if let Some(cost) = cost.filter(|c| c.is_finite() && *c != 0.0) {
         say(
             report,
             Tone::Warn,
-            format!(
-                "  cost:     ${:.2}/hr  <-- billing has started",
-                number(cost)
-            ),
+            format!("  cost:     ${cost:.2}/hr  <-- billing has started"),
         );
     }
     say(
@@ -578,7 +588,7 @@ async fn up_until(
             }
         },
     );
-    let w = wait_for(env, cfg, &seam, &pod_id);
+    let w = wait_for(env, cfg, &seam, runpod.is_some(), &pod_id);
     abort_at.store(interrupt.count() + 2, Ordering::SeqCst);
     let ready = wait::await_recorded(
         &w,
@@ -625,8 +635,10 @@ async fn up_until(
             report,
         )
         .await;
-        note_serving(env, cfg, &volume_id, report);
-        retire_replaced(env, cfg, rp, &volume_id, report).await;
+        if let Some(runpod) = &runpod {
+            note_serving(env, cfg, &volume_id, report);
+            retire_replaced(env, cfg, runpod.client(), &volume_id, report).await;
+        }
         return Ok(());
     }
     let now = env.time.now();
@@ -668,11 +680,13 @@ fn wait_for<'a>(
     env: &Env<'a>,
     cfg: &'a Config,
     seam: &Arc<dyn Provider>,
+    capture: bool,
     pod_id: &'a str,
 ) -> PodWait<'a> {
     PodWait {
         ssh: env.ssh(cfg),
         seam: Arc::clone(seam),
+        capture,
         http: &**env.http,
         time: env.time,
         pod_id,

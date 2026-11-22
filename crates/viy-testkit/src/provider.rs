@@ -1,7 +1,7 @@
-//! A scripted second GPU provider (WP 9.39, kb d182): pods held in memory,
-//! no volumes and no regions, every call recorded. The pod commands'
-//! provider-neutral paths run on it in the tests, to show that they need
-//! nothing of RunPod's.
+//! A scripted second GPU provider (WP 9.39, 9.40, kb d182): pods held in
+//! memory, volumes only when the test gives one, no regions, every call
+//! recorded. The pod commands run on it in the tests, to show that they
+//! need nothing of RunPod's.
 
 use std::sync::Mutex;
 use std::sync::PoisonError;
@@ -15,6 +15,8 @@ use viy_provider::PodState;
 use viy_provider::Provider;
 use viy_provider::ProviderError;
 use viy_provider::Result;
+use viy_provider::Volume;
+use viy_provider::Volumes;
 
 /// The provider's state: its pods, their log, the calls made.
 #[derive(Debug, Default)]
@@ -26,6 +28,10 @@ struct Book {
     /// a booting pod's is.
     ssh_hidden_for: usize,
     created: usize,
+    /// `None`: the provider has no volumes at all.
+    volumes: Option<Vec<Volume>>,
+    /// Every create is refused for capacity with this message.
+    refusal: Option<String>,
 }
 
 /// The scripted provider. Its pods change as the calls say: `start` runs
@@ -52,6 +58,26 @@ impl Scripted {
                 text: text.into(),
             })
             .collect();
+        self
+    }
+
+    /// A network volume, which also gives the provider volumes.
+    pub fn with_volume(self, id: &str, name: &str, region: &str) -> Self {
+        self.book()
+            .volumes
+            .get_or_insert_with(Vec::new)
+            .push(Volume {
+                id: id.into(),
+                name: Some(name.into()),
+                region: Some(region.into()),
+                size_gb: Some(100),
+            });
+        self
+    }
+
+    /// Every create refused: no GPU of the kind asked for is free.
+    pub fn refusing(self, message: &str) -> Self {
+        self.book().refusal = Some(message.into());
         self
     }
 
@@ -156,6 +182,15 @@ impl Provider for Scripted {
     fn create<'a>(&'a self, request: &'a PodRequest) -> BoxFuture<'a, Result<Pod>> {
         Box::pin(async move {
             let mut book = self.call(format!("create {}", request.name));
+            if let Some(message) = &book.refusal {
+                return Err(ProviderError {
+                    message: message.clone(),
+                    status: Some(400),
+                    capacity: true,
+                    transient: false,
+                    retry_after: None,
+                });
+            }
             book.created += 1;
             let mut made = pod(
                 &format!("scripted{}", book.created),
@@ -163,6 +198,7 @@ impl Provider for Scripted {
                 PodState::Running,
             );
             made.region = Some(request.region.clone());
+            made.volume.clone_from(&request.volume);
             book.pods.push(made.clone());
             Ok(made)
         })
@@ -198,6 +234,61 @@ impl Provider for Scripted {
             let book = self.call(format!("logs {id}"));
             let skip = book.logs.len().saturating_sub(tail as usize);
             Ok(book.logs[skip..].to_vec())
+        })
+    }
+
+    fn volumes(&self) -> Option<&dyn Volumes> {
+        self.book()
+            .volumes
+            .is_some()
+            .then_some(self as &dyn Volumes)
+    }
+}
+
+impl Volumes for Scripted {
+    fn list(&self) -> BoxFuture<'_, Result<Vec<Volume>>> {
+        Box::pin(async move {
+            Ok(self
+                .call("volumes".into())
+                .volumes
+                .clone()
+                .unwrap_or_default())
+        })
+    }
+
+    fn get<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Volume>>> {
+        Box::pin(async move {
+            let book = self.call(format!("volume {id}"));
+            Ok(book.volumes.iter().flatten().find(|v| v.id == id).cloned())
+        })
+    }
+
+    fn create<'a>(
+        &'a self,
+        name: &'a str,
+        size_gb: u64,
+        region: &'a str,
+    ) -> BoxFuture<'a, Result<Volume>> {
+        Box::pin(async move {
+            let mut book = self.call(format!("create volume {name}"));
+            let made = Volume {
+                id: format!("vol-{name}"),
+                name: Some(name.into()),
+                region: Some(region.into()),
+                size_gb: Some(size_gb),
+            };
+            book.volumes.get_or_insert_with(Vec::new).push(made.clone());
+            Ok(made)
+        })
+    }
+
+    fn delete<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut book = self.call(format!("delete volume {id}"));
+            if let Some(volumes) = &mut book.volumes {
+                volumes.retain(|v| v.id != id);
+            }
+            Ok(())
         })
     }
 }

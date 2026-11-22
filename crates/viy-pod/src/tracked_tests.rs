@@ -11,6 +11,7 @@ use viy_testkit::scratch::ScratchDir;
 use super::*;
 use crate::api::RunPod;
 use crate::provider::pod_of;
+use crate::provider::test_seam;
 
 /// The fixture's synthetic key (tools/fixtures.py API_KEY).
 const API_KEY: &str = "rpa_SYNTHETICKEY0000";
@@ -65,7 +66,7 @@ async fn resolve_and_base_url_do_what_rpctls_do() {
         let mut said = Vec::new();
         let outcome = match case["call"].as_str().unwrap() {
             "resolve_pod" => {
-                let rp = RunPod::new(API_KEY, http.clone());
+                let rp = test_seam(RunPod::new(API_KEY, http.clone()));
                 resolve(&rp, &paths, &cfg, |n| said.push(n.to_string()))
                     .await
                     .map(|pod| Picked::Pod(pod.map(Box::new)))
@@ -172,7 +173,10 @@ async fn an_answer_without_an_id_never_clears_the_cache() {
             None => Reply::answer(404, "{}"),
         }];
         replies.extend(list.map(|l| Reply::answer(200, l.to_string())));
-        let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new(replies)))));
+        let rp = test_seam(RunPod::new(
+            API_KEY,
+            Arc::new(V1::new(Arc::new(FakeHttp::new(replies)))),
+        ));
         let mut cfg = Config::defaults();
         cfg.set("POD_NAME", "qwen-pod");
         let pod = resolve(&rp, &paths, &cfg, |_| {}).await.unwrap();
@@ -218,7 +222,10 @@ async fn adopt(get: Reply, list: Option<Value>) -> (Option<Pod>, PodState, Paths
     .unwrap();
     let mut replies = vec![get];
     replies.extend(list.map(|l| Reply::answer(200, l.to_string())));
-    let rp = RunPod::new(API_KEY, Arc::new(V1::new(Arc::new(FakeHttp::new(replies)))));
+    let rp = test_seam(RunPod::new(
+        API_KEY,
+        Arc::new(V1::new(Arc::new(FakeHttp::new(replies)))),
+    ));
     let mut cfg = Config::defaults();
     cfg.set("POD_NAME", "p");
     let found = resolve(&rp, &paths, &cfg, |_| {}).await.unwrap();
@@ -284,20 +291,16 @@ fn as_v2_tells_it(pod: &Value) -> Value {
     }
 }
 
-/// pod.json keeps the price as RunPod sent it, a whole number or a string
-/// too, as rp's cache does: the commands read the seam's `Pod`, the file
-/// stays RunPod's while rp shares it (WP 9.37b).
+/// pod.json keeps the price as the number the seam reads, whether RunPod
+/// sent a whole number, a string or a fraction: since `viy migrate
+/// --finish` the file is viy's alone (WP 9.40, kb d135).
 #[tokio::test]
-async fn the_cache_keeps_runpods_price_as_sent() {
-    for cost in [json!(1), json!("0.79"), json!(2.5)] {
+async fn the_cache_keeps_the_price_as_a_number() {
+    for (cost, number) in [(json!(1), 1.0), (json!("0.79"), 0.79), (json!(2.5), 2.5)] {
         let pods =
             json!([{"id": "new", "name": "p", "desiredStatus": "RUNNING", "costPerHr": cost}]);
         let (found, state, _, _dir) = adopt(Reply::answer(404, "{}"), Some(pods)).await;
-        assert_eq!(state.get(key::COST_PER_HR), Some(&cost), "{cost}");
-        assert_eq!(
-            found.unwrap().cost_per_hour,
-            cost.as_f64().or(Some(0.79)),
-            "{cost}"
-        );
+        assert_eq!(state.get(key::COST_PER_HR), Some(&json!(number)), "{cost}");
+        assert_eq!(found.unwrap().cost_per_hour, Some(number), "{cost}");
     }
 }

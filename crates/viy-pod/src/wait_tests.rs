@@ -575,6 +575,7 @@ impl Home {
                 exec,
             },
             seam: Arc::new(rp.clone()),
+            capture: true,
             http,
             time: &self.time,
             pod_id: "pod111",

@@ -73,15 +73,15 @@ const DAY_S: f64 = 86400.0;
 /// dataCenterIds names a region outside the API's list. GraphQL's
 /// dataCenters may still list that region as supporting network volumes
 /// (US-NE-1 on 2026-07-29, where a volume was made and the pod refused).
-pub fn is_region_rejected(error: &RunPodError) -> bool {
-    error.status_code() == Some(400) && error.to_string().contains("dataCenterIds")
+pub fn is_region_rejected(error: &ProviderError) -> bool {
+    error.status == Some(400) && error.message.contains("dataCenterIds")
 }
 
 /// True when RunPod refuses a new volume because its region lacks the
 /// storage tier asked for (AP-IN-1 on 2026-07-30: "Standard storage is not
 /// available in data center \"AP-IN-1\".", HTTP 400).
-pub fn is_tier_unavailable(error: &RunPodError) -> bool {
-    error.status_code() == Some(400) && error.to_string().contains("storage is not available")
+pub fn is_tier_unavailable(error: &ProviderError) -> bool {
+    error.status == Some(400) && error.message.contains("storage is not available")
 }
 
 /// BACKUP_VOLUME_TYPE: the storage tier of a backup volume viy makes, None

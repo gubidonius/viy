@@ -515,7 +515,10 @@ async fn a_volume_with_a_tier_asks_for_it_and_reads_as_v1s() {
         .create_volume("w-backup", 100, "AP-IN-1", Some("STANDARD"))
         .await
         .unwrap_err();
-    assert!(crate::regions::is_tier_unavailable(&error), "{error}");
+    assert!(
+        crate::regions::is_tier_unavailable(&crate::provider::error_of(&error)),
+        "{error}"
+    );
 }
 
 // ---- RunPod's REST v2 on the wire (kb d151) ------------------------------

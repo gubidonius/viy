@@ -1869,6 +1869,125 @@ mod on_a_second_provider {
         );
     }
 
+    /// WP 9.40: a whole `viy up` on the second provider (one request, no
+    /// failover, its volume), then `viy status` finding the pod through
+    /// pod.json. Only vLLM's /health is asked over HTTP.
+    #[tokio::test(start_paused = true)]
+    async fn up_creates_on_it_and_status_finds_the_pod() {
+        let mut home = Home::new(None, |r: &viy_http::Request| {
+            assert!(r.url.ends_with("/health"), "RunPod asked: {}", r.url);
+            Reply::answer(200, "")
+        });
+        let seam = Arc::new(
+            Scripted::default()
+                .with_volume("vol222", "qwen38-weights", "EUR-IS-1")
+                .with_logs(["API server: HTTP server started"]),
+        );
+        let given: Arc<dyn Provider> = seam.clone();
+        let told = Told::default();
+        let abort_at = AtomicU32::new(1);
+        let env = Env {
+            paths: &home.paths,
+            exec: &home.exec,
+            http: &home.http,
+            time: &home.time,
+            exe: Path::new("/opt/viy/bin/viy"),
+        };
+        up_until(
+            &env,
+            &mut home.cfg,
+            Some(Arc::clone(&given)),
+            Duration::from_secs(60),
+            false,
+            &Interrupt::never(),
+            &abort_at,
+            &told.reporter(),
+            &nobody,
+        )
+        .await
+        .unwrap();
+        let calls = seam.calls();
+        assert_eq!(
+            calls[..3],
+            ["pods", "volume vol222", "create qwen-pod"],
+            "{calls:?}"
+        );
+        let texts = told.texts();
+        assert!(
+            texts.contains(&"  pod id:   scripted1".to_string()),
+            "{texts:?}"
+        );
+        assert!(texts.contains(&"  cost:     $0.50/hr  <-- billing has started".to_string()));
+        let state = home.state();
+        assert_eq!(state["pod_id"], "scripted1");
+        assert_eq!(state["volume_id"], "vol222");
+        assert_eq!(state["cost_per_hr"], 0.5);
+        let made = &seam.pods_now()[0];
+        assert_eq!(made.region.as_deref(), Some("EUR-IS-1"));
+        assert_eq!(made.volume.as_deref(), Some("vol222"));
+        // The primary's countdown is RunPod's reap's, not this provider's.
+        assert!(!home.paths.primary_volumes_file().exists());
+
+        let told = Told::default();
+        let found = resolve(&*given, &home.env(), &home.cfg, &told.reporter())
+            .await
+            .unwrap();
+        status_of(&home.env(), &home.cfg, found, &told.reporter())
+            .await
+            .unwrap();
+        assert_eq!(told.texts()[0], "  id:        scripted1");
+        assert_eq!(told.texts()[2], "  state:     running");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn up_with_no_gpu_free_says_so_without_failover() {
+        let mut home = home();
+        let seam = Arc::new(
+            Scripted::default()
+                .with_volume("vol222", "qwen38-weights", "EUR-IS-1")
+                .refusing("There are no instances currently available"),
+        );
+        let given: Arc<dyn Provider> = seam.clone();
+        let told = Told::default();
+        let abort_at = AtomicU32::new(1);
+        let env = Env {
+            paths: &home.paths,
+            exec: &home.exec,
+            http: &home.http,
+            time: &home.time,
+            exe: Path::new("/opt/viy/bin/viy"),
+        };
+        let error = up_until(
+            &env,
+            &mut home.cfg,
+            Some(given),
+            Duration::from_secs(60),
+            false,
+            &Interrupt::never(),
+            &abort_at,
+            &told.reporter(),
+            &nobody,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CommandError::Failed), "{error}");
+        // GPU_PREFERRED's types, then the others: no backup to offer.
+        let creates = seam
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("create"))
+            .count();
+        assert_eq!(creates, 2);
+        let texts = told.texts();
+        assert!(
+            texts.iter().any(|t| t.contains(
+                "No GPU free in EUR-IS-1 (scripted has no backup volumes). Retry in a minute"
+            )),
+            "{texts:?}"
+        );
+        assert!(!home.paths.pod_state_file().exists(), "nothing tracked");
+    }
+
     #[tokio::test]
     async fn up_refuses_a_provider_without_volumes_by_name() {
         let home = home();

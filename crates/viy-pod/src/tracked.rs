@@ -9,10 +9,10 @@
 //! API was unreachable (rpctl docs/architecture.md 4). Pinned by the
 //! pod/resolve fixture.
 //!
-//! The commands get the pod as the provider seam's [`Pod`] (WP 9.37b, kb
-//! d182), but the search and the cache stay RunPod's while `pod.json` is
-//! shared with rp: it keeps RunPod's own answer (`costPerHr` as RunPod
-//! sent it), byte for byte as before.
+//! The pods come through the provider seam as [`Pod`]s (WP 9.40, kb d182),
+//! and `pod.json` keeps what the seam reads: the name, the price as a
+//! number, the volume. Since `viy migrate --finish` (kb d135) `pod.json` is
+//! viy's own, so it no longer keeps RunPod's answer as rp wrote it.
 //!
 //! Where rpctl stops on an answer without a string `id` (a `KeyError`;
 //! RunPod always sends one), viy keeps the pod it asked for by the cached
@@ -23,7 +23,6 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-use serde_json::Map;
 use serde_json::Value;
 use viy_config::Config;
 use viy_config::Paths;
@@ -32,13 +31,13 @@ use viy_config::config::tunnel_local_port;
 use viy_http::HttpClient;
 
 use viy_provider::Pod;
+use viy_provider::PodState as Run;
+use viy_provider::Provider;
 use viy_provider::ProviderError;
 
 use crate::api::RunPod;
-use crate::api::RunPodError;
 use crate::api::proxy_url;
-use crate::provider::error_of;
-use crate::provider::pod_of;
+use crate::provider::RunPodProvider;
 use crate::state;
 use crate::state::PodState;
 use crate::state::key;
@@ -62,12 +61,6 @@ pub enum ResolveError {
     State(#[from] io::Error),
 }
 
-impl From<RunPodError> for ResolveError {
-    fn from(error: RunPodError) -> Self {
-        Self::Provider(error_of(&error))
-    }
-}
-
 /// Several live pods carry `POD_NAME`; the first id is the one taken. A
 /// warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,37 +81,27 @@ impl fmt::Display for MultiplePods {
     }
 }
 
-/// Our pod as RunPod has it, or `None` when RunPod has none: the cached
-/// id while that pod lives (stopped included), else the pod named
+/// Our pod as the provider has it, or `None` when it has none: the
+/// cached id while that pod lives (stopped included), else the pod named
 /// `POD_NAME`, cached for next time.
 pub async fn resolve(
-    rp: &RunPod,
+    seam: &dyn Provider,
     paths: &Paths,
     cfg: &Config,
     notice: impl FnMut(MultiplePods),
 ) -> Result<Option<Pod>, ResolveError> {
-    Ok(resolve_v1(rp, paths, cfg, notice)
-        .await?
-        .as_ref()
-        .map(pod_of))
-}
-
-/// [`resolve`] in RunPod's own shape, which `pod.json` caches.
-async fn resolve_v1(
-    rp: &RunPod,
-    paths: &Paths,
-    cfg: &Config,
-    notice: impl FnMut(MultiplePods),
-) -> Result<Option<Value>, ResolveError> {
     let cached = state::load(paths)?.pod_id().map(str::to_string);
     if let Some(id) = &cached
-        && let Some(pod) = rp.get_pod(id).await?.filter(not_terminated)
+        && let Some(mut pod) = seam.pod(id).await?.filter(not_terminated)
     {
-        let pod = with_id(pod, id);
+        // An answer without the id keeps the one asked for (d054).
+        if pod.id.is_empty() {
+            pod.id.clone_from(id);
+        }
         cache(paths, &pod)?;
         return Ok(Some(pod));
     }
-    let found = find_by_name(rp, cfg, notice).await?;
+    let found = find_by_name(seam, cfg, notice).await?;
     match &found {
         Some(pod) => cache(paths, pod)?,
         None if cached.is_some() => state::clear(paths)?,
@@ -127,30 +110,27 @@ async fn resolve_v1(
     Ok(found)
 }
 
-/// The live pod named `POD_NAME`: a RUNNING one first, then the one
-/// started last (`lastStartedAt`, else `createdAt`; ISO times sort as
-/// text), ties in RunPod's order. `None` only when RunPod answered.
+/// The live pod named `POD_NAME`: a running one first, then the one
+/// started last (its start, else its creation; ISO times sort as text),
+/// ties in the provider's order. `None` only when the provider answered.
 pub async fn find_by_name(
-    rp: &RunPod,
+    seam: &dyn Provider,
     cfg: &Config,
     mut notice: impl FnMut(MultiplePods),
-) -> Result<Option<Value>, RunPodError> {
+) -> Result<Option<Pod>, ProviderError> {
     let name = cfg.get("POD_NAME").unwrap_or("");
-    let mut matches: Vec<Value> = rp
-        .list_pods()
+    // The seam lists no terminated pod; one without an id is skipped.
+    let mut matches: Vec<Pod> = seam
+        .pods()
         .await?
         .into_iter()
-        .filter(|p| text(p, "name") == Some(name) && pod_id(p).is_some() && not_terminated(p))
+        .filter(|p| p.name.as_deref() == Some(name) && !p.id.is_empty() && not_terminated(p))
         .collect();
     matches.sort_by(|a, b| recency(b).cmp(&recency(a)));
     if matches.len() > 1 {
         notice(MultiplePods {
             name: name.to_string(),
-            ids: matches
-                .iter()
-                .filter_map(pod_id)
-                .map(str::to_string)
-                .collect(),
+            ids: matches.iter().map(|p| p.id.clone()).collect(),
         });
     }
     Ok(matches.into_iter().next())
@@ -180,7 +160,8 @@ pub async fn base_url(
         && discover
         && let Some(api_key) = cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty())
     {
-        match resolve(&RunPod::configured(api_key, http, cfg), paths, cfg, notice).await {
+        let seam = RunPodProvider::new(RunPod::configured(api_key, http, cfg), cfg);
+        match resolve(&seam, paths, cfg, notice).await {
             // resolve cached the pod it found.
             Ok(Some(_)) => state = state::load(paths)?,
             Ok(None) | Err(ResolveError::Provider(_)) => {}
@@ -235,50 +216,35 @@ const CREATED_KEYS: [&str; 3] = [key::CREATED_AT, key::TUNNEL_ONLY, key::LAST_ST
 /// except [`CREATED_KEYS`] when it is another pod than the cached one: the
 /// old pod's `tunnel_only` would make the new one's URL and label claim a
 /// tunnel-only route it may not have (rpctl b642713).
-fn cache(paths: &Paths, pod: &Value) -> io::Result<()> {
-    let id = pod_id(pod);
-    let field = |k: &str| pod.get(k).cloned().unwrap_or(Value::Null);
+fn cache(paths: &Paths, pod: &Pod) -> io::Result<()> {
+    let id = pod.id.as_str();
     state::update(paths, |map| {
-        if map.get(key::POD_ID).and_then(Value::as_str) != id {
+        if map.get(key::POD_ID).and_then(Value::as_str) != Some(id) {
             for k in CREATED_KEYS {
                 map.shift_remove(k);
             }
         }
         map.insert(key::POD_ID.into(), id.into());
-        map.insert(key::NAME.into(), field("name"));
-        map.insert(key::COST_PER_HR.into(), field("costPerHr"));
-        map.insert(key::VOLUME_ID.into(), pod_volume_id(pod).into());
+        map.insert(key::NAME.into(), pod.name.clone().into());
+        map.insert(key::COST_PER_HR.into(), pod.cost_per_hour.into());
+        map.insert(key::VOLUME_ID.into(), pod.volume.clone().into());
     })?;
     Ok(())
 }
 
-fn not_terminated(pod: &Value) -> bool {
-    text(pod, "desiredStatus") != Some("TERMINATED")
+fn not_terminated(pod: &Pod) -> bool {
+    pod.state != Some(Run::Terminated)
 }
 
-/// RunPod's answer about the pod asked for by `id`, with that id when the
-/// answer has none of its own (d054).
-fn with_id(pod: Value, id: &str) -> Value {
-    let mut map = match pod {
-        Value::Object(map) => map,
-        _ => Map::new(),
-    };
-    if !map.get("id").is_some_and(Value::is_string) {
-        map.insert("id".into(), id.into());
-    }
-    Value::Object(map)
-}
-
-/// RUNNING first, then the latest start.
-fn recency(pod: &Value) -> (bool, &str) {
-    let started = nonempty(pod, "lastStartedAt")
-        .or_else(|| nonempty(pod, "createdAt"))
+/// Running first, then the latest start.
+fn recency(pod: &Pod) -> (bool, &str) {
+    let started = pod
+        .started_at
+        .as_deref()
+        .or(pod.created_at.as_deref())
+        .filter(|s| !s.is_empty())
         .unwrap_or("");
-    (text(pod, "desiredStatus") == Some("RUNNING"), started)
-}
-
-fn pod_id(pod: &Value) -> Option<&str> {
-    text(pod, "id")
+    (pod.state == Some(Run::Running), started)
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {

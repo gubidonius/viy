@@ -44,9 +44,12 @@ use viy_config::config::gpu_type_list;
 use viy_protocol::Answer;
 use viy_protocol::Choices;
 use viy_protocol::Question;
-
+use viy_provider::Pod;
 use viy_provider::PodRequest;
+use viy_provider::Provider;
+use viy_provider::ProviderError;
 
+use crate::api::RunPod;
 use crate::api::RunPodError;
 use crate::commands::CommandError;
 use crate::commands::Env;
@@ -58,16 +61,16 @@ use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
 use crate::provider::RunPodProvider;
+use crate::provider::error_of;
 use crate::regions;
 use crate::regions::RETRY_GAP_S;
 use crate::regions::id;
-use crate::regions::is_capacity_error;
 use crate::regions::short;
 
 /// The pod a region took.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Created {
-    pub pod: Value,
+    pub pod: Pod,
     pub volume_id: String,
     /// The volume is new and empty: the weights must be downloaded.
     pub volume_is_new: bool,
@@ -96,20 +99,16 @@ enum Stop {
     Declined(String),
     /// No region took the pod.
     NoCapacity(String),
-    /// A refusal no other region can fix, as RunPod said it.
-    Refused(RunPodError),
+    /// A refusal no other region can fix, as the provider said it.
+    Refused(ProviderError),
     Command(CommandError),
 }
 
 impl From<CommandError> for Stop {
     fn from(error: CommandError) -> Self {
-        // A refusal through the seam is one too, or a capacity refusal
-        // would end `up` instead of trying on. Failover is RunPod's, whose
-        // seam errors take `capacity` from this same message, so rebuilding
-        // the client's error from it keeps that; the rest Stop never reads.
         match error {
-            CommandError::RunPod(e) => Self::Refused(e),
-            CommandError::Provider(e) => Self::Refused(RunPodError::new(e.message, e.status)),
+            CommandError::RunPod(e) => Self::Refused(error_of(&e)),
+            CommandError::Provider(e) => Self::Refused(e),
             other => Self::Command(other),
         }
     }
@@ -124,7 +123,7 @@ impl From<std::io::Error> for Stop {
 /// What failover won: the pod, its region and volume, whether that volume
 /// is new.
 struct Won {
-    pod: Value,
+    pod: Pod,
     region: String,
     volume_id: String,
     created: bool,
@@ -146,9 +145,11 @@ pub struct User<'a> {
 pub struct Creation<'a> {
     env: &'a Env<'a>,
     cfg: &'a Config,
-    /// RunPod behind the seam: the pod requests and the stock go through
-    /// it; the backup volumes and backups.json are RunPod's own.
-    seam: &'a RunPodProvider,
+    /// The provider the pods are asked of.
+    seam: &'a dyn Provider,
+    /// RunPod's own side, for failover: the backup volumes and
+    /// backups.json. `None` on another provider: one request, no failover.
+    runpod: Option<&'a RunPodProvider>,
     vllm_key: &'a str,
     pubkey: Option<&'a str>,
     user: User<'a>,
@@ -171,7 +172,8 @@ impl<'a> Creation<'a> {
     pub fn new(
         env: &'a Env<'a>,
         cfg: &'a Config,
-        seam: &'a RunPodProvider,
+        seam: &'a dyn Provider,
+        runpod: Option<&'a RunPodProvider>,
         vllm_key: &'a str,
         pubkey: Option<&'a str>,
         user: User<'a>,
@@ -180,6 +182,7 @@ impl<'a> Creation<'a> {
             env,
             cfg,
             seam,
+            runpod,
             vllm_key,
             pubkey,
             user,
@@ -209,6 +212,27 @@ impl<'a> Creation<'a> {
                 format!("(backups.json not updated: {:?})", error.kind()),
             );
         }
+    }
+
+    /// Whether a refusal for capacity goes on to the backup: FAILOVER, on
+    /// RunPod, whose backup volumes it moves.
+    fn failover_on(&self) -> bool {
+        self.runpod.is_some() && regions::failover_enabled(self.cfg)
+    }
+
+    /// RunPod's side, for the stock and the backup volumes; failover runs
+    /// only there ([`Self::failover_on`]).
+    fn runpod(&self) -> Result<&'a RunPodProvider, Stop> {
+        self.runpod.ok_or_else(|| {
+            Stop::Command(CommandError::Exit(format!(
+                "{} has no backup volumes to fail over to.",
+                self.seam.name()
+            )))
+        })
+    }
+
+    fn rp(&self) -> Result<&'a RunPod, Stop> {
+        Ok(self.runpod()?.client())
     }
 
     /// What a region is asked for first.
@@ -243,10 +267,7 @@ impl<'a> Creation<'a> {
             Err(error) => error,
         };
         // With no backup to offer, the other types follow at once.
-        if first == Ask::Preferred
-            && is_capacity_error(&refused)
-            && !regions::failover_enabled(self.cfg)
-        {
+        if first == Ask::Preferred && refused.capacity && !self.failover_on() {
             refused = match self
                 .attempt(&primary, volume_id, "primary", false, Ask::Others)
                 .await
@@ -255,36 +276,35 @@ impl<'a> Creation<'a> {
                 Err(error) => error,
             };
         }
-        let (message, capacity) =
-            if is_capacity_error(&refused) && regions::failover_enabled(self.cfg) {
-                match self.failover(volume_id).await {
-                    Ok(won) if won.region == primary => {
-                        self.say(
-                            Tone::Ok,
-                            format!(
-                                "  pod created in {} on the primary volume after all",
-                                won.region
-                            ),
-                        );
-                        return Ok(self.created(won.pod, &won.volume_id, volume_is_new, &primary));
-                    }
-                    Ok(won) => {
-                        // The boot record shows where this boot ran; the next
-                        // `viy up` starts from the primary again.
-                        self.say(
-                            Tone::Ok,
-                            format!(
-                                "  pod created in {} on the backup volume {}",
-                                won.region, won.volume_id
-                            ),
-                        );
-                        return Ok(self.created(won.pod, &won.volume_id, won.created, &won.region));
-                    }
-                    Err(stop) => self.stopped(stop)?,
+        let (message, capacity) = if refused.capacity && self.failover_on() {
+            match self.failover(volume_id).await {
+                Ok(won) if won.region == primary => {
+                    self.say(
+                        Tone::Ok,
+                        format!(
+                            "  pod created in {} on the primary volume after all",
+                            won.region
+                        ),
+                    );
+                    return Ok(self.created(won.pod, &won.volume_id, volume_is_new, &primary));
                 }
-            } else {
-                (refused.to_string(), is_capacity_error(&refused))
-            };
+                Ok(won) => {
+                    // The boot record shows where this boot ran; the next
+                    // `viy up` starts from the primary again.
+                    self.say(
+                        Tone::Ok,
+                        format!(
+                            "  pod created in {} on the backup volume {}",
+                            won.region, won.volume_id
+                        ),
+                    );
+                    return Ok(self.created(won.pod, &won.volume_id, won.created, &won.region));
+                }
+                Err(stop) => self.stopped(stop)?,
+            }
+        } else {
+            (refused.to_string(), refused.capacity)
+        };
         self.fail(message, capacity)
     }
 
@@ -327,7 +347,7 @@ impl<'a> Creation<'a> {
             }
             Stop::Command(error) => Err(error),
             Stop::NoCapacity(message) => Ok((message, true)),
-            Stop::Refused(error) => Ok((error.to_string(), is_capacity_error(&error))),
+            Stop::Refused(error) => Ok((error.to_string(), error.capacity)),
         }
     }
 
@@ -336,18 +356,33 @@ impl<'a> Creation<'a> {
         let primary = &self.primary;
         self.say(Tone::Error, message);
         let hint = if capacity {
-            let first = if self.requested || regions::failover_enabled(self.cfg) {
+            let first = if self.requested || self.failover_on() {
                 "No region took the pod".to_string()
+            } else if self.runpod.is_none() {
+                format!(
+                    "No GPU free in {primary} ({} has no backup volumes)",
+                    self.seam.name()
+                )
             } else {
                 format!("No GPU free in {primary} (FAILOVER=0: no backup offered)")
             };
-            format!(
-                "{first}. Retry in a minute (stock flickers); viy backup shows RunPod's stock of our GPU types."
-            )
+            if self.runpod.is_some() {
+                format!(
+                    "{first}. Retry in a minute (stock flickers); viy backup shows RunPod's stock of our GPU types."
+                )
+            } else {
+                format!("{first}. Retry in a minute.")
+            }
         } else {
-            "Common causes: insufficient RunPod credit, or a request RunPod rejects (see the \
-             message above)."
-                .to_string()
+            let who = if self.runpod.is_some() {
+                "RunPod"
+            } else {
+                self.seam.name()
+            };
+            format!(
+                "Common causes: insufficient {who} credit, or a request {who} rejects (see the \
+                 message above)."
+            )
         };
         self.say(
             Tone::Warn,
@@ -359,7 +394,7 @@ impl<'a> Creation<'a> {
         Err(CommandError::Failed)
     }
 
-    fn created(&self, pod: Value, volume_id: &str, volume_is_new: bool, region: &str) -> Created {
+    fn created(&self, pod: Pod, volume_id: &str, volume_is_new: bool, region: &str) -> Created {
         Created {
             pod,
             volume_id: volume_id.to_string(),
@@ -380,7 +415,7 @@ impl<'a> Creation<'a> {
         role: &str,
         quiet: bool,
         ask: Ask,
-    ) -> Result<Value, RunPodError> {
+    ) -> Result<Pod, ProviderError> {
         let mut request = self.request.clone();
         request.region = region.to_string();
         request.volume = Some(volume_id.to_string()).filter(|v| !v.is_empty());
@@ -415,7 +450,7 @@ impl<'a> Creation<'a> {
             .create(region, volume_id, role, quiet, &mut request)
             .await;
         if let Err(error) = &result
-            && is_capacity_error(error)
+            && error.capacity
             && !quiet
         {
             self.say(Tone::Warn, format!("  {region} ({role}): {none}"));
@@ -430,28 +465,25 @@ impl<'a> Creation<'a> {
         role: &str,
         quiet: bool,
         request: &mut PodRequest,
-    ) -> Result<Value, RunPodError> {
-        let error = match self.seam.create_v1(request).await {
+    ) -> Result<Pod, ProviderError> {
+        let error = match self.seam.create(request).await {
             Ok(pod) => return Ok(pod),
             Err(error) => error,
         };
         let env = self.env;
         let gpus = json!(request.gpu_types);
         regions::log_failure(
-            env.paths,
-            env.time,
-            self.cfg,
-            region,
-            role,
-            volume_id,
-            &gpus,
-            &crate::provider::error_of(&error),
+            env.paths, env.time, self.cfg, region, role, volume_id, &gpus, &error,
         );
         let asked = request.gpu_types.clone();
         let filtered = !request.cuda.is_empty();
-        if !(is_capacity_error(&error)
+        if !(error.capacity
             && filtered
-            && regions::any_cuda_is_safe(self.seam, self.cfg, region, &asked).await)
+            && match self.seam.regions() {
+                Some(stock) => regions::any_cuda_is_safe(stock, self.cfg, region, &asked).await,
+                // No stock to tell newer drivers by: the filter stays.
+                None => false,
+            })
         {
             return Err(error);
         }
@@ -468,17 +500,10 @@ impl<'a> Creation<'a> {
             );
         }
         request.cuda.clear();
-        self.seam.create_v1(request).await.inspect_err(|error| {
+        self.seam.create(request).await.inspect_err(|error| {
             let role = format!("{role}, any cuda");
             regions::log_failure(
-                env.paths,
-                env.time,
-                self.cfg,
-                region,
-                &role,
-                volume_id,
-                &gpus,
-                &crate::provider::error_of(error),
+                env.paths, env.time, self.cfg, region, &role, volume_id, &gpus, error,
             );
         })
     }
@@ -533,7 +558,7 @@ impl<'a> Creation<'a> {
                 volume_id: volume_id.to_string(),
                 created: false,
             })),
-            Err(error) if !is_capacity_error(&error) => Err(Stop::Refused(error)),
+            Err(error) if !error.capacity => Err(Stop::Refused(error)),
             Err(_) => Ok(None),
         }
     }
@@ -557,7 +582,7 @@ impl<'a> Creation<'a> {
                     created: false,
                 }))
             }
-            Err(error) if !is_capacity_error(&error) => Err(Stop::Refused(error)),
+            Err(error) if !error.capacity => Err(Stop::Refused(error)),
             Err(_) => Ok(None),
         }
     }
@@ -572,8 +597,7 @@ impl<'a> Creation<'a> {
     async fn failover(&mut self, primary_volume: &str) -> Result<Won, Stop> {
         let (paths, time) = (self.env.paths, self.env.time);
         let primary = self.primary.clone();
-        let backup =
-            regions::find_backup(self.seam.client(), paths, self.cfg, regions::now(time)).await?;
+        let backup = regions::find_backup(self.rp()?, paths, self.cfg, regions::now(time)).await?;
         let backup_region = backup
             .as_ref()
             .map(|b| crate::api::shown(b.get("dataCenterId")));
@@ -624,7 +648,7 @@ impl<'a> Creation<'a> {
             "Checking RunPod's stock of our GPU types in every region with network volumes...",
         );
         let sampled = regions::sample_stock(
-            self.seam,
+            self.runpod()?,
             paths,
             time,
             self.cfg,
@@ -892,7 +916,7 @@ impl<'a> Creation<'a> {
                             ),
                         );
                     }
-                    Err(error) if !is_capacity_error(&error) => {
+                    Err(error) if !error.capacity => {
                         failed = Some(Stop::Refused(error));
                         break 'rounds;
                     }
@@ -936,11 +960,12 @@ impl<'a> Creation<'a> {
         // further Ctrl-C skips the one being deleted, which stays recorded
         // as unused for `viy reap`, and goes on with the rest.
         let winner = won.as_ref().map(|w| w.volume_id.as_str());
+        let rp = self.rp()?;
         for volume in made.values().filter(|v| Some(id(v)) != winner) {
             let deleted = tokio::select! {
                 biased;
                 () = self.user.interrupt.next() => continue,
-                deleted = regions::delete_empty(self.seam.client(), paths, volume, self.user.report) => deleted,
+                deleted = regions::delete_empty(rp, paths, volume, self.user.report) => deleted,
             };
             self.keep(deleted);
         }
@@ -997,8 +1022,7 @@ impl<'a> Creation<'a> {
             )))
         })?;
         let volume = self
-            .seam
-            .client()
+            .rp()?
             .create_volume(
                 &regions::backup_name(self.cfg),
                 size_gb,
@@ -1006,9 +1030,14 @@ impl<'a> Creation<'a> {
                 regions::backup_tier(self.cfg),
             )
             .await
-            .map_err(Stop::Refused)?
+            .map_err(|e| Stop::Refused(error_of(&e)))?
             .filter(|v| !id(v).is_empty())
-            .ok_or_else(|| Stop::Refused(RunPodError::new("RunPod created no volume", None)))?;
+            .ok_or_else(|| {
+                Stop::Refused(error_of(&RunPodError::new(
+                    "RunPod created no volume",
+                    None,
+                )))
+            })?;
         regions::record_unused(self.env.paths, &volume, regions::now(self.env.time))?;
         Ok(volume)
     }

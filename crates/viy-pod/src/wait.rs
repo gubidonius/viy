@@ -648,6 +648,9 @@ pub struct PodWait<'a> {
     pub ssh: Ssh<'a>,
     /// The provider the pod runs on (kb d182).
     pub seam: Arc<dyn Provider>,
+    /// Whether a boot's logs and host facts are collected afterwards
+    /// (`viy capture-boot`): RunPod's, which it asks for them.
+    pub capture: bool,
     /// What reaches vLLM's /health.
     pub http: &'a dyn HttpClient,
     pub time: &'a dyn TimeProvider,
@@ -920,7 +923,9 @@ async fn record_boot(
         .get("boot_id")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    spawn_capture(w, boot_id)?;
+    if w.capture {
+        spawn_capture(w, boot_id)?;
+    }
     say(
         report,
         Tone::Dim,
