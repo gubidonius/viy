@@ -263,7 +263,8 @@ fn one_line(text: &str) -> String {
 
 /// Text of a user message's content: a string, or its text parts. Of a
 /// `!` command's record only the command counts: its output is not the
-/// user's word for a URL (kb d149).
+/// user's word for a URL (kb d149). A skill a `$name` attached does not
+/// count at all: a skill cannot widen what the network allows (kb d183).
 fn user_text(c: &Value) -> String {
     match c {
         Value::String(s) => s.clone(),
@@ -271,6 +272,7 @@ fn user_text(c: &Value) -> String {
             .iter()
             .filter_map(|p| p.as_object())
             .map(|p| p.get("text").and_then(Value::as_str).unwrap_or_default())
+            .filter(|t| !crate::skills::is_part(t))
             .map(|t| {
                 if crate::shell::is_record(t) {
                     crate::shell::record_command(t).unwrap_or_default()

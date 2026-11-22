@@ -1102,8 +1102,10 @@ impl Chat {
         self.messages.extend(after);
         self.abort_background();
         // The history behind the system prompt is new, so its prefix is
-        // re-prefilled anyway: a free moment to show tools kept since.
+        // re-prefilled anyway: a free moment to show tools and skills kept
+        // since.
         self.snapshot_toolbox();
+        self.snapshot_skills();
     }
 
     // ---- step 2: the background pass ------------------------------------------

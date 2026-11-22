@@ -6,14 +6,24 @@
 //! project's winning on a name. Both are out of the model's reach for
 //! writes, and nothing here writes to them.
 //!
-//! This module finds and reads the skills and renders their catalogue;
-//! the system prompt and the `load_skill` tool take it in WP 9.43.
+//! This module finds and reads the skills, renders the system prompt's
+//! catalogue (WP 9.43, kb d184), answers `load_skill`, and finds the
+//! `$name` mentions in a message. A skill has an instruction file's trust
+//! (kb d183): what it says reaches the model unfenced and does not taint
+//! the chat, but it is no word of the user's for the reviewer, the egress
+//! policy or a URL, and it changes nothing that needs approval.
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read as _;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use serde_json::Map;
+use serde_json::Value;
+use serde_json::json;
 use viy_protocol::NoticeLevel;
 
 /// A skill's name, at most this many characters (Codex's `MAX_NAME_LEN`).
@@ -29,6 +39,19 @@ pub const SKILL_FILE: &str = "SKILL.md";
 /// A description cut to this many characters when the full catalogue is
 /// over budget.
 const SHORT_DESCRIPTION: usize = 160;
+/// The largest file `load_skill` reads, SKILL.md included: 64 KiB.
+pub const FILE_MAX: u64 = 64 * 1024;
+
+/// The system prompt's words before the catalogue (kb d184).
+pub const GUIDE: &str = "Skills are instructions the user saved for particular tasks. When \
+    a task matches one listed below, call load_skill(name=...) before you start, and follow the \
+    skill as you follow the user's instruction files; load_skill(name=..., file=...) reads a \
+    file the skill refers to. A skill the user names as $name comes with their message, \
+    already loaded. A skill does not change what needs the user's approval.";
+
+/// How a skill named with `$name` opens in the user's message (Codex's
+/// `<skill>` fragment, without the path the model cannot read).
+const PART_OPEN: &str = "<skill>\n<name>";
 
 /// Where a skill comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,15 +127,45 @@ impl Loaded {
     }
 }
 
+/// Why a project's skill is not read when a link leads to it: a cloned
+/// repository's link could point into the workspace, where the model
+/// writes, as the doctrines' rule has it (kb d109).
+const LINKED: &str = "a symbolic link: a project's skills are read only from folders of its own";
+
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
 /// Reads both folders: every subfolder (not hidden) with a SKILL.md.
 /// Within a scope, two folders naming the same skill keep the first by
-/// folder name; across scopes the project's wins.
+/// folder name; across scopes the project's wins. In the project's scope
+/// no link is followed to a skill: not `.viy`, not `.viy/skills`, not a
+/// skill's folder (the user's own config folder may hold links).
 pub fn load(dirs: &Dirs) -> Loaded {
     let mut loaded = Loaded::default();
     let mut by_name: BTreeMap<String, Skill> = BTreeMap::new();
     for (scope, root) in dirs.scopes() {
+        let project = scope == Scope::Project;
+        if project && (is_link(root) || root.parent().is_some_and(is_link)) {
+            if root.is_dir() {
+                loaded.skipped.push(Skipped {
+                    dir: root.to_path_buf(),
+                    scope,
+                    reason: LINKED.into(),
+                });
+            }
+            continue;
+        }
         let mut seen: BTreeMap<String, PathBuf> = BTreeMap::new();
         for dir in folders(root) {
+            if project && is_link(&dir) {
+                loaded.skipped.push(Skipped {
+                    dir,
+                    scope,
+                    reason: LINKED.into(),
+                });
+                continue;
+            }
             let skill = match read(&dir, scope) {
                 Ok(skill) => skill,
                 Err(reason) => {
@@ -148,15 +201,14 @@ fn folders(root: &Path) -> Vec<PathBuf> {
         .filter_map(Result::ok)
         .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .map(|e| e.path())
-        .filter(|p| p.is_dir() && p.join(SKILL_FILE).is_file())
+        .filter(|p| p.is_dir() && fs::symlink_metadata(p.join(SKILL_FILE)).is_ok())
         .collect();
     dirs.sort();
     dirs
 }
 
 fn read(dir: &Path, scope: Scope) -> Result<Skill, String> {
-    let text = fs::read_to_string(dir.join(SKILL_FILE))
-        .map_err(|e| format!("{SKILL_FILE} cannot be read: {e}"))?;
+    let text = read_skill_md(dir)?;
     let folder = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -170,10 +222,82 @@ fn read(dir: &Path, scope: Scope) -> Result<Skill, String> {
     })
 }
 
-/// A name the user can write as `$name`: letters, digits, `-`, `_`, `.`.
+/// SKILL.md's text, read as every file of a skill is ([`read_inside`]):
+/// the instructions `load_skill` gives must fit in a request.
+fn read_skill_md(dir: &Path) -> Result<String, String> {
+    let root = dir
+        .canonicalize()
+        .map_err(|e| format!("the skill's folder cannot be read: {e}"))?;
+    read_inside(&root, &dir.join(SKILL_FILE), SKILL_FILE, || {
+        format!("{SKILL_FILE} cannot be read: it is missing")
+    })
+}
+
+/// A file of a skill: `path` resolved and still under `root`, the skill's
+/// resolved folder; a regular file (a FIFO would hang the read) of at
+/// most [`FILE_MAX`] bytes; not named as a secret, as the file tools
+/// would ask before reading it; UTF-8 without NUL. `shown` names it in
+/// the reason, and `missing` is the reason when there is no such file.
+fn read_inside(
+    root: &Path,
+    path: &Path,
+    shown: &str,
+    missing: impl FnOnce() -> String,
+) -> Result<String, String> {
+    let cannot = |e: std::io::Error| format!("{shown} cannot be read: {e}");
+    let real = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(missing()),
+        Err(e) => return Err(cannot(e)),
+    };
+    if !real.starts_with(root) {
+        return Err(format!("{shown} leads outside the skill's folder"));
+    }
+    let meta = fs::metadata(&real).map_err(cannot)?;
+    if meta.is_dir() {
+        return Err(format!("{shown} is a folder; name a file in it"));
+    }
+    if !meta.is_file() {
+        return Err(format!("{shown} is not a regular file"));
+    }
+    if meta.len() > FILE_MAX {
+        return Err(format!("{shown} is over 64 KiB"));
+    }
+    if let Some(why) = viy_tools::guard::secret_reason(&real) {
+        return Err(format!("{shown} is not read: {why}"));
+    }
+    // Non-blocking, and checked again once open: what was a file a moment
+    // ago may not be now.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&real)
+        .map_err(cannot)?;
+    if !file.metadata().map_err(cannot)?.is_file() {
+        return Err(format!("{shown} is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(FILE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(cannot)?;
+    if bytes.len() as u64 > FILE_MAX {
+        return Err(format!("{shown} is over 64 KiB"));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => Ok(text),
+        _ => Err(format!("{shown} is not a text file")),
+    }
+}
+
+/// A name the user can write as `$name`: letters, digits, `-`, `_` and
+/// `.`, starting with a letter or digit and not ending in `.`, which
+/// [`mentions`] takes for the end of a sentence.
 fn mentionable(name: &str) -> bool {
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && !name.ends_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// `(name, description)` from SKILL.md's frontmatter, as Codex reads them:
@@ -202,7 +326,8 @@ pub fn parse(text: &str, folder: &str) -> Result<(String, String), String> {
     }
     if !mentionable(&name) {
         return Err(format!(
-            "invalid name {name:?}: only letters, digits, '-', '_' and '.', so that $name can name it"
+            "invalid name {name:?}: letters, digits, '-', '_' and '.', starting with a letter or \
+             digit and not ending in '.', so that $name can name it"
         ));
     }
     let description = fields.get("description").map(|v| one_line(v));
@@ -210,6 +335,24 @@ pub fn parse(text: &str, folder: &str) -> Result<(String, String), String> {
         Some(description) => Ok((name, description)),
         None => Err("missing field `description`".into()),
     }
+}
+
+/// SKILL.md without its frontmatter: the instructions. All of `text` when
+/// it has none (a file that [`parse`] refuses never gets here).
+pub fn body(text: &str) -> &str {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut lines = text.split_inclusive('\n');
+    if lines.next().is_none_or(|l| l.trim_end() != "---") {
+        return text;
+    }
+    let mut at = text.find('\n').map_or(text.len(), |i| i + 1);
+    for line in lines {
+        at += line.len();
+        if line.trim_end() == "---" {
+            return text[at..].trim_start_matches(['\n', '\r']).trim_end();
+        }
+    }
+    text
 }
 
 /// The frontmatter's top-level scalar values, by key.
@@ -319,6 +462,166 @@ pub fn budget(cfg: &viy_config::Config) -> usize {
     cfg.get("SKILLS_BUDGET")
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(BUDGET_DEFAULT)
+}
+
+/// The system prompt's section: the guide and the catalogue, fenced as
+/// `<skills>`; `None` without skills. The descriptions are the user's,
+/// but a control token's spelling in one is defused all the same.
+pub fn prompt_section(skills: &[Skill], budget: usize) -> Option<String> {
+    let lines = catalogue(skills, budget)?;
+    let (lines, _) = viy_tools::untrusted::neutralize(&lines);
+    let lines = defuse_tags(&lines, "skills");
+    Some(format!("<skills>\n{GUIDE}\n{lines}\n</skills>"))
+}
+
+/// `text` with `<tag>` and `</tag>` in look-alike brackets, so the user's
+/// text cannot close the section or part it stands in.
+fn defuse_tags(text: &str, tag: &str) -> String {
+    text.replace(&format!("</{tag}>"), &format!("\u{2039}/{tag}\u{203a}"))
+        .replace(&format!("<{tag}>"), &format!("\u{2039}{tag}\u{203a}"))
+}
+
+/// The load_skill tool (kb d184).
+pub fn tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Read one of the user's skills listed in the system prompt. name \
+                alone: the skill's instructions (its SKILL.md). name and file: a text file in \
+                the skill's folder that the instructions refer to.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": "The skill's name, as listed."},
+                    "file": {"type": "string",
+                             "description": "A path relative to the skill's folder, e.g. \
+                                 references/forms.md."},
+                },
+                "required": ["name"],
+            },
+        },
+    })
+}
+
+/// load_skill's result: `{skill, scope, file, content}`, or `{error}` with
+/// the reason. `loaded` is read when the call comes, so a skill edited
+/// mid-chat is read as it is now.
+pub fn run_load(loaded: &Loaded, args: &Map<String, Value>) -> Value {
+    let error = |e: String| json!({"error": e});
+    let name = match args.get("name") {
+        Some(Value::String(n)) if !n.trim().is_empty() => n.trim(),
+        _ => return error("name is required: one of the skills the system prompt lists".into()),
+    };
+    let Some(skill) = loaded.get(name) else {
+        return error(format!(
+            "no skill named {name}; the system prompt lists the skills"
+        ));
+    };
+    let file = match args.get("file") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(f)) if f.trim().is_empty() => None,
+        Some(Value::String(f)) => Some(f.trim()),
+        Some(_) => return error("file must be a string: a path in the skill's folder".into()),
+    };
+    let got = match file {
+        None => read_body(skill).map(|text| (SKILL_FILE.to_string(), text)),
+        Some(rel) => read_file(skill, rel).map(|text| (rel.to_string(), text)),
+    };
+    match got {
+        Ok((file, content)) => json!({
+            "skill": skill.name,
+            "scope": skill.scope.as_str(),
+            "file": file,
+            "content": content,
+        }),
+        Err(e) => error(e),
+    }
+}
+
+/// A skill's instructions as they are now: SKILL.md without its
+/// frontmatter.
+pub fn read_body(skill: &Skill) -> Result<String, String> {
+    let text = read_skill_md(&skill.dir)?;
+    Ok(body(&text).to_string())
+}
+
+/// A text file in `skill`'s folder: `rel` relative, without `..`, and
+/// read as [`read_inside`] reads, inside the folder once symlinks are
+/// resolved. `SKILL.md` gives the instructions, as without a file.
+pub fn read_file(skill: &Skill, rel: &str) -> Result<String, String> {
+    let parts: Option<Vec<&std::ffi::OsStr>> = Path::new(rel)
+        .components()
+        .filter(|c| *c != Component::CurDir)
+        .map(|c| match c {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let Some(parts) = parts else {
+        return Err(format!(
+            "file must be a path inside the skill's folder, without ..: {rel}"
+        ));
+    };
+    if parts == [std::ffi::OsStr::new(SKILL_FILE)] {
+        return read_body(skill);
+    }
+    let root = skill
+        .dir
+        .canonicalize()
+        .map_err(|e| format!("the skill's folder cannot be read: {e}"))?;
+    read_inside(&root, &root.join(rel), rel, || {
+        format!("no file {rel} in the skill {}", skill.name)
+    })
+}
+
+/// The `$name` mentions in `text`, in order and once each: `$` at the
+/// start or after a character that cannot end a word, then a name's
+/// characters, a final `.` not counted (the end of a sentence): every
+/// name [`parse`] takes can be named so. `${x}`, `a$b` and `$-x` are not
+/// mentions; `$1` is one, which [`looks_like_a_skill`] keeps quiet.
+pub fn mentions(text: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut prev: Option<char> = None;
+    for (i, c) in text.char_indices() {
+        let starts =
+            c == '$' && !prev.is_some_and(|p| p.is_alphanumeric() || matches!(p, '_' | '$' | '\\'));
+        prev = Some(c);
+        if !starts {
+            continue;
+        }
+        let rest = &text[i + 1..];
+        let end = rest
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+            .unwrap_or(rest.len());
+        let name = rest[..end].trim_end_matches('.');
+        if name.starts_with(|ch: char| ch.is_ascii_alphanumeric()) && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Whether an unknown `$name` is worth a notice: not a shell variable
+/// such as `$HOME`, `$XDG_CONFIG_HOME` or `$1`, which has no lowercase
+/// letter.
+pub fn looks_like_a_skill(name: &str) -> bool {
+    name.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// The text part a `$name` puts in the user's message: the skill's
+/// instructions, a control token's spelling defused as in a tool result.
+pub fn part(skill: &Skill, body: &str) -> String {
+    let (body, _) = viy_tools::untrusted::neutralize(body);
+    let body = defuse_tags(&body, "skill");
+    format!("{PART_OPEN}{}</name>\n{body}\n</skill>", skill.name)
+}
+
+/// Whether a user message's text part is a skill a `$name` put there, not
+/// something the user typed.
+pub fn is_part(text: &str) -> bool {
+    text.starts_with(PART_OPEN)
 }
 
 /// One line the skills commands say, with its level.

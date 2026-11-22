@@ -31,6 +31,7 @@ fn make() -> SystemPrompt<'static> {
         workspace: Path::new("/w/proj"),
         today: "2026-07-03 (Friday)",
         instructions: None,
+        skills: None,
     }
 }
 
@@ -174,4 +175,30 @@ fn today_names_the_weekday() {
         weekday.starts_with('(') && weekday.ends_with("day)"),
         "{today}"
     );
+}
+
+// viy's own (kb d184): the skills' section comes last, after the
+// instruction files, and only with the build tools that offer load_skill.
+#[test]
+fn the_skills_section_comes_last_with_build_tools_only() {
+    let section = "<skills>\nguide\n- notes: Release notes. [global]\n</skills>";
+    let with = SystemPrompt {
+        instructions: Some("# AGENTS.md\nbe brief"),
+        skills: Some(section),
+        ..make()
+    }
+    .render()
+    .unwrap();
+    assert!(with.ends_with(&format!("be brief\n\n{section}")), "{with}");
+    let without = SystemPrompt {
+        instructions: Some("# AGENTS.md\nbe brief"),
+        ..make()
+    };
+    assert_eq!(with, format!("{}\n\n{section}", without.render().unwrap()));
+    let no_tools = SystemPrompt {
+        tools_on: false,
+        skills: Some(section),
+        ..make()
+    };
+    assert!(!no_tools.render().unwrap().contains("<skills>"));
 }

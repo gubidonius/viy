@@ -2,7 +2,8 @@
 //! its guides, verbatim: the user's own system prompt, the tool-use guide
 //! with build tools on, the untrusted-text rule with web search on, and with
 //! SYSTEM_GUIDE the environment line, the answer guide and the tool-work
-//! guide, then the toolbox index and the instruction files. It is rebuilt
+//! guide, then the toolbox index, the instruction files and, viy's own,
+//! the skills' catalogue (kb d184). It is rebuilt
 //! for every request, so the instruction files survive /compact and /reset
 //! and an edit to one lands on the next message; the date is the chat's.
 
@@ -105,6 +106,10 @@ pub struct SystemPrompt<'a> {
     pub today: &'a str,
     /// The instruction files' block ([`crate::instructions::render`]).
     pub instructions: Option<&'a str>,
+    /// The skills' section frozen for the chat
+    /// ([`crate::skills::prompt_section`]), shown with build tools on, as
+    /// load_skill is offered.
+    pub skills: Option<&'a str>,
 }
 
 impl SystemPrompt<'_> {
@@ -152,6 +157,9 @@ impl SystemPrompt<'_> {
         }
         if let Some(block) = self.instructions {
             parts.push(block.to_string());
+        }
+        if let Some(section) = self.skills.filter(|_| self.tools_on) {
+            parts.push(section.to_string());
         }
         (!parts.is_empty()).then(|| parts.join("\n\n"))
     }

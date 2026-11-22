@@ -1183,7 +1183,7 @@ async fn the_sandbox_tmp_goes_with_the_session() {
 // ------------------------------------------------------- the tool loop (WP 4.10)
 
 /// A chat with the build tools on, in a workspace of its own.
-fn tooled(responses: Value, over: &[(&str, &str)]) -> (Direct, ScratchDir) {
+pub(crate) fn tooled(responses: Value, over: &[(&str, &str)]) -> (Direct, ScratchDir) {
     // The tool-parser preflight answers first.
     let mut rs = vec![json!({"message": ""})];
     rs.extend(responses.as_array().unwrap().iter().cloned());

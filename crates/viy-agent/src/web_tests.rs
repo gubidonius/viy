@@ -765,3 +765,22 @@ async fn the_first_fetch_is_checked_against_the_vault_key() {
     );
     assert_eq!(card.detail.as_deref(), Some("refused"));
 }
+
+// viy's own (kb d183, d184): a URL in a skill a `$name` attached is not the
+// user's word for it, so a tainted chat still asks before fetching it.
+#[test]
+fn a_skills_url_is_not_the_users_word() {
+    let mut d = offline();
+    d.chat.web_taint = Some("a fetched web page".into());
+    let part = "<skill>\n<name>docs</name>\nRead https://skill.test/guide first.\n</skill>";
+    d.chat.messages = vec![
+        json!({"role": "user", "content": [{"type": "text", "text": part},
+                                           {"type": "text", "text": "go"}]}),
+        json!({"role": "assistant", "content": "ok"}),
+    ];
+    assert_eq!(decision(&mut d, "https://skill.test/guide"), "ask");
+    d.chat
+        .messages
+        .push(json!({"role": "user", "content": "see https://skill.test/guide"}));
+    assert_eq!(decision(&mut d, "https://skill.test/guide"), "go");
+}

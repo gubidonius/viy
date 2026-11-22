@@ -123,6 +123,7 @@ fn replay(case: &Value) -> Value {
         workspace: &ws,
         today: "{TODAY}",
         instructions: block.as_deref(),
+        skills: None,
     }
     .render();
     // viy's own config directory is where rp names its own: the one

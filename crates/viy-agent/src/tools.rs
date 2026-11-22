@@ -169,6 +169,14 @@ fn summary(name: &str, args: &Map<String, Value>) -> String {
         // rp's `[find_tool]` line: the name, else the query, else "all"
         return untrusted::terminal_safe(&crate::toolbox::find_what(args), Some(80));
     }
+    if name == "load_skill" {
+        let field = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or_default();
+        let shown = match field("file").trim() {
+            "" => field("name").to_string(),
+            file => format!("{} {file}", field("name")),
+        };
+        return untrusted::terminal_safe(&shown, Some(200));
+    }
     let key = match name {
         "run_shell" => "command",
         "web_search" => "query",
@@ -330,11 +338,7 @@ impl Chat {
     /// when a call would ask (a secret file, a fetch), since its threads
     /// cannot ask; viy queues those questions instead (kb d181).
     pub(crate) fn parallel_ok(&self, calls: &[ToolCall]) -> bool {
-        self.parallel_tools
-            && calls.len() >= 2
-            && calls
-                .iter()
-                .all(|c| PARALLEL_SAFE.contains(&c.name.as_str()))
+        self.parallel_tools && calls.len() >= 2 && calls.iter().all(|c| parallel_safe(&c.name))
     }
 
     /// A read-only batch side by side (rp's thread pool): the file tools on
@@ -519,6 +523,16 @@ impl Chat {
             "find_tool" => {
                 let out = match parse_args(&c.arguments) {
                     Ok(args) => crate::toolbox::run_find(&args, &self.live_toolbox()),
+                    Err(e) => e,
+                };
+                (out, Card::default())
+            }
+            // Offered with build tools and a skill in the catalogue. A
+            // skill's text is the user's (kb d183): not fenced, no taint.
+            "load_skill" if !(self.tools_on && !self.skills_snap.is_empty()) => off(name),
+            "load_skill" => {
+                let out = match parse_args(&c.arguments) {
+                    Ok(args) => crate::skills::run_load(&self.live_skills(), &args),
                     Err(e) => e,
                 };
                 (out, Card::default())
@@ -1073,16 +1087,12 @@ pub(crate) fn report_egress(
     rep
 }
 
-/// Tools that only read, so a batch of them can run side by side (rp's
-/// `PARALLEL_SAFE`).
-pub(crate) const PARALLEL_SAFE: [&str; 6] = [
-    "read_file",
-    "list_dir",
-    "web_search",
-    "fetch_url",
-    "explore",
-    "find_tool",
-];
+/// Whether a tool only reads, so a batch of such calls can run side by
+/// side: rp's `PARALLEL_SAFE` (`build::PARALLEL_SAFE`, checked against
+/// rpctl's list) and viy's own load_skill (kb d184).
+pub(crate) fn parallel_safe(name: &str) -> bool {
+    build::PARALLEL_SAFE.contains(&name) || name == "load_skill"
+}
 
 /// Shows a call starting.
 fn begin_call(ctx: &TurnContext, c: &ToolCall) {
@@ -1105,8 +1115,8 @@ async fn quiet_call(
 ) -> Option<(Value, Card, Option<(PathBuf, String)>)> {
     if !build::NAMES.contains(&name.as_str()) {
         // web_search, fetch_url and explore hold the chat's web state, and
-        // find_tool reads the chat's toolbox: run one by one after the
-        // batch's reads, in call order.
+        // find_tool and load_skill read the chat's folders: run one by one
+        // after the batch's reads, in call order.
         return None;
     }
     if !tools_on {

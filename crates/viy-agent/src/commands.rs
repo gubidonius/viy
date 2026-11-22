@@ -84,9 +84,10 @@ const HELP: &str = "  /help              show this
   /consult [on|off]  ask_claude: hand hard tasks to Claude Code; no argument
                      lists this chat's consults. Also: mode act|advise,
                      model <name>, effort <level>, approval ask|auto
-  /skills            the skills you saved in ~/.config/viy/skills/ and
+  /skills [list|reload]  the skills you saved in ~/.config/viy/skills/ and
                      .viy/skills/ (a folder with a SKILL.md each), and any
-                     left out with why
+                     left out with why; reload puts new ones in the system
+                     prompt. $name in a message sends that skill with it
   /toolbox [list|show <name>|find <words>|check|on|off]  command-line tools
                      kept between chats, listed in the system prompt and on
                      run_shell's PATH (viy toolbox add/rm to manage them)
@@ -146,6 +147,7 @@ fn replay_label(name: &str) -> (&str, Option<&'static str>) {
         "web_search" => ("search", Some("query")),
         "fetch_url" => ("fetch", Some("url")),
         "find_tool" => ("find_tool", Some("query")),
+        "load_skill" => ("skill", Some("name")),
         "ask_claude" => ("ask_claude", Some("task")),
         "explore" => ("explore", Some("tasks")),
         other => (other, None),
@@ -197,9 +199,11 @@ fn user_text(m: &Value) -> String {
             .iter()
             .filter(|p| {
                 p.is_object()
-                    && !p["text"]
-                        .as_str()
-                        .is_some_and(|t| sessions::is_client_note(t) || crate::shell::is_record(t))
+                    && !p["text"].as_str().is_some_and(|t| {
+                        sessions::is_client_note(t)
+                            || crate::shell::is_record(t)
+                            || crate::skills::is_part(t)
+                    })
             })
             .map(|p| {
                 if p["type"] == "image_url" {
@@ -362,17 +366,55 @@ impl Chat {
     /// `/skills`: the skills in the two folders, those replaced, and those
     /// left out with why (kb d183).
     fn skills_command(&mut self, ctx: &TurnContext, arg: &str) {
+        let info = |text: String| notice(ctx, NoticeLevel::Info, "skills", text);
         match arg {
             "" | "list" => {
                 for l in crate::skills::cmd_list(&self.places.skills) {
                     notice(ctx, l.level, "skills", l.text);
                 }
+                let shown: BTreeSet<&str> =
+                    self.skills_snap.iter().map(|s| s.name.as_str()).collect();
+                let live = self.live_skills();
+                let new: Vec<&str> = live
+                    .skills
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .filter(|n| !shown.contains(n))
+                    .collect();
+                if !new.is_empty() {
+                    // load_skill is offered only with a skill frozen.
+                    let found = if self.tools_on && !self.skills_snap.is_empty() {
+                        "load_skill and $name find them"
+                    } else {
+                        "$name finds them"
+                    };
+                    info(format!(
+                        "not in this chat's system prompt yet ({found}; /skills reload adds \
+                         them): {}",
+                        new.join(", ")
+                    ));
+                }
+                if !self.tools_on && !live.skills.is_empty() {
+                    info(
+                        "build tools are off, so the model is not told of the skills (/tools on); \
+                         $name still sends one"
+                            .into(),
+                    );
+                }
+            }
+            "reload" => {
+                self.snapshot_skills();
+                info(format!(
+                    "{} skill(s) in the system prompt (it changes, so the next message re-reads \
+                     the whole history)",
+                    self.skills_snap.len()
+                ));
             }
             _ => notice(
                 ctx,
                 NoticeLevel::Warn,
                 "skills",
-                "usage: /skills [list]".to_string(),
+                "usage: /skills [list|reload]".to_string(),
             ),
         }
     }
@@ -937,15 +979,20 @@ impl Chat {
 
     /// The next user message: the records of the `!` commands run since
     /// the last one (kb d149), the pending `/mount` and `/ssh` notes, the
-    /// line, then the pending images (rp's `_user_content`). A record's
-    /// output is untrusted text: it taints the chat.
+    /// skills its `$name`s attached (kb d184), the line, then the pending
+    /// images (rp's `_user_content`). A record's output is untrusted text:
+    /// it taints the chat; a skill does not.
     pub fn user_content(&mut self, line: String) -> Value {
         let records = std::mem::take(&mut self.shell_records);
         if !records.is_empty() {
             self.taint("the output of a ! command".into());
         }
         let notes = [self.mount_note.take(), self.ssh_note.take()];
-        if self.pending_images.is_empty() && notes.iter().all(Option::is_none) && records.is_empty()
+        let skills = std::mem::take(&mut self.skill_parts);
+        if self.pending_images.is_empty()
+            && notes.iter().all(Option::is_none)
+            && records.is_empty()
+            && skills.is_empty()
         {
             return Value::String(line);
         }
@@ -953,6 +1000,7 @@ impl Chat {
         for text in records
             .into_iter()
             .chain(notes.into_iter().flatten())
+            .chain(skills)
             .chain(Some(line.clone()))
         {
             if !text.is_empty() {
@@ -1339,12 +1387,17 @@ impl Chat {
             other => vec![json!({"type": "text", "text": other.as_str().unwrap_or_default()})],
         };
         // What the user typed: not the client's notes, nor a `!` command's
-        // record, whose output is not theirs to send again (kb d149).
+        // record, whose output is not theirs to send again (kb d149), nor
+        // a skill, which its `$name` sends again as it is then (kb d184).
         let text = parts
             .iter()
             .filter(|p| p["type"] == "text")
             .filter_map(|p| p["text"].as_str())
-            .filter(|t| !sessions::is_client_note(t) && !crate::shell::is_record(t))
+            .filter(|t| {
+                !sessions::is_client_note(t)
+                    && !crate::shell::is_record(t)
+                    && !crate::skills::is_part(t)
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let images: Vec<String> = parts

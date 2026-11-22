@@ -148,9 +148,9 @@ pub fn default_title(messages: &[Value]) -> Option<String> {
             let kept: Vec<Value> = parts
                 .iter()
                 .filter(|p| {
-                    !p["text"]
-                        .as_str()
-                        .is_some_and(|t| is_client_note(t) || crate::shell::is_record(t))
+                    !p["text"].as_str().is_some_and(|t| {
+                        is_client_note(t) || crate::shell::is_record(t) || crate::skills::is_part(t)
+                    })
                 })
                 .cloned()
                 .collect();

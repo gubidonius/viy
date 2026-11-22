@@ -264,6 +264,13 @@ pub struct Chat {
     toolbox_snap: Vec<crate::toolbox::Tool>,
     /// TOOLBOX_INDEX_MAX: the index's lines.
     toolbox_index_max: usize,
+    /// The skills this chat's system prompt lists, frozen as the toolbox
+    /// index is (kb d184); load_skill and `$name` read the folders live.
+    pub(crate) skills_snap: Vec<crate::skills::Skill>,
+    /// SKILLS_BUDGET: the catalogue's characters.
+    skills_budget: usize,
+    /// The skills `$name` put in the next user message (kb d184).
+    pub(crate) skill_parts: Vec<String>,
     /// SANDBOX_GIT: the model's own .git in the sandbox
     /// ([`viy_tools::sandboxgit`]).
     sandbox_git_on: bool,
@@ -360,6 +367,7 @@ impl Chat {
         } else {
             Vec::new()
         };
+        let skills_snap = crate::skills::load(&places.skills).skills;
         // int() of the value, a negative one showing no lines; 40 otherwise
         let toolbox_index_max = cfg
             .get("TOOLBOX_INDEX_MAX")
@@ -449,6 +457,9 @@ impl Chat {
             toolbox_on,
             toolbox_snap,
             toolbox_index_max,
+            skills_snap,
+            skills_budget: crate::skills::budget(cfg),
+            skill_parts: Vec::new(),
             sandbox_git_on: on("SANDBOX_GIT", "1"),
             sbgit_offer: None,
             sbgit: None,
@@ -667,6 +678,7 @@ impl Chat {
         self.system = system;
         self.today = crate::prompt::today();
         self.snapshot_toolbox();
+        self.snapshot_skills();
         self.earlier.clear();
         self.inflight = None;
         // Files read by the old chat are unknown to this one.
@@ -755,6 +767,7 @@ impl Chat {
         self.earlier = st.earlier;
         self.today = crate::prompt::today();
         self.snapshot_toolbox();
+        self.snapshot_skills();
         self.inflight = None;
         // Reads made by the chat left behind do not count.
         self.files.forget_reads();
@@ -766,6 +779,7 @@ impl Chat {
         self.mount_note = self.mounts_note();
         self.ssh_note = self.ssh_hosts_note();
         self.shell_records.clear();
+        self.skill_parts.clear();
     }
 
     /// Runs `f` on this chat's record of what write_file overwrote (rp's
@@ -1230,6 +1244,9 @@ impl Chat {
             if !self.toolbox_snap.is_empty() {
                 specs.push(crate::toolbox::find_tool());
             }
+            if !self.skills_snap.is_empty() {
+                specs.push(crate::skills::tool());
+            }
         }
         specs
     }
@@ -1242,6 +1259,85 @@ impl Chat {
         } else {
             Vec::new()
         };
+    }
+
+    /// Freezes the skills' catalogue for this history, where the toolbox
+    /// index is frozen, and at `/skills reload`.
+    pub(crate) fn snapshot_skills(&mut self) {
+        self.skills_snap = crate::skills::load(&self.places.skills).skills;
+    }
+
+    /// The skills as the folders hold them now, for load_skill and `$name`.
+    pub(crate) fn live_skills(&self) -> crate::skills::Loaded {
+        crate::skills::load(&self.places.skills)
+    }
+
+    /// Puts the skills `line` names as `$name` in the next user message,
+    /// read now (kb d184). An unknown name stays text, with a notice
+    /// unless it looks like a shell variable; a skill this history already
+    /// holds as it reads now is not sent again, so repeating `$name` does
+    /// not pile copies of it into the context.
+    pub fn attach_skills(&mut self, ctx: &TurnContext, line: &str) {
+        let names = crate::skills::mentions(line);
+        if names.is_empty() {
+            return;
+        }
+        let loaded = self.live_skills();
+        for name in names {
+            let Some(skill) = loaded.get(name) else {
+                if crate::skills::looks_like_a_skill(name) {
+                    notice(
+                        ctx,
+                        NoticeLevel::Info,
+                        "skills",
+                        format!(
+                            "no skill named {name}: ${name} goes as you wrote it (/skills lists \
+                             them)"
+                        ),
+                    );
+                }
+                continue;
+            };
+            match crate::skills::read_body(skill) {
+                Ok(body) => {
+                    let part = crate::skills::part(skill, &body);
+                    let held = self
+                        .messages
+                        .iter()
+                        .filter(|m| m["role"] == "user")
+                        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                        .any(|p| p["text"].as_str() == Some(part.as_str()));
+                    if held {
+                        notice(
+                            ctx,
+                            NoticeLevel::Info,
+                            "skills",
+                            format!(
+                                "skill {name} is already in this chat as it reads now; not sent \
+                                 again"
+                            ),
+                        );
+                        continue;
+                    }
+                    self.skill_parts.push(part);
+                    notice(
+                        ctx,
+                        NoticeLevel::Info,
+                        "skills",
+                        format!(
+                            "skill {name} [{}] goes with this message",
+                            skill.scope.as_str()
+                        ),
+                    );
+                }
+                Err(e) => notice(
+                    ctx,
+                    NoticeLevel::Warn,
+                    "skills",
+                    format!("skill {name} not added: {e}"),
+                ),
+            }
+        }
     }
 
     /// The live toolbox run_shell and find_tool read, so a tool kept
@@ -1287,6 +1383,7 @@ impl Chat {
     fn system_prompt(&self) -> Option<String> {
         let block = instructions::render(&self.instructions());
         let index = crate::toolbox::render_index(&self.toolbox_snap, self.toolbox_index_max);
+        let skills = crate::skills::prompt_section(&self.skills_snap, self.skills_budget);
         SystemPrompt {
             user: self.system.as_deref(),
             tools_on: self.tools_on,
@@ -1298,6 +1395,7 @@ impl Chat {
             workspace: &self.places.workspace,
             today: &self.today,
             instructions: block.as_deref(),
+            skills: skills.as_deref(),
         }
         .render()
     }
@@ -2132,6 +2230,7 @@ impl Turns for ChatTurns {
             };
             match lease.chat.as_mut() {
                 Some(chat) => {
+                    chat.attach_skills(&ctx, &text);
                     let content = chat.user_content(text);
                     chat.send(&ctx, content).await
                 }
@@ -2344,6 +2443,10 @@ mod sandbox_git_tests;
 #[cfg(test)]
 #[path = "toolbox_chat_tests.rs"]
 mod toolbox_chat_tests;
+
+#[cfg(test)]
+#[path = "skills_chat_tests.rs"]
+mod skills_chat_tests;
 
 #[cfg(test)]
 #[path = "chat_tests.rs"]

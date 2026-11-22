@@ -127,7 +127,7 @@ async fn switches() {
 
 #[test]
 fn find_tool_runs_in_parallel_batches() {
-    assert!(super::tools::PARALLEL_SAFE.contains(&"find_tool"));
+    assert!(super::tools::parallel_safe("find_tool"));
 }
 
 /// Runs `command` through run_shell without the sandbox, saying yes; the

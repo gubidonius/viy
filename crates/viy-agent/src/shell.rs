@@ -62,7 +62,8 @@ pub fn record_command(text: &str) -> Option<&str> {
 }
 
 /// The text parts of a user message's content that the user wrote: a
-/// string, or its text parts without the `!` records.
+/// string, or its text parts without the `!` records and the skills a
+/// `$name` attached (kb d184), neither of which is the user's request.
 pub fn typed_parts(content: &Value) -> Vec<&str> {
     match content {
         Value::String(s) => vec![s.as_str()],
@@ -70,7 +71,7 @@ pub fn typed_parts(content: &Value) -> Vec<&str> {
             .iter()
             .filter(|p| p["type"] == "text")
             .filter_map(|p| p["text"].as_str())
-            .filter(|t| !is_record(t))
+            .filter(|t| !is_record(t) && !crate::skills::is_part(t))
             .collect(),
         _ => Vec::new(),
     }
