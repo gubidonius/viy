@@ -8,6 +8,7 @@ pub mod chat;
 pub mod cli;
 pub mod dev;
 pub mod exec;
+pub mod exec_json;
 pub mod finish;
 pub mod hardening;
 pub mod init;

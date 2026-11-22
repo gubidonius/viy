@@ -419,6 +419,12 @@ pub struct ExecArgs {
     pub think: bool,
     #[arg(long, global = true, help = "run without saving the chat")]
     pub ephemeral: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "print the run as JSON lines on stdout (Codex's exec events)"
+    )]
+    pub json: bool,
 }
 
 #[derive(Debug, Subcommand)]

@@ -40,6 +40,7 @@ fn args(prompt: &str) -> ExecArgs {
         system: None,
         think: false,
         ephemeral: false,
+        json: false,
     }
 }
 
@@ -186,4 +187,156 @@ fn exec_resume_needs_a_chat() {
         failed.err().and_then(|f| f.message),
         Some("No session found matching 'nothing-like-it'.".into())
     );
+}
+
+// ------------------------------------------------------------ --json (9.31)
+
+impl Rig {
+    /// Runs `args` with `--json` against a server answering `responses` in
+    /// turn: the lines on stdout, and stderr.
+    fn exec_json(&self, args: ExecArgs, responses: Value) -> (Vec<Value>, String) {
+        let (lines, err, status) = self.exec_json_status(args, responses);
+        assert!(status.is_ok(), "{lines:?}");
+        (lines, err)
+    }
+
+    /// As [`Rig::exec_json`], with how `cmd_exec` ended.
+    fn exec_json_status(
+        &self,
+        mut args: ExecArgs,
+        responses: Value,
+    ) -> (Vec<Value>, String, Result<(), Failure>) {
+        let mock = MockLlm::start(&json!({ "responses": responses })).unwrap();
+        args.url = Some(mock.uri());
+        args.json = true;
+        let mut cfg = dev::scripted_base();
+        cfg.set("CHAT_AUTO_TITLE", "0");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = cmd_exec(&args, &self.paths, cfg, &self.project, &mut out, &mut err);
+        let out = String::from_utf8(out).unwrap();
+        (
+            out.lines()
+                .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{l:?}: {e}")))
+                .collect(),
+            String::from_utf8(err).unwrap(),
+            status,
+        )
+    }
+}
+
+/// Codex's envelope: the saved chat's id first (what `viy exec resume`
+/// takes), the turn, the answer as one item, the turn's end (kb d179).
+#[test]
+fn json_tells_the_run_as_codex_exec_does() {
+    let r = rig();
+    let (lines, err) = r.exec_json(
+        args("what is 2+2"),
+        json!([{"stream": [{"reasoning": "add them"}, {"content": "4"}]}]),
+    );
+    let id = r.store().list(None)[0].id.clone();
+    assert_eq!(err, format!("session id: {id}\n"));
+    let types: Vec<&str> = lines.iter().map(|l| l["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        types,
+        [
+            "thread.started",
+            "turn.started",
+            "item.completed",
+            "item.completed",
+            "turn.completed"
+        ]
+    );
+    assert_eq!(lines[0]["thread_id"], json!(id));
+    assert_eq!(
+        lines[2]["item"],
+        json!({"id": "item_0", "type": "reasoning", "text": "add them"})
+    );
+    assert_eq!(
+        lines[3]["item"],
+        json!({"id": "item_1", "type": "agent_message", "text": "4"})
+    );
+    assert!(lines[4]["usage"]["context_tokens"].as_u64().unwrap() > 0);
+}
+
+/// A tool call starts and completes as an item, before the answer that
+/// follows it; an ephemeral run has no thread id.
+#[test]
+fn json_tells_a_tool_call_with_its_output() {
+    let r = rig();
+    std::fs::write(r.project.join("notes.txt"), "hello\n").unwrap();
+    let mut a = args("what is here");
+    a.ephemeral = true;
+    let (lines, err) = r.exec_json(
+        a,
+        json!([
+            {"stream": [
+                {"tool_call": {"id": "c1", "name": "list_dir", "arguments": "{\"path\": \".\"}"}},
+                {"finish": "tool_calls"}
+            ]},
+            {"stream": [{"content": "notes.txt"}]}
+        ]),
+    );
+    assert_eq!(err, "");
+    assert_eq!(
+        lines[0],
+        json!({"type": "thread.started", "thread_id": null})
+    );
+    let started = lines.iter().find(|l| l["type"] == "item.started").unwrap();
+    assert_eq!(started["item"]["type"], "tool_call");
+    assert_eq!(started["item"]["tool"], "list_dir");
+    assert_eq!(started["item"]["status"], "in_progress");
+    let done = lines
+        .iter()
+        .find(|l| l["type"] == "item.completed" && l["item"]["type"] == "tool_call")
+        .unwrap();
+    assert_eq!(done["item"]["id"], started["item"]["id"]);
+    assert_eq!(done["item"]["status"], "completed");
+    // list_dir shows nothing while it runs; its listing goes to the model.
+    assert_eq!(done["item"]["arguments"], ".");
+    assert_eq!(done["item"]["output"], "");
+    let last_two: Vec<&Value> = lines.iter().rev().take(2).collect();
+    assert_eq!(last_two[1]["item"]["text"], "notes.txt");
+    assert_eq!(last_two[0]["type"], "turn.completed");
+}
+
+/// A safeguard's question takes its unattended no, as in the plain exec,
+/// and the caller is told: the question, then the declined call.
+#[test]
+fn json_tells_a_refused_question_and_the_declined_call() {
+    let r = rig();
+    std::fs::create_dir_all(r.project.join("build")).unwrap();
+    let (lines, _) = r.exec_json(
+        args("clean up"),
+        json!([
+            {"stream": [
+                {"tool_call": {"id": "c1", "name": "run_shell",
+                               "arguments": "{\"command\": \"rm -rf build\"}"}},
+                {"finish": "tool_calls"}
+            ]},
+            {"stream": [{"content": "left it"}]}
+        ]),
+    );
+    let question = lines
+        .iter()
+        .find(|l| l["item"]["type"] == "question")
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert_eq!(question["item"]["answer"], "no");
+    assert_eq!(question["item"]["answered_by"], "unattended");
+    let call = lines
+        .iter()
+        .find(|l| l["type"] == "item.completed" && l["item"]["type"] == "command_execution")
+        .unwrap();
+    assert_eq!(call["item"]["status"], "declined");
+    assert_eq!(call["item"]["command"], "rm -rf build");
+    assert!(r.project.join("build").exists(), "nothing ran");
+}
+
+/// A turn the server cannot answer fails: `turn.failed`, and exit status
+/// 1 for a script that checks it, as `codex exec`.
+#[test]
+fn json_fails_a_turn_the_server_cannot_answer() {
+    let r = rig();
+    let (lines, _, status) = r.exec_json_status(args("hi"), json!([]));
+    assert_eq!(lines.last().unwrap()["type"], "turn.failed", "{lines:?}");
+    assert!(status.is_err());
 }

@@ -175,6 +175,13 @@ fn shown(c: char, prev: Option<char>) -> Shown {
     }
 }
 
+/// A control char (C0, DEL, C1) or one that reorders text or draws
+/// nothing ([`is_hidden`]'s): what a JSON line escapes as `\uXXXX` on top
+/// of JSON's own escapes (`viy exec --json`, ui-plan 7), losing nothing.
+pub fn needs_json_escape(c: char) -> bool {
+    c.is_control() || is_hidden(c)
+}
+
 /// ZWNJ and ZWJ.
 fn is_joiner(c: char) -> bool {
     matches!(c, '\u{200c}' | '\u{200d}')

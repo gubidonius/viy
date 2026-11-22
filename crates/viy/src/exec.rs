@@ -4,7 +4,8 @@
 //! the resume pickers leave it out unless asked, and its id said on stderr,
 //! so a script piping the answer gets only the answer; `--ephemeral` keeps
 //! nothing. `viy exec resume` goes on in a saved chat, `viy exec fork` in a
-//! copy of one.
+//! copy of one. `--json` prints the run as JSON lines instead
+//! ([`crate::exec_json`]).
 
 use std::io::Read;
 use std::io::Write;
@@ -35,6 +36,7 @@ use crate::Failure;
 use crate::cli::ExecArgs;
 use crate::cli::ExecCommand;
 use crate::dev;
+use crate::exec_json::JsonEvents;
 use crate::sessions_cli::find;
 
 /// The chat the prompt goes to.
@@ -98,7 +100,9 @@ pub fn cmd_exec(
     let http: Arc<dyn HttpClient> =
         Arc::new(ReqwestHttp::new().map_err(|e| Failure::from(e.to_string()))?);
     runtime.block_on(async {
-        let url = base_url(&cfg, args.url.as_deref(), paths, &http, out).await?;
+        // Advisory lines stay off a JSON stdout.
+        let advisory: &mut (dyn Write + Send) = if args.json { &mut *err } else { &mut *out };
+        let url = base_url(&cfg, args.url.as_deref(), paths, &http, advisory).await?;
         let mut chat = dev::chat(&cfg, &url, Arc::clone(&http), paths, start, saved)?;
         let store = Sessions::new(paths.sessions_dir(), Arc::new(SystemTimeProvider));
         match target {
@@ -130,8 +134,12 @@ pub fn cmd_exec(
         if let Some(id) = chat.session_id().filter(|_| saved) {
             let _ = writeln!(err, "session id: {id}");
         }
+        let thread_id = chat.session_id().filter(|_| saved);
         let turns = Arc::new(ChatTurns::new(chat));
         let mut engine = Engine::spawn(turns);
+        if args.json {
+            return run_json(&mut engine, prompt, thread_id.as_deref(), out).await;
+        }
         let mut plain = Plain::new(&mut *out).show_think(args.think);
         let failed = |e: std::io::Error| Failure::from(e.to_string());
         let turn = engine
@@ -140,7 +148,9 @@ pub fn cmd_exec(
         while let Some(event) = engine.next_event().await {
             match &event.msg {
                 EventMsg::ShutdownComplete => break,
-                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) if event.id == turn => {
+                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_) | EventMsg::TurnRefused(_)
+                    if event.id == turn =>
+                {
                     let _ = engine.submit(Op::Shutdown);
                 }
                 // A chat's opening line; nothing a script wants.
@@ -154,6 +164,42 @@ pub fn cmd_exec(
         let out = plain.into_inner();
         out.flush().map_err(|e| Failure::from(e.to_string()))
     })
+}
+
+/// The turn with its events as JSON lines on `out` (`--json`).
+async fn run_json(
+    engine: &mut Engine,
+    prompt: String,
+    thread_id: Option<&str>,
+    out: &mut (dyn Write + Send),
+) -> Result<(), Failure> {
+    let failed = |e: std::io::Error| Failure::from(e.to_string());
+    let mut events = JsonEvents::new(&mut *out);
+    events.thread_started(thread_id).map_err(failed)?;
+    let turn = engine
+        .submit(Op::UserTurn { text: prompt })
+        .map_err(|e| Failure::from(e.to_string()))?;
+    let mut ok = true;
+    while let Some(event) = engine.next_event().await {
+        match &event.msg {
+            EventMsg::ShutdownComplete => break,
+            EventMsg::TurnComplete(e) if event.id == turn => {
+                ok = !matches!(e.outcome, viy_protocol::TurnOutcome::Failed { .. });
+                let _ = engine.submit(Op::Shutdown);
+            }
+            EventMsg::TurnAborted(_) | EventMsg::TurnRefused(_) if event.id == turn => {
+                ok = false;
+                let _ = engine.submit(Op::Shutdown);
+            }
+            _ => {}
+        }
+        if let Some(op) = events.event(&event.msg).map_err(failed)? {
+            let _ = engine.submit(op);
+        }
+    }
+    events.into_inner().flush().map_err(failed)?;
+    // The lines said why; a script checking the status needs no more.
+    if ok { Ok(()) } else { Err(Failure::silent(1)) }
 }
 
 /// The most recent saved chat, one-shot ones included, of this project or
