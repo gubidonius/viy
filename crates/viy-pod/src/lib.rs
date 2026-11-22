@@ -17,6 +17,7 @@ pub mod local;
 pub mod lock;
 pub mod notice;
 pub mod process;
+pub mod provider;
 pub mod regions;
 pub mod shutdown;
 pub mod ssh;

@@ -32,6 +32,7 @@ viy-engine = { workspace = true }
 viy-exec = { workspace = true }
 viy-http = { workspace = true }
 viy-protocol = { workspace = true }
+viy-provider = { workspace = true }
 viy-strata = { workspace = true }
 viy-time = { workspace = true }
 viy-vllm = { workspace = true }

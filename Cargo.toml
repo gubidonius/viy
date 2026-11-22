@@ -7,6 +7,7 @@ members = [
     "crates/viy-exec",
     "crates/viy-http",
     "crates/viy-pod",
+    "crates/viy-provider",
     "crates/viy-strata",
     "crates/viy-protocol",
     "crates/viy-term",
@@ -34,6 +35,7 @@ viy-engine = { path = "crates/viy-engine", version = "0.3.0" }
 viy-exec = { path = "crates/viy-exec", version = "0.3.0" }
 viy-http = { path = "crates/viy-http", version = "0.3.0" }
 viy-pod = { path = "crates/viy-pod", version = "0.3.0" }
+viy-provider = { path = "crates/viy-provider", version = "0.3.0" }
 viy-strata = { path = "crates/viy-strata", version = "0.3.0" }
 viy-protocol = { path = "crates/viy-protocol", version = "0.3.0" }
 viy-term = { path = "crates/viy-term", version = "0.3.0" }

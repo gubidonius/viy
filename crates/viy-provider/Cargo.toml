@@ -1,0 +1,22 @@
+[package]
+name = "viy-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "viy's seam between the pod commands and a GPU rental provider (RunPod first)"
+license-file.workspace = true
+repository.workspace = true
+
+[lib]
+name = "viy_provider"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

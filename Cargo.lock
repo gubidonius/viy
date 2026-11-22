@@ -2835,6 +2835,7 @@ dependencies = [
  "viy-exec",
  "viy-http",
  "viy-protocol",
+ "viy-provider",
  "viy-strata",
  "viy-testkit",
  "viy-time",
@@ -2848,6 +2849,14 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "viy-provider"
+version = "0.3.0"
+dependencies = [
+ "pretty_assertions",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
