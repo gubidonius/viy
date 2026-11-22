@@ -56,6 +56,8 @@ use crate::notice::Report;
 use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
+use crate::provider::RunPodProvider;
+use crate::provider::pod_of;
 use crate::regions;
 use crate::ssh::Ssh;
 use crate::ssh::find_ssh_pubkey;
@@ -67,6 +69,10 @@ use crate::tunnel;
 use crate::wait;
 use crate::wait::PodWait;
 use crate::wait::WaitError;
+use viy_provider::Pod;
+use viy_provider::PodState;
+use viy_provider::Provider;
+use viy_provider::ProviderError;
 
 /// This machine's side of the pod commands.
 #[derive(Clone, Copy)]
@@ -107,6 +113,9 @@ pub enum CommandError {
     /// stderr, exit status 1.
     #[error(transparent)]
     RunPod(#[from] RunPodError),
+    /// The same through the provider seam (kb d182).
+    #[error(transparent)]
+    Provider(#[from] viy_provider::ProviderError),
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -193,6 +202,12 @@ impl Interrupt {
 pub fn connect(env: &Env<'_>, cfg: &Config) -> Result<RunPod, CommandError> {
     let key = require_api_key(cfg, env.paths).map_err(CommandError::Exit)?;
     Ok(RunPod::configured(key, Arc::clone(env.http), cfg))
+}
+
+/// RunPod behind the provider seam (kb d182): what the commands that have
+/// moved onto it call.
+pub fn provider(env: &Env<'_>, cfg: &Config) -> Result<RunPodProvider, CommandError> {
+    Ok(RunPodProvider::new(connect(env, cfg)?, cfg))
 }
 
 /// Our pod as RunPod has it, several of that name said as rpctl does.
@@ -935,40 +950,34 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
         }
         return Ok(());
     };
-    let pod_id = text(&pod, "id").unwrap_or_default();
+    // What it shows, through the provider seam's pod (kb d182).
+    let pod = pod_of(&pod);
+    let pod_id = pod.id.as_str();
     let line = |text: String| say(report, Tone::Plain, text);
-    let gpu = pod.get("gpu").cloned().unwrap_or(Value::Null);
-    let machine = pod.get("machine").cloned().unwrap_or(Value::Null);
     let tunnelled = tracked::tunnel_only(env.paths, cfg)?;
     let url = if tunnelled {
         tracked::local_url(cfg)
     } else {
         proxy_url(pod_id, cfg_at(cfg, "VLLM_PORT"))
     };
-    let gpu_name = [text(&gpu, "displayName"), text(&gpu, "id")]
-        .into_iter()
-        .flatten()
-        .find(|s| !s.is_empty())
-        .unwrap_or("?");
-    let count = pod
-        .get("gpuCount")
-        .map_or("?".to_string(), |c| shown(Some(c)));
+    let gpu_name = pod.gpu_name.as_deref().unwrap_or("?");
+    let count = pod.gpu_count.map_or("?".to_string(), |c| c.to_string());
+    // rp shows a missing value as Python's None.
+    let or_none = |v: &Option<String>| v.clone().unwrap_or_else(|| "None".into());
     line(format!("  id:        {pod_id}"));
-    line(format!("  name:      {}", shown(pod.get("name"))));
-    line(format!("  state:     {}", shown(pod.get("desiredStatus"))));
+    line(format!("  name:      {}", or_none(&pod.name)));
+    line(format!("  state:     {}", or_none(&pod.state_name)));
     line(format!("  gpu:       {gpu_name} x{count}"));
     line(format!(
         "  region:    {}",
-        text(&machine, "dataCenterId")
-            .filter(|s| !s.is_empty())
-            .unwrap_or("?")
+        pod.region.as_deref().unwrap_or("?")
     ));
     line(format!(
         "  cost:      ${:.2}/hr",
-        number(pod.get("costPerHr"))
+        pod.cost_per_hour.unwrap_or(0.0)
     ));
-    if truthy(pod.get("lastStartedAt")) {
-        line(format!("  started:   {}", shown(pod.get("lastStartedAt"))));
+    if let Some(started) = &pod.started_at {
+        line(format!("  started:   {started}"));
     }
     line(format!("  endpoint:  {url}"));
     line(format!(
@@ -982,7 +991,7 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
     for text in lifetimes {
         line(text);
     }
-    if text(&pod, "desiredStatus") != Some("RUNNING") {
+    if pod.state != Some(viy_provider::PodState::Running) {
         return Ok(());
     }
     let request = Request::new(Method::GET, format!("{url}/health"))
@@ -1036,17 +1045,18 @@ pub async fn stop_confirmed(
 /// Pods of ours RunPod lists as neither stopped nor terminated: after the
 /// shutdown's stop there should be none, or `down` ends them.
 pub async fn running_pods(env: &Env<'_>, cfg: &Config) -> Result<Vec<String>, CommandError> {
-    let rp = connect(env, cfg)?;
+    let seam = provider(env, cfg)?;
     let ids: HashSet<String> = state::load(env.paths)?
         .pod_id()
         .map(str::to_string)
         .into_iter()
         .collect();
-    Ok(our_pods(&rp, cfg, &ids)
+    Ok(our_pods(&seam, cfg, &ids)
         .await?
-        .iter()
-        .filter(|p| text(p, "desiredStatus") != Some("EXITED"))
-        .filter_map(|p| text(p, "id").map(str::to_string))
+        .into_iter()
+        .filter(|p| p.state != Some(PodState::Stopped))
+        .map(|p| p.id)
+        .filter(|id| !id.is_empty())
         .collect())
 }
 
@@ -1057,8 +1067,8 @@ async fn stop_pod(
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
     let _lock = PodLock::exclusive(env.paths, "stop")?;
-    let rp = connect(env, cfg)?;
-    let pod = match resolve(&rp, env, cfg, report).await {
+    let seam = provider(env, cfg)?;
+    let pod = match resolve(seam.client(), env, cfg, report).await {
         Ok(pod) => pod,
         Err(ResolveError::RunPod(error)) => {
             say(
@@ -1083,7 +1093,7 @@ async fn stop_pod(
     // Nothing left to forward to.
     let mut said = |notice| report(Report::Notice(notice));
     tunnel::stop(&env.ssh(cfg), true, &mut said).await?;
-    rp.stop_pod(pod_id).await?;
+    viy_provider::Provider::stop(&seam, pod_id).await?;
     say(
         report,
         Tone::Ok,
@@ -1114,7 +1124,7 @@ pub async fn down(
     cancelled_up: bool,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let rp = connect(env, cfg)?;
+    let seam = provider(env, cfg)?;
     // Preemption blocks for up to 15 s plus a grace per kill; its notices
     // are said as they happen.
     let paths = env.paths.clone();
@@ -1162,7 +1172,7 @@ pub async fn down(
             ),
         );
     }
-    let (done, error) = sweep(&rp, cfg, &mut ids, settle, SWEEP_BUDGET, report).await;
+    let (done, error) = sweep(&seam, cfg, &mut ids, settle, SWEEP_BUDGET, report).await;
     if let Some(error) = error {
         say(
             report,
@@ -1207,21 +1217,19 @@ pub async fn down(
     Ok(())
 }
 
-/// Every live pod that could be ours: named POD_NAME, or one we tracked.
+/// Every live pod that could be ours: named POD_NAME, or one we tracked
+/// (the provider lists none terminated).
 async fn our_pods(
-    rp: &RunPod,
+    seam: &dyn Provider,
     cfg: &Config,
     ids: &HashSet<String>,
-) -> Result<Vec<Value>, RunPodError> {
+) -> Result<Vec<Pod>, ProviderError> {
     let name = cfg_at(cfg, "POD_NAME");
-    Ok(rp
-        .list_pods()
+    Ok(seam
+        .pods()
         .await?
         .into_iter()
-        .filter(|p| {
-            text(p, "desiredStatus") != Some("TERMINATED")
-                && (text(p, "name") == Some(name) || text(p, "id").is_some_and(|i| ids.contains(i)))
-        })
+        .filter(|p| p.name.as_deref() == Some(name) || (!p.id.is_empty() && ids.contains(&p.id)))
         .collect())
 }
 
@@ -1229,25 +1237,25 @@ async fn our_pods(
 /// none for `settle` straight. The pods terminated, and the error that
 /// stopped it, when it could not confirm: a pod may still be billing.
 async fn sweep(
-    rp: &RunPod,
+    seam: &dyn Provider,
     cfg: &Config,
     ids: &mut HashSet<String>,
     settle: Duration,
     budget: Duration,
     report: Reporter<'_>,
-) -> (Vec<String>, Option<RunPodError>) {
+) -> (Vec<String>, Option<ProviderError>) {
     let started = Instant::now();
     let mut clear_since: Option<Instant> = None;
     let mut done: Vec<String> = Vec::new();
-    let mut error: Option<RunPodError> = None;
+    let mut error: Option<ProviderError> = None;
     let mut delay = Duration::from_secs(2);
     while started.elapsed() < budget {
-        let pods = match our_pods(rp, cfg, ids).await {
+        let pods = match our_pods(seam, cfg, ids).await {
             Ok(pods) => {
                 error = None;
                 Some(pods)
             }
-            Err(e) if !e.transient() => return (done, Some(e)),
+            Err(e) if !e.transient => return (done, Some(e)),
             Err(e) => {
                 error = Some(e);
                 None
@@ -1267,14 +1275,15 @@ async fn sweep(
         }
         clear_since = None;
         for pod in pods.unwrap_or_default() {
-            let Some(id) = text(&pod, "id").map(str::to_string) else {
+            if pod.id.is_empty() {
                 continue;
-            };
+            }
+            let id = pod.id.clone();
             ids.insert(id.clone());
-            if let Err(e) = rp.delete_pod(&id).await
-                && e.status_code() != Some(404)
+            if let Err(e) = seam.terminate(&id).await
+                && e.status != Some(404)
             {
-                let transient = e.transient();
+                let transient = e.transient;
                 error = Some(e);
                 if !transient {
                     return (done, error);
@@ -1287,7 +1296,7 @@ async fn sweep(
                     Tone::Ok,
                     format!(
                         "  terminated {id} (was {})",
-                        shown(pod.get("desiredStatus"))
+                        pod.state_name.as_deref().unwrap_or("None")
                     ),
                 );
                 done.push(id);
@@ -1308,10 +1317,10 @@ async fn sweep(
         };
     }
     let error = error.unwrap_or_else(|| {
-        RunPodError::new(
+        crate::provider::error_of(&RunPodError::new(
             format!("pods still listed after {}s", budget.as_secs()),
             None,
-        )
+        ))
     });
     (done, Some(error))
 }

@@ -245,7 +245,9 @@ pub async fn reap(
         print("rp or viy up/stop/down is running; not checking now".into());
         return Ok(());
     }
-    let rp = commands::connect(env, cfg)?;
+    let seam = commands::provider(env, cfg)?;
+    // Volumes and tracking stay RunPod's (kb d182).
+    let rp = seam.client();
     let now = regions::now(env.time);
     let mut tell = |message: String| {
         alert(report, "viy reap", message.clone(), false);
@@ -253,7 +255,7 @@ pub async fn reap(
     };
     // Volumes unused for BACKUP_IDLE_DAYS or PRIMARY_IDLE_DAYS (expiry
     // takes the pod lock itself when one is due).
-    match regions::expire(&rp, env.paths, cfg, now, &mut tell).await {
+    match regions::expire(rp, env.paths, cfg, now, &mut tell).await {
         Err(CommandError::RunPod(error)) => {
             print(format!("volume check failed: {}", first_line(&error)));
         }
@@ -261,7 +263,7 @@ pub async fn reap(
             result?;
         }
     }
-    let found = match commands::resolve(&rp, env, cfg, report).await {
+    let found = match commands::resolve(rp, env, cfg, report).await {
         Ok(found) => found,
         Err(ResolveError::RunPod(error)) => {
             print(format!("could not reach RunPod: {}", first_line(&error)));
@@ -277,7 +279,10 @@ pub async fn reap(
         print("no pod running".into());
         return Ok(());
     };
-    let desired = pod.get("desiredStatus").and_then(Value::as_str);
+    // The pod through the seam: its state in RunPod's word, which
+    // `decide` reads as rp's `idle.decide` does.
+    let seen_pod = crate::provider::pod_of(&pod);
+    let desired = seen_pod.state_name.as_deref();
     if desired != Some("EXITED") {
         // A stopped pod is not a use of its volume (kb d178).
         regions::note_pod(env.paths, &pod, now)?;

@@ -589,6 +589,7 @@ impl PodServer {
                         message: format!("/{name}: interrupted"),
                     })),
                     CommandError::RunPod(e) => failed(e.to_string()),
+                    CommandError::Provider(e) => failed(e.to_string()),
                     CommandError::Io(e) => failed(e.to_string()),
                 }
                 BackgroundState::Failed

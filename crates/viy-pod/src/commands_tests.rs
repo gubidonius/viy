@@ -1028,6 +1028,38 @@ async fn status_shows_the_pod_and_whether_vllm_answers() {
     );
 }
 
+/// A sparse pod, stopped: rp's `None` for a missing name, `?` for what is
+/// missing or empty, no started line, and no health check (WP 9.36's status
+/// through the seam).
+#[tokio::test(start_paused = true)]
+async fn status_of_a_sparse_stopped_pod() {
+    let home = Home::new(tracked(false), |r: &viy_http::Request| {
+        assert!(!r.url.ends_with("/health"), "a stopped pod is not asked");
+        json_reply(json!({"id": "pod111", "desiredStatus": "EXITED",
+                          "machine": {"dataCenterId": ""}, "lastStartedAt": ""}))
+    });
+    let told = Told::default();
+    status(&home.env(), &home.cfg, &told.reporter())
+        .await
+        .unwrap();
+    assert_eq!(
+        told.texts()[..6],
+        [
+            "  id:        pod111",
+            "  name:      None",
+            "  state:     EXITED",
+            "  gpu:       ? x?",
+            "  region:    ?",
+            "  cost:      $0.00/hr",
+        ]
+    );
+    assert!(
+        !told.texts().iter().any(|t| t.starts_with("  started:")),
+        "{:?}",
+        told.texts()
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn status_without_a_pod_or_runpod() {
     let home = Home::new(None, |r: &viy_http::Request| {

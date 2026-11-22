@@ -4,8 +4,10 @@
 //! RunPod's v1-shaped pods (`wire.rs`, kb d151) become [`Pod`]s here, and a
 //! [`PodRequest`] becomes the v1 create body the engines build today
 //! (`viy_engine::pod::body`), key for key, with RunPod's own settings
-//! (CLOUD_TYPE, GPU_TYPE_PRIORITY) from its configuration. Nothing calls it
-//! yet: the commands move onto it in WP 9.36-9.38. What viy writes to files
+//! (CLOUD_TYPE, GPU_TYPE_PRIORITY) from its configuration. `viy status`,
+//! `stop`, `down`'s sweep, the shutdown's running-pod check and the reaper
+//! go through it since WP 9.36; `up` and its path (tracked, wait, ssh,
+//! tunnel) move in 9.37, the engines' bodies in 9.38. What viy writes to files
 //! shared with rp (pod.json's `costPerHr` as RunPod sent it) stays read
 //! from RunPod's own answer on RunPod's side.
 
@@ -42,6 +44,11 @@ pub struct RunPodProvider {
 }
 
 impl RunPodProvider {
+    /// The client, for what stays RunPod's (tracking, regions, failover).
+    pub fn client(&self) -> &RunPod {
+        &self.rp
+    }
+
     pub fn new(rp: RunPod, cfg: &Config) -> Self {
         let get = |key: &str| cfg.get(key).unwrap_or("").to_string();
         Self {
@@ -104,12 +111,16 @@ pub fn pod_of(v1: &Value) -> Pod {
         _ => None,
     };
     let machine = v1.get("machine");
-    let gpu = v1
-        .get("gpu")
-        .and_then(|g| g.get("id"))
-        .or_else(|| machine.and_then(|m| m.get("gpuDisplayName")))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let gpu_field = |key: &str| {
+        v1.get("gpu")
+            .and_then(|g| g.get(key))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let gpu = gpu_field("id");
+    // `viy status`'s rule: the type's display name, else its id.
+    let gpu_name = gpu_field("displayName").or_else(|| gpu.clone());
     Pod {
         id: text("id").unwrap_or_default(),
         name: text("name"),
@@ -117,17 +128,22 @@ pub fn pod_of(v1: &Value) -> Pod {
         state_name,
         cost_per_hour: number(v1.get("costPerHr")),
         gpu,
-        gpu_count: v1
-            .get("gpuCount")
-            .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok()),
+        gpu_name,
+        // A number, or a number RunPod sent as a string.
+        gpu_count: match v1.get("gpuCount") {
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse().ok(),
+            _ => None,
+        }
+        .and_then(|n| u32::try_from(n).ok()),
         region: machine
             .and_then(|m| m.get("dataCenterId"))
             .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
             .map(str::to_string),
         // The rules the tunnel and the waits use today.
         ssh: crate::ssh::ssh_endpoint(v1),
-        started_at: text("lastStartedAt"),
+        started_at: text("lastStartedAt").filter(|s| !s.is_empty()),
         created_at: text("createdAt"),
         volume: pod_volume_id(v1).map(str::to_string),
     }

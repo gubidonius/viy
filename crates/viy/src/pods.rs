@@ -381,7 +381,7 @@ fn failure(error: CommandError, printer: &Printer<'_>) -> Failure {
         CommandError::Exit(message) => Failure::from(message),
         CommandError::Failed => Failure::silent(1),
         CommandError::Interrupted => ended(Failure::silent(130), printer),
-        CommandError::RunPod(error) => {
+        CommandError::RunPod(_) | CommandError::Provider(_) => {
             let message = error.to_string();
             Failure::from(if printer.terminal.err_tty {
                 format!("\x1b[31m{message}\x1b[0m")

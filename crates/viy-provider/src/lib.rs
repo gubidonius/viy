@@ -42,8 +42,10 @@ pub struct Pod {
     pub state_name: Option<String>,
     /// What the pod costs an hour while it runs, in USD.
     pub cost_per_hour: Option<f64>,
-    /// The GPU, as the provider names it.
+    /// The GPU's type, as the provider names it in a request.
     pub gpu: Option<String>,
+    /// The GPU as viy shows it: the provider's display name, else its type.
+    pub gpu_name: Option<String>,
     pub gpu_count: Option<u32>,
     pub region: Option<String>,
     /// Where its SSH answers, while it runs.

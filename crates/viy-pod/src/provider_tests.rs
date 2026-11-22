@@ -136,6 +136,7 @@ fn a_pod_reads_whole() {
             state_name: Some("EXITED".into()),
             cost_per_hour: Some(2.19),
             gpu: Some("NVIDIA A100-SXM4-80GB".into()),
+            gpu_name: Some("NVIDIA A100-SXM4-80GB".into()),
             gpu_count: Some(1),
             region: Some("EUR-IS-1".into()),
             ssh: Some(("157.0.0.1".into(), 16219)),
@@ -268,4 +269,16 @@ async fn the_contract_on_lists_ids_and_creates() {
         .await
         .unwrap_err();
     assert_eq!(error.message, "RunPod created no pod");
+}
+
+/// The GPU's type stays its id; what viy shows prefers a display name; a
+/// count sent as a string is read.
+#[test]
+fn the_gpu_and_its_count() {
+    let pod = pod_of(&json!({"id": "p", "gpu": {"id": "NVIDIA A100-SXM4-80GB",
+                                                 "displayName": "A100 SXM"},
+                             "gpuCount": "2"}));
+    assert_eq!(pod.gpu.as_deref(), Some("NVIDIA A100-SXM4-80GB"));
+    assert_eq!(pod.gpu_name.as_deref(), Some("A100 SXM"));
+    assert_eq!(pod.gpu_count, Some(2));
 }
