@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use viy_http::HttpClient;
 use viy_testkit::fixtures;
 use viy_testkit::http::Reply;
@@ -38,10 +39,10 @@ fn request_from(body: &Value) -> PodRequest {
             .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
             .collect(),
         gpu_types: list("gpuTypeIds"),
-        gpu_count: u32::try_from(body["gpuCount"].as_u64().unwrap()).unwrap(),
+        gpu_count: body["gpuCount"].as_i64().unwrap(),
         region: body["dataCenterIds"][0].as_str().unwrap().to_string(),
         volume: Some(text("networkVolumeId")).filter(|v| !v.is_empty()),
-        disk_gb: body["containerDiskInGb"].as_u64().unwrap(),
+        disk_gb: body["containerDiskInGb"].as_i64().unwrap(),
         ports: list("ports"),
         cuda: list("allowedCudaVersions"),
         min_ram_gb: body["minRAMPerGPU"].as_u64(),

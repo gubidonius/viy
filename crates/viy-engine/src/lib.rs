@@ -1,13 +1,14 @@
 //! The seam between viy-pod and the engines that serve the model on the pod
 //! (kb d171, docs/strata-engine.md 4.1). Each engine lives in a crate of its
-//! own (`viy-vllm`, `viy-strata`) that depends on this one and on
-//! viy-config only, never on the other engine or on viy-pod; viy-pod picks
-//! one by the `ENGINE` key and asks it, through [`Engine`], for what the pod
-//! runs. Codex keeps its local servers the same way, in `codex-rs/ollama`
+//! own (`viy-vllm`, `viy-strata`) that depends on this one, on viy-config
+//! and on the provider seam's types (`viy-provider`, kb d182), never on the
+//! other engine or on viy-pod; viy-pod picks one by the `ENGINE` key and
+//! asks it, through [`Engine`], for the pod request it wants. Codex keeps its local servers the same way, in `codex-rs/ollama`
 //! and `codex-rs/lmstudio`, chosen by provider id.
 
 use serde_json::Value;
 use viy_config::Config;
+use viy_provider::PodRequest;
 
 /// The engines a profile can name in `ENGINE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,17 +54,29 @@ pub trait Engine: Sync {
     /// Its `ENGINE` value.
     fn name(&self) -> EngineName;
 
-    /// The create-pod request body in RunPod REST v1's shapes (viy-pod's
-    /// `wire` sends it as v2): image, start command, environment, ports and
-    /// the placement fields, which failover then sets per attempt
-    /// (`dataCenterIds`, `networkVolumeId`, `gpuTypeIds`).
+    /// What the engine asks a provider for (kb d182): image, start command,
+    /// environment, ports and the placement, which failover then sets per
+    /// attempt.
+    fn pod_request(
+        &self,
+        cfg: &Config,
+        api_key: &str,
+        volume_id: &str,
+        public_key: Option<&str>,
+    ) -> Result<PodRequest, BadValue>;
+
+    /// RunPod's create body for [`Engine::pod_request`], in REST v1's shapes
+    /// (viy-pod's `wire` sends it as v2).
     fn pod_body(
         &self,
         cfg: &Config,
         api_key: &str,
         volume_id: &str,
         public_key: Option<&str>,
-    ) -> Result<Value, BadValue>;
+    ) -> Result<Value, BadValue> {
+        let request = self.pod_request(cfg, api_key, volume_id, public_key)?;
+        Ok(pod::runpod_body_for(cfg, &request))
+    }
 }
 
 /// A config value a pod body cannot take: not a number where one is needed

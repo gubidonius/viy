@@ -16,6 +16,7 @@ use viy_engine::pod;
 use viy_engine::pod::PodStart;
 use viy_engine::pod::at;
 use viy_engine::pod::quote;
+use viy_provider::PodRequest;
 
 /// rpctl's `startup.py` at the pinned commit, unchanged: the boot script
 /// writes it to `/run/rpctl-startup.py`, which applies the boot-time
@@ -228,20 +229,33 @@ echo "RPCTL_PHASE starting vLLM" | tee -a /workspace/vllm.log
     )
 }
 
-/// The create-pod request body (RunPod REST `POST /pods`), keys in rpctl's
-/// order: vLLM's image and boot script in the body every engine shares.
+/// What vLLM's pod asks a provider for: its image and boot script in the
+/// request every engine shares (kb d182).
+pub fn build_pod_request(
+    cfg: &Config,
+    api_key: &str,
+    volume_id: &str,
+    public_key: Option<&str>,
+) -> Result<PodRequest, BadValue> {
+    let env = pod::env(cfg, api_key, public_key)?;
+    let start = PodStart {
+        image: at(cfg, "VLLM_IMAGE").to_string(),
+        script: build_boot_script(cfg, api_key),
+    };
+    pod::request(cfg, start, env, volume_id)
+}
+
+/// RunPod's create-pod body (REST `POST /pods`), keys in rpctl's order, for
+/// [`build_pod_request`]: rpctl's body byte for byte (the `pod/boot`
+/// fixture).
 pub fn build_pod_body(
     cfg: &Config,
     api_key: &str,
     volume_id: &str,
     public_key: Option<&str>,
 ) -> Result<Value, BadValue> {
-    let env = pod::env(cfg, api_key, public_key)?;
-    let start = PodStart {
-        image: at(cfg, "VLLM_IMAGE").to_string(),
-        script: build_boot_script(cfg, api_key),
-    };
-    pod::body(cfg, start, env, volume_id)
+    let request = build_pod_request(cfg, api_key, volume_id, public_key)?;
+    Ok(pod::runpod_body_for(cfg, &request))
 }
 
 #[cfg(test)]

@@ -222,3 +222,39 @@ fn strata_pod_passes_its_tests() {
     assert!(out.status.success(), "{stderr}");
     assert!(stderr.contains("Ran 43 tests"), "{stderr}");
 }
+
+/// The body's keys in order, held apart from the code that writes them
+/// (WP 9.38): RunPod's fields, the CUDA filter, then the RAM floor last.
+#[test]
+fn the_bodys_keys_come_in_rps_order() {
+    let body = build_pod_body(&with([("MIN_RAM_GB", "250")]), "k", "v", None).unwrap();
+    let keys: Vec<&str> = body
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "name",
+            "imageName",
+            "computeType",
+            "cloudType",
+            "gpuCount",
+            "gpuTypeIds",
+            "gpuTypePriority",
+            "dataCenterIds",
+            "networkVolumeId",
+            "volumeMountPath",
+            "containerDiskInGb",
+            "ports",
+            "env",
+            "dockerEntrypoint",
+            "dockerStartCmd",
+            "allowedCudaVersions",
+            "minRAMPerGPU",
+        ]
+    );
+    assert_eq!(body["minRAMPerGPU"], 250);
+}

@@ -6,7 +6,6 @@
 //! setting is checked here, before a pod is made.
 
 use serde_json::Value;
-use serde_json::json;
 use viy_config::Config;
 use viy_config::config::tunnel_enabled;
 use viy_engine::BadValue;
@@ -14,6 +13,7 @@ use viy_engine::pod;
 use viy_engine::pod::PodStart;
 use viy_engine::pod::at;
 use viy_engine::pod::quote;
+use viy_provider::PodRequest;
 
 use crate::release;
 
@@ -163,26 +163,36 @@ pub fn build_boot_script(cfg: &Config) -> Result<String, BadValue> {
     Ok(format!("set -uo pipefail\n{exports}\n{body}"))
 }
 
-/// The create-pod request body: the shared body around STRATA_IMAGE and the
-/// boot script, and `minRAMPerGPU` (v1's name) from MIN_RAM_GB: Strata
-/// keeps the model's experts and n-gram table in RAM.
-pub fn build_pod_body(
+/// What Strata's pod asks a provider for: the shared request around
+/// STRATA_IMAGE and the boot script, and the host RAM per GPU from
+/// MIN_RAM_GB: Strata keeps the model's experts and n-gram table in RAM.
+pub fn build_pod_request(
     cfg: &Config,
     api_key: &str,
     volume_id: &str,
     public_key: Option<&str>,
-) -> Result<Value, BadValue> {
+) -> Result<PodRequest, BadValue> {
     let env = pod::env(cfg, api_key, public_key)?;
     let start = PodStart {
         image: at(cfg, "STRATA_IMAGE").to_string(),
         script: build_boot_script(cfg)?,
     };
     let min_ram = whole_in(cfg, "MIN_RAM_GB", 0..=1 << 20, "a whole number of GB")?;
-    let mut body = pod::body(cfg, start, env, volume_id)?;
-    if min_ram > 0 {
-        body["minRAMPerGPU"] = json!(min_ram);
-    }
-    Ok(body)
+    let mut request = pod::request(cfg, start, env, volume_id)?;
+    request.min_ram_gb = u64::try_from(min_ram).ok().filter(|r| *r > 0);
+    Ok(request)
+}
+
+/// RunPod's create body for [`build_pod_request`] (`minRAMPerGPU`, v1's
+/// name, from the RAM floor).
+pub fn build_pod_body(
+    cfg: &Config,
+    api_key: &str,
+    volume_id: &str,
+    public_key: Option<&str>,
+) -> Result<Value, BadValue> {
+    let request = build_pod_request(cfg, api_key, volume_id, public_key)?;
+    Ok(pod::runpod_body_for(cfg, &request))
 }
 
 #[cfg(test)]

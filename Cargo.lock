@@ -2797,6 +2797,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "viy-config",
+ "viy-provider",
 ]
 
 [[package]]
@@ -2867,6 +2868,7 @@ dependencies = [
  "serde_json",
  "viy-config",
  "viy-engine",
+ "viy-provider",
  "viy-testkit",
 ]
 
@@ -2957,6 +2959,7 @@ dependencies = [
  "serde_json",
  "viy-config",
  "viy-engine",
+ "viy-provider",
  "viy-testkit",
 ]
 

@@ -1,9 +1,11 @@
-//! What every engine's pod has in common: the create-pod body around the
-//! engine's image and start script, the pod's environment (the API key, the
+//! What every engine's pod has in common: the pod request around the
+//! engine's image and start script ([`request`], the provider seam's
+//! `PodRequest`, kb d182), the pod's environment (the API key, the
 //! watchdog's limits and keys), the ports, and the shell quoting and number
-//! checks the bodies need. Moved out of viy-vllm's boot.rs unchanged, so
-//! vLLM's body is still rpctl's byte for byte (kb d003; the `pod/boot`
-//! fixture checks it).
+//! checks they need; and RunPod's create body for a request
+//! ([`runpod_body`]), kept here beside the engines so vLLM's body is still
+//! rpctl's byte for byte (kb d003; the `pod/boot` fixture checks it in
+//! viy-vllm), and viy-pod's RunPod provider sends that same body.
 
 use serde_json::Map;
 use serde_json::Value;
@@ -11,6 +13,8 @@ use serde_json::json;
 use viy_config::Config;
 use viy_config::config::gpu_type_list;
 use viy_config::config::tunnel_enabled;
+
+use viy_provider::PodRequest;
 
 use crate::BadValue;
 
@@ -118,38 +122,84 @@ pub fn env(
     Ok(env)
 }
 
-/// The create-pod request body (RunPod REST `POST /pods`), keys in rpctl's
-/// order, around `start`.
-pub fn body(
+/// What an engine asks a provider for, around `start`: the pod's name,
+/// image and start command, its environment, the GPU types and count, the
+/// region, the volume, the disk, the ports, the CUDA versions.
+pub fn request(
     cfg: &Config,
     start: PodStart,
     env: Map<String, Value>,
     volume_id: &str,
-) -> Result<Value, BadValue> {
-    let cuda: Vec<&str> = at(cfg, "CUDA_VERSIONS")
+) -> Result<PodRequest, BadValue> {
+    let cuda: Vec<String> = at(cfg, "CUDA_VERSIONS")
         .split(',')
         .map(str::trim)
         .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(PodRequest {
+        name: at(cfg, "POD_NAME").to_string(),
+        image: start.image,
+        entrypoint: vec!["/bin/bash".into(), "-c".into()],
+        command: vec![start.script],
+        // Strings, as `env` sets them; anything else as its JSON text, so
+        // nothing is lost quietly.
+        env: env
+            .into_iter()
+            .map(|(k, v)| match v {
+                Value::String(s) => (k, s),
+                other => (k, other.to_string()),
+            })
+            .collect(),
+        gpu_count: whole(cfg, "GPU_COUNT")?,
+        gpu_types: gpu_type_list(cfg).into_iter().map(str::to_string).collect(),
+        region: at(cfg, "DATA_CENTER_ID").to_string(),
+        // None for a boot without the primary (`up --backup` names none).
+        volume: Some(volume_id.to_string()).filter(|v| !v.is_empty()),
+        disk_gb: whole(cfg, "CONTAINER_DISK_GB")?,
+        ports: ports(cfg),
+        cuda,
+        min_ram_gb: None,
+    })
+}
+
+/// RunPod's create-pod body (REST `POST /pods`, in v1's shapes) for
+/// `request`, keys in rpctl's order, with RunPod's own settings: its cloud
+/// tier (CLOUD_TYPE) and how it reads the GPU list (GPU_TYPE_PRIORITY).
+pub fn runpod_body(cloud: &str, gpu_priority: &str, request: &PodRequest) -> Value {
+    let env: Map<String, Value> = request
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v)))
         .collect();
     let mut body = json!({
-        "name": at(cfg, "POD_NAME"),
-        "imageName": start.image,
+        "name": request.name,
+        "imageName": request.image,
         "computeType": "GPU",
-        "cloudType": at(cfg, "CLOUD_TYPE"),
-        "gpuCount": whole(cfg, "GPU_COUNT")?,
-        "gpuTypeIds": gpu_type_list(cfg),
-        "gpuTypePriority": at(cfg, "GPU_TYPE_PRIORITY"),
-        "dataCenterIds": [at(cfg, "DATA_CENTER_ID")],
-        "networkVolumeId": volume_id,
+        "cloudType": cloud,
+        "gpuCount": request.gpu_count,
+        "gpuTypeIds": request.gpu_types,
+        "gpuTypePriority": gpu_priority,
+        "dataCenterIds": [request.region],
+        "networkVolumeId": request.volume.clone().unwrap_or_default(),
         "volumeMountPath": "/workspace",
-        "containerDiskInGb": whole(cfg, "CONTAINER_DISK_GB")?,
-        "ports": ports(cfg),
+        "containerDiskInGb": request.disk_gb,
+        "ports": request.ports,
         "env": env,
-        "dockerEntrypoint": ["/bin/bash", "-c"],
-        "dockerStartCmd": [start.script],
+        "dockerEntrypoint": request.entrypoint,
+        "dockerStartCmd": request.command,
     });
-    if !cuda.is_empty() {
-        body["allowedCudaVersions"] = json!(cuda);
+    if !request.cuda.is_empty() {
+        body["allowedCudaVersions"] = json!(request.cuda);
     }
-    Ok(body)
+    if let Some(ram) = request.min_ram_gb.filter(|r| *r > 0) {
+        body["minRAMPerGPU"] = json!(ram);
+    }
+    body
+}
+
+/// [`runpod_body`] with RunPod's settings from `cfg`: the one place the
+/// engines' and the trait's RunPod bodies read them.
+pub fn runpod_body_for(cfg: &Config, request: &PodRequest) -> Value {
+    runpod_body(at(cfg, "CLOUD_TYPE"), at(cfg, "GPU_TYPE_PRIORITY"), request)
 }

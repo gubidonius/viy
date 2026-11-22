@@ -105,3 +105,36 @@ fn stratas_body_through_its_crate() {
     assert_eq!(body["minRAMPerGPU"], 150);
     assert_eq!(viy_strata::STRATA.name(), EngineName::Strata);
 }
+
+/// Each engine's request is the neutral one (kb d182): the placement and
+/// the volume where the seam names them, and RunPod's body for it is the
+/// body the engine gives.
+#[test]
+fn each_engine_asks_through_a_pod_request() {
+    for (name, ram) in [("vllm", None), ("strata", Some(250))] {
+        let mut cfg = Config::defaults();
+        cfg.set("ENGINE", name);
+        if ram.is_some() {
+            cfg.set("MIN_RAM_GB", "250");
+        }
+        let engine = for_config(&cfg).unwrap();
+        let request = engine.pod_request(&cfg, "k", "vol9", None).unwrap();
+        assert_eq!(request.volume.as_deref(), Some("vol9"), "{name}");
+        assert_eq!(request.region, cfg.get("DATA_CENTER_ID").unwrap(), "{name}");
+        assert_eq!(request.min_ram_gb, ram, "{name}");
+        assert!(
+            request.env.iter().any(|(k, _)| k == "VLLM_API_KEY"),
+            "{name}"
+        );
+        let body = engine.pod_body(&cfg, "k", "vol9", None).unwrap();
+        assert_eq!(
+            body,
+            viy_engine::pod::runpod_body(
+                cfg.get("CLOUD_TYPE").unwrap(),
+                cfg.get("GPU_TYPE_PRIORITY").unwrap(),
+                &request
+            ),
+            "{name}"
+        );
+    }
+}

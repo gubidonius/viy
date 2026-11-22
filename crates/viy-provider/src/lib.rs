@@ -70,11 +70,13 @@ pub struct PodRequest {
     pub env: Vec<(String, String)>,
     /// GPU types in the order wanted.
     pub gpu_types: Vec<String>,
-    pub gpu_count: u32,
+    /// As the config says it, sent as it is (rp sends what it reads): a
+    /// provider checks it is at least 1 before it asks for a pod.
+    pub gpu_count: i64,
     pub region: String,
     /// The persistent volume, mounted at `/workspace`.
     pub volume: Option<String>,
-    pub disk_gb: u64,
+    pub disk_gb: i64,
     /// `8000/http`, `22/tcp`.
     pub ports: Vec<String>,
     /// Acceptable host driver versions (CUDA), any when empty.

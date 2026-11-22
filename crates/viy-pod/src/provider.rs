@@ -2,21 +2,20 @@
 //! implements `viy_provider::Provider` and `Volumes` over [`RunPod`], the
 //! client the pod commands use today, so its requests are the same ones.
 //! RunPod's v1-shaped pods (`wire.rs`, kb d151) become [`Pod`]s here, and a
-//! [`PodRequest`] becomes the v1 create body the engines build today
-//! (`viy_engine::pod::body`), key for key, with RunPod's own settings
+//! [`PodRequest`] becomes RunPod's v1 create body through the one
+//! translation the engines use too (`viy_engine::pod::runpod_body`), with
+//! RunPod's own settings
 //! (CLOUD_TYPE, GPU_TYPE_PRIORITY) from its configuration. `viy status`,
 //! `stop`, `down`'s sweep, the shutdown's running-pod check and the reaper
 //! go through it since WP 9.36; `up` and its path (tracked, wait, ssh,
-//! tunnel), adopt, create and failover in 9.37b, the engines' bodies in
-//! 9.38; `up`'s resume and volumes moved in 9.37. What viy writes to files
+//! tunnel), adopt, create and failover in 9.37b; `up`'s resume and volumes
+//! moved in 9.37, the engines' requests in 9.38. What viy writes to files
 //! shared with rp (pod.json's `costPerHr` as RunPod sent it) stays read
 //! from RunPod's own answer on RunPod's side.
 
 use std::time::Duration;
 
-use serde_json::Map;
 use serde_json::Value;
-use serde_json::json;
 use viy_config::Config;
 use viy_provider::BoxFuture;
 use viy_provider::LogLine;
@@ -32,9 +31,6 @@ use crate::api::RunPod;
 use crate::api::RunPodError;
 use crate::regions::is_capacity_error;
 use crate::tracked::pod_volume_id;
-
-/// Where RunPod mounts a pod's network volume.
-const WORKSPACE: &str = "/workspace";
 
 pub struct RunPodProvider {
     rp: RunPod,
@@ -59,38 +55,10 @@ impl RunPodProvider {
         }
     }
 
-    /// The v1 create body for `request`, as `viy_engine::pod::body` builds
-    /// it, in its key order.
+    /// The v1 create body for `request`: the engines' own translation
+    /// (`viy_engine::pod::runpod_body`), with this provider's settings.
     pub fn body(&self, request: &PodRequest) -> Value {
-        let env: Map<String, Value> = request
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), json!(v)))
-            .collect();
-        let mut body = json!({
-            "name": request.name,
-            "imageName": request.image,
-            "computeType": "GPU",
-            "cloudType": self.cloud,
-            "gpuCount": request.gpu_count,
-            "gpuTypeIds": request.gpu_types,
-            "gpuTypePriority": self.gpu_priority,
-            "dataCenterIds": [request.region],
-            "networkVolumeId": request.volume.clone().unwrap_or_default(),
-            "volumeMountPath": WORKSPACE,
-            "containerDiskInGb": request.disk_gb,
-            "ports": request.ports,
-            "env": env,
-            "dockerEntrypoint": request.entrypoint,
-            "dockerStartCmd": request.command,
-        });
-        if !request.cuda.is_empty() {
-            body["allowedCudaVersions"] = json!(request.cuda);
-        }
-        if let Some(ram) = request.min_ram_gb.filter(|r| *r > 0) {
-            body["minRAMPerGPU"] = json!(ram);
-        }
-        body
+        viy_engine::pod::runpod_body(&self.cloud, &self.gpu_priority, request)
     }
 }
 

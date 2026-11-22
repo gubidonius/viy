@@ -8,11 +8,11 @@
 //! report's [`stages`] it still reads from here directly, until Strata's
 //! needs shape the seam for them (WP 9.24-9.25, docs/strata-engine.md 4.1).
 
-use serde_json::Value;
 use viy_config::Config;
 use viy_engine::BadValue;
 use viy_engine::Engine;
 use viy_engine::EngineName;
+use viy_provider::PodRequest;
 
 pub mod boot;
 pub mod stages;
@@ -24,6 +24,7 @@ pub use boot::RUNTIME_HOSTKEY_DIR;
 pub use boot::STARTUP_PY;
 pub use boot::build_boot_script;
 pub use boot::build_pod_body;
+pub use boot::build_pod_request;
 pub use boot::build_vllm_args;
 
 /// The config keys only vLLM reads: its arguments and the boot script's
@@ -59,13 +60,13 @@ impl Engine for Vllm {
         EngineName::Vllm
     }
 
-    fn pod_body(
+    fn pod_request(
         &self,
         cfg: &Config,
         api_key: &str,
         volume_id: &str,
         public_key: Option<&str>,
-    ) -> Result<Value, BadValue> {
-        build_pod_body(cfg, api_key, volume_id, public_key)
+    ) -> Result<PodRequest, BadValue> {
+        build_pod_request(cfg, api_key, volume_id, public_key)
     }
 }
