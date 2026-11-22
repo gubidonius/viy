@@ -238,6 +238,17 @@ fn dispatch(
             };
             toolbox_cli::cmd_toolbox(args, &paths()?, &cwd()?, terminal.tty, asking, out)
         }
+        Command::Skills => {
+            let paths = paths()?;
+            let cwd = cwd()?;
+            let project = viy_config::Project::find(&cwd)
+                .map_err(|e| Failure::from(format!("{}: {e}", cwd.display())))?;
+            let dirs = viy_agent::skills::Dirs::new(&paths, &project);
+            for line in viy_agent::skills::cmd_list(&dirs) {
+                writeln!(out, "{}", line.text).map_err(|e| Failure::from(e.to_string()))?;
+            }
+            Ok(())
+        }
         Command::Trace(args) => {
             let lines =
                 viy_agent::trace::view(&paths()?.state_dir(), &args.what, args.n, terminal.tty);

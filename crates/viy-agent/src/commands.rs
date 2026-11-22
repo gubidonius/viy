@@ -84,6 +84,9 @@ const HELP: &str = "  /help              show this
   /consult [on|off]  ask_claude: hand hard tasks to Claude Code; no argument
                      lists this chat's consults. Also: mode act|advise,
                      model <name>, effort <level>, approval ask|auto
+  /skills            the skills you saved in ~/.config/viy/skills/ and
+                     .viy/skills/ (a folder with a SKILL.md each), and any
+                     left out with why
   /toolbox [list|show <name>|find <words>|check|on|off]  command-line tools
                      kept between chats, listed in the system prompt and on
                      run_shell's PATH (viy toolbox add/rm to manage them)
@@ -356,6 +359,24 @@ pub(crate) fn expand_home(text: &str, home: &Path) -> PathBuf {
 }
 
 impl Chat {
+    /// `/skills`: the skills in the two folders, those replaced, and those
+    /// left out with why (kb d183).
+    fn skills_command(&mut self, ctx: &TurnContext, arg: &str) {
+        match arg {
+            "" | "list" => {
+                for l in crate::skills::cmd_list(&self.places.skills) {
+                    notice(ctx, l.level, "skills", l.text);
+                }
+            }
+            _ => notice(
+                ctx,
+                NoticeLevel::Warn,
+                "skills",
+                "usage: /skills [list]".to_string(),
+            ),
+        }
+    }
+
     /// `/toolbox`: the tools, one tool, a search, a check, or on/off (rp's
     /// `_cmd_toolbox`).
     fn toolbox_command(&mut self, ctx: &TurnContext, arg: &str) {
@@ -441,6 +462,7 @@ impl Chat {
             "compact" => self.compact_command(ctx, arg).await,
             "consult" => self.consult_command(ctx, arg),
             "toolbox" => self.toolbox_command(ctx, arg),
+            "skills" => self.skills_command(ctx, arg),
             "git" => self.git_command(ctx, arg).await,
             "ssh" => self.ssh_command(ctx, arg).await,
             "unssh" => self.unssh_command(ctx, arg),

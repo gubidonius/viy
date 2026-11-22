@@ -42,6 +42,10 @@ fn nowhere() -> Places {
             global: std::path::PathBuf::from("/nonexistent/viy-data/toolbox"),
             project: std::path::PathBuf::from("/nonexistent/viy-workspace/.viy/toolbox"),
         },
+        skills: crate::skills::Dirs {
+            global: std::path::PathBuf::from("/nonexistent/viy-config/skills"),
+            project: std::path::PathBuf::from("/nonexistent/viy-workspace/.viy/skills"),
+        },
         sandbox_git: viy_tools::sandboxgit::Places::new(
             std::path::Path::new("/nonexistent/viy-data"),
             None,

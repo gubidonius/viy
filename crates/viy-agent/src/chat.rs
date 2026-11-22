@@ -125,6 +125,8 @@ pub struct Places {
     pub guarded: Vec<PathBuf>,
     /// The global and project toolbox folders ([`crate::toolbox`]).
     pub toolbox: crate::toolbox::Dirs,
+    /// The global and project skill folders ([`crate::skills`]).
+    pub skills: crate::skills::Dirs,
     /// Where the model's own git repositories live, encrypted, and are
     /// mounted ([`viy_tools::sandboxgit`]).
     pub sandbox_git: viy_tools::sandboxgit::Places,

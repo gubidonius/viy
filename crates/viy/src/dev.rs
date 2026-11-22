@@ -587,6 +587,7 @@ pub(crate) fn chat(
             paths.rpctl_data_dir(),
         ],
         toolbox: viy_agent::toolbox::Dirs::new(paths, &project),
+        skills: viy_agent::skills::Dirs::new(paths, &project),
         sandbox_git: viy_tools::sandboxgit::Places::new(
             &paths.data_dir(),
             std::env::var_os("XDG_RUNTIME_DIR")

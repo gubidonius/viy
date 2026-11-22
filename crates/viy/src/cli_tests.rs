@@ -130,17 +130,19 @@ fn subcommands_and_flags_are_rps() {
         .map(clap::Command::get_name)
         .collect();
     // rp's, the saved chats' commands as Codex's (kb d083): `chats` is
-    // resume, fork, archive, unarchive and delete, `ask` is exec.
+    // resume, fork, archive, unarchive and delete, `ask` is exec; and
+    // viy's own after cutover: `skills` (kb d183).
     let rp_names: Vec<&str> = subcommands
         .iter()
         .flat_map(|s| match s["name"].as_str().unwrap() {
             "chats" => vec!["resume", "fork", "archive", "unarchive", "delete"],
             "ask" => vec!["exec"],
+            "toolbox" => vec!["toolbox", "skills"],
             other => vec![other],
         })
         .collect();
     assert_eq!(names, rp_names);
-    assert_eq!(names.len(), 23);
+    assert_eq!(names.len(), 24);
     for rp in subcommands {
         let name = rp["name"].as_str().unwrap();
         let Some(sub) = cmd.find_subcommand(name) else {
@@ -202,6 +204,7 @@ fn namespace(cli: &Cli) -> Value {
         | Command::Migrate(_)
         | Command::Status
         | Command::Stop
+        | Command::Skills
         | Command::Down => {
             json!({})
         }

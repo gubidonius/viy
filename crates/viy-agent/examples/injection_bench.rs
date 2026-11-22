@@ -54,6 +54,7 @@ fn chat() -> Result<Chat, String> {
         doctrine_sources: Vec::new(),
         guarded: Vec::new(),
         toolbox: viy_agent::toolbox::Dirs::default(),
+        skills: viy_agent::skills::Dirs::default(),
         sandbox_git: viy_tools::sandboxgit::Places::new(
             std::path::Path::new("/nonexistent/viy-data"),
             None,

@@ -116,6 +116,10 @@ pub enum Command {
     Trace(TraceArgs),
     #[command(about = "command-line tools the model keeps between chats")]
     Toolbox(ToolboxArgs),
+    #[command(
+        about = "the skills you saved for the model: ~/.config/viy/skills/ and this project's .viy/skills/"
+    )]
+    Skills,
     #[command(about = "manage model profiles (for a model swap)")]
     Model(ModelArgs),
     #[command(
@@ -164,6 +168,7 @@ impl Command {
             Self::Exec(_) => "exec",
             Self::Trace(_) => "trace",
             Self::Toolbox(_) => "toolbox",
+            Self::Skills => "skills",
             Self::Model(_) => "model",
             Self::Backup { .. } => "backup",
             Self::Volume(_) => "volume",

@@ -51,6 +51,7 @@ fn chat_in(dir: &Path, over: &Value) -> Chat {
         doctrine_sources: Vec::new(),
         guarded: Vec::new(),
         toolbox: crate::toolbox::Dirs::default(),
+        skills: crate::skills::Dirs::default(),
         sandbox_git: viy_tools::sandboxgit::Places::new(
             &nowhere.join("data"),
             None,

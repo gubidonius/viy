@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod server;
 pub mod sessions;
 pub mod shell;
+pub mod skills;
 pub mod stream;
 pub mod toolbox;
 pub mod trace;
