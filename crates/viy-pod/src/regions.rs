@@ -188,10 +188,10 @@ pub fn log_failure(
     role: &str,
     volume_id: &str,
     gpus: &Value,
-    error: &RunPodError,
+    error: &viy_provider::ProviderError,
 ) {
     let text: String = Redactor::from_config(cfg)
-        .text(&error.to_string())
+        .text(&error.message)
         .chars()
         .take(1000)
         .collect();
@@ -202,8 +202,8 @@ pub fn log_failure(
         "volume_id": volume_id,
         "pod_name": cfg.get("POD_NAME"),
         "gpu_types": gpus,
-        "status_code": error.status_code(),
-        "capacity": is_capacity_error(error),
+        "status_code": error.status,
+        "capacity": error.capacity,
         "error": text,
     });
     append(paths, &paths.up_failures_file(), &row);

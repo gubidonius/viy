@@ -7,7 +7,8 @@
 //! (CLOUD_TYPE, GPU_TYPE_PRIORITY) from its configuration. `viy status`,
 //! `stop`, `down`'s sweep, the shutdown's running-pod check and the reaper
 //! go through it since WP 9.36; `up` and its path (tracked, wait, ssh,
-//! tunnel) move in 9.37, the engines' bodies in 9.38. What viy writes to files
+//! tunnel), adopt, create and failover in 9.37b, the engines' bodies in
+//! 9.38; `up`'s resume and volumes moved in 9.37. What viy writes to files
 //! shared with rp (pod.json's `costPerHr` as RunPod sent it) stays read
 //! from RunPod's own answer on RunPod's side.
 
@@ -154,9 +155,14 @@ pub fn volume_of(v1: &Value) -> Volume {
     let text = |key: &str| v1.get(key).and_then(Value::as_str).map(str::to_string);
     Volume {
         id: text("id").unwrap_or_default(),
-        name: text("name").unwrap_or_default(),
+        name: text("name"),
         region: text("dataCenterId"),
-        size_gb: v1.get("size").and_then(Value::as_u64),
+        // A number, or a number sent as a string, as `viy volume` lists it.
+        size_gb: match v1.get("size") {
+            Some(Value::Number(n)) => n.as_u64(),
+            Some(Value::String(s)) => s.trim().parse().ok(),
+            _ => None,
+        },
     }
 }
 

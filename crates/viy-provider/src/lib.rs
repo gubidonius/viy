@@ -108,7 +108,8 @@ impl std::fmt::Debug for PodRequest {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Volume {
     pub id: String,
-    pub name: String,
+    /// `None` when the provider gave none.
+    pub name: Option<String>,
     pub region: Option<String>,
     pub size_gb: Option<u64>,
 }

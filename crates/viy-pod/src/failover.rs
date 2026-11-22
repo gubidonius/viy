@@ -101,6 +101,9 @@ enum Stop {
 
 impl From<CommandError> for Stop {
     fn from(error: CommandError) -> Self {
+        // No failover path returns the seam's `CommandError::Provider` yet;
+        // WP 9.37b, which moves failover onto the seam, must map it here too,
+        // or a capacity refusal would end `up` instead of trying on.
         match error {
             CommandError::RunPod(e) => Self::Refused(e),
             other => Self::Command(other),
@@ -428,7 +431,14 @@ impl<'a> Creation<'a> {
         let env = self.env;
         let gpus = body["gpuTypeIds"].clone();
         regions::log_failure(
-            env.paths, env.time, self.cfg, region, role, volume_id, &gpus, &error,
+            env.paths,
+            env.time,
+            self.cfg,
+            region,
+            role,
+            volume_id,
+            &gpus,
+            &crate::provider::error_of(&error),
         );
         let asked: Vec<String> = serde_json::from_value(gpus.clone()).unwrap_or_default();
         let filtered = body
@@ -459,7 +469,14 @@ impl<'a> Creation<'a> {
         create(self.rp, body.clone()).await.inspect_err(|error| {
             let role = format!("{role}, any cuda");
             regions::log_failure(
-                env.paths, env.time, self.cfg, region, &role, volume_id, &gpus, error,
+                env.paths,
+                env.time,
+                self.cfg,
+                region,
+                &role,
+                volume_id,
+                &gpus,
+                &crate::provider::error_of(error),
             );
         })
     }

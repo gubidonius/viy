@@ -573,7 +573,13 @@ async fn up_keeps_a_stopped_pod_whose_start_fails_otherwise() {
         }
     });
     let error = run_up(&mut home, &Told::default()).await.unwrap_err();
-    assert!(matches!(error, CommandError::RunPod(_)), "{error:?}");
+    // RunPod's error, through the provider seam since WP 9.37.
+    assert!(matches!(error, CommandError::Provider(_)), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .starts_with("POST /pods/pod111/action -> HTTP 500")
+    );
     assert!(
         !home
             .sent()
@@ -929,7 +935,7 @@ async fn a_new_volume_is_made_and_remembered_when_none_is_found() {
     });
     let told = Told::default();
     let env = home.env();
-    let rp = RunPod::new(API_KEY, Arc::clone(&home.http));
+    let rp = RunPodProvider::new(RunPod::new(API_KEY, Arc::clone(&home.http)), &home.cfg);
     let mut cfg = home.cfg.clone();
     let got = ensure_volume(&env, &mut cfg, &rp, &told.reporter())
         .await
@@ -968,7 +974,7 @@ async fn a_volume_found_by_name_brings_its_region() {
     home.cfg.set("NETWORK_VOLUME_ID", "");
     let told = Told::default();
     let env = home.env();
-    let rp = RunPod::new(API_KEY, Arc::clone(&home.http));
+    let rp = RunPodProvider::new(RunPod::new(API_KEY, Arc::clone(&home.http)), &home.cfg);
     let mut cfg = home.cfg.clone();
     let got = ensure_volume(&env, &mut cfg, &rp, &told.reporter())
         .await
@@ -1389,7 +1395,7 @@ async fn a_volume_without_a_region_creates_nothing() {
     });
     let told = Told::default();
     let env = home.env();
-    let rp = RunPod::new(API_KEY, Arc::clone(&home.http));
+    let rp = RunPodProvider::new(RunPod::new(API_KEY, Arc::clone(&home.http)), &home.cfg);
     let mut cfg = home.cfg.clone();
     cfg.set("NETWORK_VOLUME_ID", "");
     let error = ensure_volume(&env, &mut cfg, &rp, &told.reporter())

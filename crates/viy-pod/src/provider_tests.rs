@@ -197,7 +197,7 @@ async fn calls_are_the_clients_requests() {
         volumes,
         [Volume {
             id: "vol222".into(),
-            name: "w".into(),
+            name: Some("w".into()),
             region: Some("EUR-IS-1".into()),
             size_gb: Some(100)
         }]
@@ -281,4 +281,13 @@ fn the_gpu_and_its_count() {
     assert_eq!(pod.gpu.as_deref(), Some("NVIDIA A100-SXM4-80GB"));
     assert_eq!(pod.gpu_name.as_deref(), Some("A100 SXM"));
     assert_eq!(pod.gpu_count, Some(2));
+}
+
+#[test]
+fn a_volume_size_sent_as_a_string_is_read() {
+    assert_eq!(
+        volume_of(&json!({"id": "v", "size": "100"})).size_gb,
+        Some(100)
+    );
+    assert_eq!(volume_of(&json!({"id": "v"})).name, None);
 }

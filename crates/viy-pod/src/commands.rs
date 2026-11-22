@@ -318,11 +318,13 @@ async fn up_until(
     let mut started = Instant::now();
     let mut started_wall = env.time.now();
     let mut timeline = Timeline::start(env.time);
-    let rp = connect(env, cfg)?;
+    let seam = provider(env, cfg)?;
+    // Tracking, the waits and failover are still the client's (WP 9.37b).
+    let rp = seam.client();
     let vllm_key = profiles::ensure_vllm_api_key(cfg, env.paths)?;
 
     // Never create a duplicate: adopt any existing pod with our name first.
-    let existing = match resolve(&rp, env, cfg, report).await {
+    let existing = match resolve(rp, env, cfg, report).await {
         Ok(existing) => existing,
         Err(ResolveError::RunPod(error)) => {
             // A 429 says when RunPod takes requests again (kb d140).
@@ -365,7 +367,7 @@ async fn up_until(
                 Tone::Dim,
                 format!("Resuming stopped pod {pod_id} (named '{name}')..."),
             );
-            match rp.start_pod(&pod_id).await {
+            match Provider::start(&seam, &pod_id).await {
                 Ok(()) => {
                     timeline.mark("resume requested", [("pod_id", json!(pod_id))]);
                     // A new run: reap counts its idle time and cap from now.
@@ -379,8 +381,8 @@ async fn up_until(
                         );
                     }
                 }
-                Err(error) if regions::is_capacity_error(&error) => {
-                    retire_stopped(env, cfg, &rp, &existing, &error, report).await?;
+                Err(error) if error.capacity => {
+                    retire_stopped(env, cfg, &seam, &existing, &error, report).await?;
                     timeline.mark("resume refused", [("pod_id", json!(pod_id))]);
                     break 'adopt;
                 }
@@ -405,7 +407,7 @@ async fn up_until(
                  viy up) closes that route.",
             );
         }
-        let w = wait_for(env, cfg, &rp, &pod_id);
+        let w = wait_for(env, cfg, rp, &pod_id);
         abort_at.store(interrupt.count() + 2, Ordering::SeqCst);
         let ready = wait::await_recorded(
             &w,
@@ -446,7 +448,7 @@ async fn up_until(
             }
             let volume_id = tracked::pod_volume_id(&existing).unwrap_or_default();
             note_serving(env, cfg, volume_id, report);
-            retire_replaced(env, cfg, &rp, volume_id, report).await;
+            retire_replaced(env, cfg, rp, volume_id, report).await;
             return Ok(());
         }
         if booting {
@@ -485,7 +487,7 @@ async fn up_until(
     let (volume_id, volume_is_new) = if backup {
         (String::new(), false)
     } else {
-        ensure_volume(env, cfg, &rp, report).await?
+        ensure_volume(env, cfg, &seam, report).await?
     };
     timeline.mark("pod requested", []);
     let user = User {
@@ -494,7 +496,7 @@ async fn up_until(
         interrupt,
         abort_at,
     };
-    let creation = Creation::new(env, cfg, &rp, &vllm_key, pubkey.as_deref(), user);
+    let creation = Creation::new(env, cfg, rp, &vllm_key, pubkey.as_deref(), user);
     let created = if backup {
         creation.run_on_backup().await?
     } else {
@@ -577,7 +579,7 @@ async fn up_until(
             }
         },
     );
-    let w = wait_for(env, cfg, &rp, &pod_id);
+    let w = wait_for(env, cfg, rp, &pod_id);
     abort_at.store(interrupt.count() + 2, Ordering::SeqCst);
     let ready = wait::await_recorded(
         &w,
@@ -625,7 +627,7 @@ async fn up_until(
         )
         .await;
         note_serving(env, cfg, &volume_id, report);
-        retire_replaced(env, cfg, &rp, &volume_id, report).await;
+        retire_replaced(env, cfg, rp, &volume_id, report).await;
         return Ok(());
     }
     let now = env.time.now();
@@ -682,13 +684,20 @@ fn wait_for<'a>(env: &Env<'a>, cfg: &'a Config, rp: &'a RunPod, pod_id: &'a str)
 pub async fn ensure_volume(
     env: &Env<'_>,
     cfg: &mut Config,
-    rp: &RunPod,
+    seam: &dyn Provider,
     report: Reporter<'_>,
 ) -> Result<(String, bool), CommandError> {
+    let Some(volumes) = seam.volumes() else {
+        return Err(CommandError::Exit(format!(
+            "{} has no network volumes for the weights.",
+            seam.name()
+        )));
+    };
     if let Some(id) = cfg.get("NETWORK_VOLUME_ID").filter(|v| !v.is_empty()) {
-        match rp.get_volume(id).await {
+        match volumes.get(id).await {
             Ok(Some(volume)) => {
-                return Ok((text(&volume, "id").unwrap_or(id).to_string(), false));
+                let found = if volume.id.is_empty() { id } else { &volume.id };
+                return Ok((found.to_string(), false));
             }
             Ok(None) => {}
             Err(_) => say(
@@ -699,12 +708,12 @@ pub async fn ensure_volume(
         }
     }
     let name = cfg_at(cfg, "NETWORK_VOLUME_NAME").to_string();
-    for volume in rp.list_volumes().await? {
-        if text(&volume, "name") != Some(name.as_str()) {
+    for volume in volumes.list().await? {
+        if volume.name.as_deref() != Some(name.as_str()) {
             continue;
         }
         let region = cfg_at(cfg, "DATA_CENTER_ID").to_string();
-        let Some(theirs) = text(&volume, "dataCenterId") else {
+        let Some(theirs) = volume.region.as_deref() else {
             // A pod must live where its volume lives; rpctl stops here too.
             return Err(CommandError::Exit(format!(
                 "RunPod lists volume '{name}' without its data center, so there is no telling \
@@ -716,14 +725,13 @@ pub async fn ensure_volume(
                 report,
                 Tone::Warn,
                 format!(
-                    "Volume '{name}' is in {} but DATA_CENTER_ID={region}. Using the volume's \
-                     region, since a pod must live where its volume lives.",
-                    shown(volume.get("dataCenterId"))
+                    "Volume '{name}' is in {theirs} but DATA_CENTER_ID={region}. Using the \
+                     volume's region, since a pod must live where its volume lives."
                 ),
             );
             cfg.set("DATA_CENTER_ID", theirs);
         }
-        let id = text(&volume, "id").unwrap_or_default().to_string();
+        let id = volume.id.clone();
         profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", &id)?;
         return Ok((id, false));
     }
@@ -739,14 +747,8 @@ pub async fn ensure_volume(
             "NETWORK_VOLUME_SIZE_GB must be a whole number, not {size:?}"
         ))
     })?;
-    let volume = rp
-        // The primary takes its region's default tier, as rp.
-        .create_volume(&name, size_gb, &region, None)
-        .await?
-        .unwrap_or(Value::Null);
-    let id = text(&volume, "id")
-        .ok_or_else(|| RunPodError::new("RunPod created no volume", None))?
-        .to_string();
+    // The primary takes its region's default tier, as rp.
+    let id = volumes.create(&name, size_gb, &region).await?.id;
     profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", &id)?;
     say(report, Tone::Ok, format!("  volume id: {id}"));
     Ok((id, true))
@@ -760,9 +762,9 @@ pub async fn ensure_volume(
 async fn retire_stopped(
     env: &Env<'_>,
     cfg: &Config,
-    rp: &RunPod,
+    seam: &dyn Provider,
     pod: &Value,
-    error: &RunPodError,
+    error: &ProviderError,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
     let pod_id = text(pod, "id").unwrap_or_default();
@@ -793,9 +795,9 @@ async fn retire_stopped(
     let mut said = |notice| report(Report::Notice(notice));
     tunnel::stop(&ssh, true, &mut said).await?;
     tunnel::kill_strays(&ssh).await?;
-    match rp.delete_pod(pod_id).await {
+    match seam.terminate(pod_id).await {
         // Gone already: terminated by the reaper or the other tool.
-        Err(error) if error.status_code() != Some(404) => return Err(error.into()),
+        Err(error) if error.status != Some(404) => return Err(error.into()),
         _ => {}
     }
     state::clear(env.paths)?;
@@ -862,26 +864,34 @@ pub async fn volume(
     report: Reporter<'_>,
     ask: Asker<'_>,
 ) -> Result<(), CommandError> {
-    let rp = connect(env, cfg)?;
+    let seam = provider(env, cfg)?;
+    let Some(volumes) = seam.volumes() else {
+        return Err(CommandError::Exit(format!(
+            "{} has no network volumes.",
+            seam.name()
+        )));
+    };
     let print = |line: String| say(report, Tone::Plain, line);
+    // rp shows what is missing as Python's None.
+    let or_none = |v: Option<String>| v.unwrap_or_else(|| "None".into());
     match action {
         VolumeAction::List => {
-            let volumes = rp.list_volumes().await?;
-            if volumes.is_empty() {
+            let listed = volumes.list().await?;
+            if listed.is_empty() {
                 print("no network volumes".to_string());
             }
-            for v in volumes {
+            for v in listed {
                 print(format!(
                     "  {}  {:<24} {}GB  {}",
-                    shown(v.get("id")),
-                    shown(v.get("name")),
-                    shown(v.get("size")),
-                    shown(v.get("dataCenterId"))
+                    v.id,
+                    or_none(v.name),
+                    or_none(v.size_gb.map(|s| s.to_string())),
+                    or_none(v.region)
                 ));
             }
         }
         VolumeAction::Create => {
-            let (id, created) = ensure_volume(env, cfg, &rp, report).await?;
+            let (id, created) = ensure_volume(env, cfg, &seam, report).await?;
             let existed = if created { "" } else { " (already existed)" };
             print(format!("volume: {id}{existed}"));
         }
@@ -905,7 +915,7 @@ pub async fn volume(
                 print("aborted".to_string());
                 return Ok(());
             }
-            rp.delete_volume(&id).await?;
+            volumes.delete(&id).await?;
             regions::forget(env.paths, &id)?;
             if cfg.get("NETWORK_VOLUME_ID") == Some(id.as_str()) {
                 profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", "")?;
