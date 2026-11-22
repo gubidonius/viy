@@ -2908,6 +2908,7 @@ dependencies = [
  "viy-exec",
  "viy-http",
  "viy-protocol",
+ "viy-provider",
  "viy-time",
  "vt100",
 ]

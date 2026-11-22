@@ -944,6 +944,17 @@ pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result
         }
         Err(error) => return Err(error.into()),
     };
+    status_of(env, cfg, pod, report).await
+}
+
+/// [`status`]'s lines for the pod found, whatever the provider: the pod
+/// comes from RunPod's tracking (`tracked`) today (kb d182).
+pub(crate) async fn status_of(
+    env: &Env<'_>,
+    cfg: &Config,
+    pod: Option<Pod>,
+    report: Reporter<'_>,
+) -> Result<(), CommandError> {
     let lifetimes = regions::lifetimes(env.paths, cfg, regions::now(env.time));
     let Some(pod) = pod else {
         say(
@@ -1099,11 +1110,22 @@ async fn stop_pod(
         say(report, Tone::Dim, "No pod to stop.");
         return Ok(());
     };
+    stop_on(env, cfg, &seam, &pod, report).await
+}
+
+/// Stops `pod` on `seam`, its forward first, and says what that costs.
+pub(crate) async fn stop_on(
+    env: &Env<'_>,
+    cfg: &Config,
+    seam: &dyn Provider,
+    pod: &Pod,
+    report: Reporter<'_>,
+) -> Result<(), CommandError> {
     let pod_id = pod.id.as_str();
     // Nothing left to forward to.
     let mut said = |notice| report(Report::Notice(notice));
     tunnel::stop(&env.ssh(cfg), true, &mut said).await?;
-    viy_provider::Provider::stop(&seam, pod_id).await?;
+    seam.stop(pod_id).await?;
     say(
         report,
         Tone::Ok,
@@ -1134,7 +1156,18 @@ pub async fn down(
     cancelled_up: bool,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let seam = provider(env, cfg)?;
+    down_on(env, cfg, &provider(env, cfg)?, cancelled_up, report).await
+}
+
+/// [`down`] on `seam`: nothing in it is RunPod's but the console it names
+/// when it cannot confirm.
+pub(crate) async fn down_on(
+    env: &Env<'_>,
+    cfg: &Config,
+    seam: &dyn Provider,
+    cancelled_up: bool,
+    report: Reporter<'_>,
+) -> Result<(), CommandError> {
     // Preemption blocks for up to 15 s plus a grace per kill; its notices
     // are said as they happen.
     let paths = env.paths.clone();
@@ -1182,7 +1215,7 @@ pub async fn down(
             ),
         );
     }
-    let (done, error) = sweep(&seam, cfg, &mut ids, settle, SWEEP_BUDGET, report).await;
+    let (done, error) = sweep(seam, cfg, &mut ids, settle, SWEEP_BUDGET, report).await;
     if let Some(error) = error {
         say(
             report,

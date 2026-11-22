@@ -1532,3 +1532,43 @@ async fn past_the_boot_budget_the_wait_asks_runpod_less_often() {
     assert_eq!(count(false, 180, 300), 12);
     assert_eq!(count(true, 180, 300), 2);
 }
+
+/// WP 9.39 (kb d182): `up`'s wait for sshd and the boot's progress on a
+/// scripted second provider: the endpoint once the provider shows it, the
+/// log read through the seam.
+#[tokio::test(start_paused = true)]
+async fn the_ssh_wait_runs_on_a_second_provider() {
+    use viy_provider::PodState as Run;
+    use viy_testkit::provider::Scripted;
+    use viy_testkit::provider::pod;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut booting = pod("s1", "qwen-pod", Run::Running);
+    booting.ssh = Some(("127.0.0.1".into(), port));
+    let seam = Arc::new(
+        Scripted::new([booting])
+            .ssh_after(2)
+            .with_logs(["0f06d63f7039 Downloading"]),
+    );
+    let shared: Arc<dyn viy_provider::Provider> = seam.clone();
+    let progress = Progress::new(Arc::clone(&shared), "s1", true);
+    let told = Told::default();
+    let got = wait_ssh(
+        &*shared,
+        "s1",
+        Duration::from_secs(120),
+        Some(&progress),
+        &told.reporter(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, Some(("127.0.0.1".to_string(), port)));
+    let calls = seam.calls();
+    assert_eq!(
+        calls.iter().filter(|c| *c == "pod s1").count(),
+        3,
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"logs s1".to_string()), "{calls:?}");
+}

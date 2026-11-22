@@ -1778,3 +1778,109 @@ async fn volume_list_shows_each_volume_as_rp_does() {
         ]
     );
 }
+
+// ------------------------------------------------- a second provider
+
+/// WP 9.39 (kb d182): the commands' provider-neutral bodies on a scripted
+/// second provider, with no volumes and no regions. RunPod is never asked.
+mod on_a_second_provider {
+    use pretty_assertions::assert_eq;
+    use viy_provider::PodState as Run;
+    use viy_testkit::provider::Scripted;
+    use viy_testkit::provider::pod;
+
+    use super::*;
+
+    fn home() -> Home {
+        Home::new(None, |r: &viy_http::Request| {
+            panic!("RunPod asked: {}", r.url)
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn down_terminates_ours_and_leaves_the_rest() {
+        let home = home();
+        let seam = Scripted::new([
+            pod("s1", "qwen-pod", Run::Running),
+            pod("s2", "qwen-pod", Run::Stopped),
+            pod("x9", "someone-else", Run::Running),
+        ]);
+        let told = Told::default();
+        down_on(&home.env(), &home.cfg, &seam, false, &told.reporter())
+            .await
+            .unwrap();
+        let left: Vec<String> = seam.pods_now().into_iter().map(|p| p.id).collect();
+        assert_eq!(left, ["x9"]);
+        let texts = told.texts();
+        assert!(
+            texts.contains(&"  terminated s1 (was running)".to_string()),
+            "{texts:?}"
+        );
+        assert!(
+            texts.contains(&"  terminated s2 (was stopped)".to_string()),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("Terminated s1, s2. No pod is running")),
+            "{texts:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_stops_the_pod_and_says_so() {
+        let home = home();
+        let seam = Scripted::new([pod("s1", "qwen-pod", Run::Running)]);
+        let told = Told::default();
+        stop_on(
+            &home.env(),
+            &home.cfg,
+            &seam,
+            &seam.pods_now()[0],
+            &told.reporter(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seam.calls(), ["stop s1"]);
+        assert_eq!(seam.pods_now()[0].state, Some(Run::Stopped));
+        assert!(told.texts()[0].starts_with("Stopped s1. GPU billing ends"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_shows_the_pod_as_the_provider_has_it() {
+        let home = home();
+        let seam = Scripted::new([pod("s1", "qwen-pod", Run::Stopped)]);
+        let found = seam.pod("s1").await.unwrap();
+        let told = Told::default();
+        status_of(&home.env(), &home.cfg, found, &told.reporter())
+            .await
+            .unwrap();
+        assert_eq!(
+            told.texts()[..6],
+            [
+                "  id:        s1",
+                "  name:      qwen-pod",
+                "  state:     stopped",
+                "  gpu:       Scripted GPU x1",
+                "  region:    lab-1",
+                "  cost:      $0.50/hr",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn up_refuses_a_provider_without_volumes_by_name() {
+        let home = home();
+        let seam = Scripted::default();
+        let mut cfg = home.cfg.clone();
+        let error = ensure_volume(&home.env(), &mut cfg, &seam, &Told::default().reporter())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "scripted has no network volumes for the weights."
+        );
+        assert!(seam.calls().is_empty());
+    }
+}

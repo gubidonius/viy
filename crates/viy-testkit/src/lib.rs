@@ -21,6 +21,7 @@ pub mod http;
 pub mod mock_llm;
 #[cfg(feature = "oracle")]
 pub mod oracle;
+pub mod provider;
 pub mod pty;
 pub mod rp_names;
 pub mod runpod_v1;

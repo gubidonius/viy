@@ -29,6 +29,7 @@ vt100 = { workspace = true }
 viy-exec = { workspace = true }
 viy-http = { workspace = true }
 viy-protocol = { workspace = true }
+viy-provider = { workspace = true }
 viy-time = { workspace = true }
 
 [dev-dependencies]
