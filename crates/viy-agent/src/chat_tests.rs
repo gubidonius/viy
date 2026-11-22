@@ -1981,7 +1981,9 @@ async fn a_read_only_batch_runs_in_parallel_and_keeps_order() {
     assert_eq!(paths, ["text 0\n", "text 1\n", "text 2\n"]);
 }
 
-// rpctl's ParallelToolTests.test_batch_with_a_command_runs_one_by_one.
+// rpctl's ParallelToolTests.test_batch_with_a_command_runs_one_by_one; a
+// read that would ask (.env) no longer keeps the batch serial, as in rp: its
+// question waits its turn (kb d181).
 #[test]
 fn a_batch_with_a_command_runs_one_by_one() {
     let (mut d, _s) = shell_chat(json!([]), &[]);
@@ -1994,7 +1996,7 @@ fn a_batch_with_a_command_runs_one_by_one() {
         d.chat
             .parallel_ok(&[read.clone(), call("c2", "list_dir", json!({}))])
     );
-    assert!(!d.chat.parallel_ok(&[
+    assert!(d.chat.parallel_ok(&[
         call("c1", "read_file", json!({"path": ".env"})),
         call("c2", "list_dir", json!({})),
     ]));
@@ -2045,8 +2047,8 @@ async fn a_parallel_read_counts_for_the_write_guard() {
     assert!(!wrote[0].contains("error"), "{}", wrote[0]);
 }
 
-// A read that has turned secret since the batch was admitted is not read in
-// the batch: it runs on its own, with rp's question.
+// A secret read in a batch is not read in the batch: it runs on its own,
+// with rp's question, after the batch's other reads (kb d181).
 #[tokio::test]
 async fn a_secret_read_in_a_batch_still_asks() {
     let (mut d, s) = shell_chat(json!([]), &[]);
@@ -2072,6 +2074,108 @@ async fn a_secret_read_in_a_batch_still_asks() {
     assert_eq!(answering.await.unwrap(), "  let the model read it?");
     assert!(out[0].0.contains("declined"), "{}", out[0].0);
     assert!(out[1].0.contains("a.txt"), "{}", out[1].0);
+    assert_eq!(traced(&d.chat), ["parallel_batch"]);
+}
+
+/// What [`answer_all`] answered, or a failure if fewer questions came.
+async fn asked(answering: tokio::task::JoinHandle<Vec<String>>) -> Vec<String> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), answering)
+        .await
+        .expect("fewer questions than expected")
+        .unwrap()
+}
+
+/// Answers the first `n` questions with `answer`: what each one said
+/// before its prompt, in the order asked.
+fn answer_all(
+    d: &mut Direct,
+    answer: viy_protocol::Answer,
+    n: usize,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    let ctx = d.ctx.clone();
+    let old = std::mem::replace(&mut d.rx, tokio::sync::mpsc::unbounded_channel().1);
+    tokio::spawn(async move {
+        let mut old = old;
+        let mut asked = Vec::new();
+        while let Some(e) = old.recv().await {
+            if let EventMsg::QuestionRequest(q) = e.msg {
+                ctx.answer(&q.question_id, answer);
+                let reason: Vec<String> = q
+                    .question
+                    .reason
+                    .iter()
+                    .map(|r| r.message.clone())
+                    .collect();
+                asked.push(reason.join(" "));
+                if asked.len() == n {
+                    break;
+                }
+            }
+        }
+        asked
+    })
+}
+
+// Not in rp, whose threads cannot ask (kb d181): a batch with two secret
+// reads is still a batch; their questions come one at a time, in call order,
+// after the other reads, and every result is where its call was.
+#[tokio::test]
+async fn questions_in_a_batch_wait_their_turn() {
+    let (mut d, s) = shell_chat(json!([]), &[]);
+    std::fs::write(s.path().join("ws/.env"), "K=v\n").unwrap();
+    std::fs::write(s.path().join("ws/.env.local"), "L=w\n").unwrap();
+    let calls = [
+        call("c1", "read_file", json!({"path": ".env"})),
+        call("c2", "read_file", json!({"path": "a.txt"})),
+        call("c3", "read_file", json!({"path": ".env.local"})),
+        call("c4", "list_dir", json!({})),
+    ];
+    assert!(d.chat.parallel_ok(&calls));
+    let answering = answer_all(&mut d, viy_protocol::Answer::Yes, 2);
+    let ctx = d.ctx.clone();
+    let out = d.chat.run_tool_calls(&ctx, &calls).await;
+    assert!(out[0].contains("K=v"), "{}", out[0]);
+    assert!(out[1].contains("alpha"), "{}", out[1]);
+    assert!(out[2].contains("L=w"), "{}", out[2]);
+    assert!(out[3].contains("a.txt"), "{}", out[3]);
+    let asked = asked(answering).await;
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    assert!(
+        asked[0].contains(".env") && !asked[0].contains(".env.local"),
+        "{asked:?}"
+    );
+    assert!(asked[1].contains(".env.local"), "{asked:?}");
+    assert_eq!(traced(&d.chat), ["parallel_batch"]);
+}
+
+// A third refusal inside a batch stops the turn: what comes after it reads
+// "not run", even a read the batch had already made, as one by one it would
+// not have run.
+#[tokio::test]
+async fn a_stop_inside_a_batch_withholds_what_follows() {
+    let (mut d, s) = shell_chat(json!([]), &[]);
+    for name in [".env", ".env.a", ".env.b"] {
+        std::fs::write(s.path().join("ws").join(name), "K=v\n").unwrap();
+    }
+    let calls = [
+        call("c1", "read_file", json!({"path": ".env"})),
+        call("c2", "read_file", json!({"path": ".env.a"})),
+        call("c3", "read_file", json!({"path": ".env.b"})),
+        call("c4", "read_file", json!({"path": "a.txt"})),
+    ];
+    assert!(d.chat.parallel_ok(&calls));
+    let answering = answer_all(&mut d, viy_protocol::Answer::No, 3);
+    let ctx = d.ctx.clone();
+    let out = d.chat.run_tool_calls(&ctx, &calls).await;
+    for r in &out[..3] {
+        assert!(r.contains("declined"), "{r}");
+    }
+    assert!(
+        out[3].contains("not run: the turn was stopped"),
+        "{}",
+        out[3]
+    );
+    assert_eq!(asked(answering).await.len(), 3);
     assert_eq!(traced(&d.chat), ["parallel_batch"]);
 }
 

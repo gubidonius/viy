@@ -52,7 +52,6 @@ use viy_tools::doctrines;
 use viy_tools::egress;
 use viy_tools::egress::Policy;
 use viy_tools::egress::Proxy;
-use viy_tools::guard;
 use viy_tools::quarantine;
 use viy_tools::sandbox;
 use viy_tools::sandbox::Jail;
@@ -133,21 +132,6 @@ pub(super) fn parse_args(raw: &str) -> Result<Map<String, Value>, Value> {
         Ok(Value::Object(m)) => Ok(m),
         Ok(_) => Err(json!({"error": "arguments must be a JSON object"})),
         Err(e) => Err(json!({"error": format!("could not parse arguments: {e}")})),
-    }
-}
-
-/// A batch call's arguments as `_parallel_ok` reads them:
-/// `json.loads(arguments or "{}")`, an object or nothing (whitespace alone
-/// is not JSON there, unlike [`parse_args`]).
-fn batch_args(arguments: &str) -> Option<Map<String, Value>> {
-    let raw = if arguments.is_empty() {
-        "{}"
-    } else {
-        arguments
-    };
-    match serde_json::from_str::<Value>(raw) {
-        Ok(Value::Object(args)) => Some(args),
-        _ => None,
     }
 }
 
@@ -316,11 +300,6 @@ impl Chat {
         ctx: &TurnContext,
         calls: &[ToolCall],
     ) -> Vec<String> {
-        if self.search_on && calls.iter().any(|c| c.name == "fetch_url") {
-            // fetch_url's batch check reads the vault's key, as rpctl's
-            // `_parallel_ok` does through `_fetch_decision`.
-            self.web.search.load_key().await;
-        }
         let results = if self.abort_turn.is_none() && self.parallel_ok(calls) {
             self.run_parallel(ctx, calls).await
         } else {
@@ -346,57 +325,26 @@ impl Chat {
             .collect()
     }
 
-    /// Whether a batch runs side by side (rp's `_parallel_ok`): every call
-    /// only reads and none of them would stop to ask the user (a secret
-    /// file), since a batch never holds a question.
-    pub(crate) fn parallel_ok(&mut self, calls: &[ToolCall]) -> bool {
-        if !self.parallel_tools || calls.len() < 2 {
-            return false;
-        }
-        calls.iter().all(|c| {
-            if !PARALLEL_SAFE.contains(&c.name.as_str()) {
-                return false;
-            }
-            match c.name.as_str() {
-                "read_file" => self.reads_without_asking(&c.arguments),
-                "fetch_url" => self.fetches_without_asking(&c.arguments),
-                _ => true,
-            }
-        })
-    }
-
-    /// Whether fetch_url with these arguments reads without a question.
-    fn fetches_without_asking(&mut self, arguments: &str) -> bool {
-        let Some(args) = batch_args(arguments) else {
-            return false;
-        };
-        let Some(url) = args.get("url").and_then(Value::as_str) else {
-            return false;
-        };
-        !matches!(self.fetch_decision(url), super::web::FetchDecision::Ask(..))
-    }
-
-    /// Whether read_file with these arguments reads without a question.
-    fn reads_without_asking(&self, arguments: &str) -> bool {
-        let Some(args) = batch_args(arguments) else {
-            return false;
-        };
-        let Some(rel) = args
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|r| !r.is_empty())
-        else {
-            return false;
-        };
-        self.files
-            .resolve_in_workspace(rel)
-            .is_ok_and(|path| guard::secret_reason(&path).is_none())
+    /// Whether a batch runs side by side (rp's `_parallel_ok`): two or more
+    /// calls, every one of them only reading. rp also kept a batch serial
+    /// when a call would ask (a secret file, a fetch), since its threads
+    /// cannot ask; viy queues those questions instead (kb d181).
+    pub(crate) fn parallel_ok(&self, calls: &[ToolCall]) -> bool {
+        self.parallel_tools
+            && calls.len() >= 2
+            && calls
+                .iter()
+                .all(|c| PARALLEL_SAFE.contains(&c.name.as_str()))
     }
 
     /// A read-only batch side by side (rp's thread pool): the file tools on
     /// blocking threads, their results and what they read taken in call
-    /// order. A read that has turned secret since [`Chat::parallel_ok`]
-    /// runs on its own afterwards, with its question.
+    /// order. A call that would ask (a secret file, a fetch that asks) and
+    /// the web calls run one by one afterwards, in call order, so their
+    /// questions come one at a time, oldest first (kb d181). Once the turn
+    /// is stopped (a third refusal), every later call's result is "not run",
+    /// a read that ran in the batch included, as one by one it would not
+    /// have run.
     pub(crate) async fn run_parallel(
         &mut self,
         ctx: &TurnContext,
@@ -414,13 +362,22 @@ impl Chat {
             async move {
                 let started = Instant::now();
                 let got = quiet_call(files, name, &arguments, tools_on).await;
-                (got, started)
+                // A read's own time, not the time until its result is taken
+                // (an earlier call may have stopped to ask meanwhile).
+                (got, started, started.elapsed())
             }
         });
         let results = futures_util::future::join_all(runs).await;
         let mut out = Vec::with_capacity(calls.len());
-        for (c, (got, mut started)) in calls.iter().zip(results) {
+        for (c, (got, mut started, took)) in calls.iter().zip(results) {
+            let mut took = Some(took);
             let (result, card) = match got {
+                // Read, but after the stop: withheld, and not counted for
+                // the write guard, since the model never sees it.
+                Some(_) if self.abort_turn.is_some() => (
+                    json!({"error": "not run: the turn was stopped"}),
+                    Card::default(),
+                ),
                 Some((result, card, seen)) => {
                     if let Some((path, sha1)) = seen {
                         self.files.remember_read(path, sha1);
@@ -436,11 +393,15 @@ impl Chat {
                 ),
                 None => {
                     started = Instant::now();
+                    took = None;
                     self.dispatch(ctx, c).await
                 }
             };
-            let secs = started.elapsed().as_secs_f64();
-            out.push((self.end_call(ctx, c, &result, card, started), secs));
+            let took = took.unwrap_or_else(|| started.elapsed());
+            out.push((
+                self.end_call(ctx, c, &result, card, took),
+                took.as_secs_f64(),
+            ));
         }
         let round2 = |x: f64| (x * 100.0).round() / 100.0;
         self.tracer.event(
@@ -468,8 +429,11 @@ impl Chat {
         let started = Instant::now();
         begin_call(ctx, c);
         let (result, card) = self.dispatch(ctx, c).await;
-        let secs = started.elapsed().as_secs_f64();
-        (self.end_call(ctx, c, &result, card, started), secs)
+        let took = started.elapsed();
+        (
+            self.end_call(ctx, c, &result, card, took),
+            took.as_secs_f64(),
+        )
     }
 
     /// Shows a call's end and gives its result, defused.
@@ -479,13 +443,13 @@ impl Chat {
         c: &ToolCall,
         result: &Value,
         card: Card,
-        started: Instant,
+        took: std::time::Duration,
     ) -> String {
         ctx.emit(EventMsg::ToolCallEnd(ToolCallEndEvent {
             call_id: c.id.clone(),
             status: status_of(result),
             detail: card.detail,
-            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            duration_ms: u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
             sandboxed: card.sandboxed,
             network: card.network,
         }));

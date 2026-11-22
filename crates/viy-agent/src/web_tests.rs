@@ -422,9 +422,11 @@ async fn fetch_payload_pages_and_links() {
     assert!(card2.detail.unwrap().starts_with("direct, cached: html, "));
 }
 
-// rpctl's test_parallel_batches_never_hold_a_question.
+// rpctl's test_parallel_batches_never_hold_a_question, turned around (kb
+// d181): a fetch that would ask no longer keeps the batch serial; it runs
+// after the batch's reads, one by one, with its question.
 #[test]
-fn parallel_batches_never_hold_a_question() {
+fn a_fetch_that_asks_keeps_the_batch() {
     let mut d = offline();
     let call = |url: &str| crate::stream::ToolCall {
         id: "c1".into(),
@@ -434,7 +436,7 @@ fn parallel_batches_never_hold_a_question() {
     let calls = [call("https://a.test/"), call("https://b.test/")];
     assert!(d.chat.parallel_ok(&calls));
     d.chat.web_taint = Some("web search results".into());
-    assert!(!d.chat.parallel_ok(&calls));
+    assert!(d.chat.parallel_ok(&calls));
 }
 
 // rpctl's test_resumed_chats_keep_their_taint, and the web state forgotten.
