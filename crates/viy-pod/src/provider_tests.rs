@@ -302,3 +302,45 @@ fn an_empty_region_and_gpu_stay_as_given() {
     assert_eq!(pod.gpu.as_deref(), Some(""));
     assert_eq!(pod.gpu_name, None);
 }
+
+/// RunPod's stock behind `Regions`: only listed regions that take a network
+/// volume, with the types they show available; the CUDA stock as free or
+/// not.
+#[test]
+fn the_stock_keeps_volume_regions_and_their_free_types() {
+    let rows = [
+        json!({"id": "EUR-IS-1", "listed": true, "storageSupport": true, "gpuAvailability": [
+            {"gpuTypeId": "NVIDIA A100-SXM4-80GB", "available": true},
+            {"gpuTypeId": "NVIDIA H100 80GB HBM3", "available": false}]}),
+        json!({"id": "US-KS-2", "listed": true, "storageSupport": false}),
+        json!({"id": "US-TX-3", "listed": false, "storageSupport": true}),
+        json!({"listed": true, "storageSupport": true}),
+    ];
+    let stock: Vec<RegionStock> = rows.iter().filter_map(region_stock).collect();
+    assert_eq!(
+        stock,
+        [RegionStock {
+            region: "EUR-IS-1".into(),
+            free: vec!["NVIDIA A100-SXM4-80GB".into()],
+        }]
+    );
+}
+
+/// A create answer with an empty id is no pod, as one without an id is.
+#[tokio::test(start_paused = true)]
+async fn a_create_with_an_empty_id_is_no_pod() {
+    let (seam, _) = provider(|r| {
+        if r.url.as_str().ends_with("/v1/pods") {
+            Reply::answer(
+                200,
+                json!({"id": "", "desiredStatus": "RUNNING"}).to_string(),
+            )
+        } else {
+            Reply::answer(200, "{}")
+        }
+    });
+    let error = Provider::create(&seam, &PodRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.message, "RunPod created no pod");
+}

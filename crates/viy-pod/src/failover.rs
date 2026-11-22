@@ -45,7 +45,8 @@ use viy_protocol::Answer;
 use viy_protocol::Choices;
 use viy_protocol::Question;
 
-use crate::api::RunPod;
+use viy_provider::PodRequest;
+
 use crate::api::RunPodError;
 use crate::commands::CommandError;
 use crate::commands::Env;
@@ -56,6 +57,7 @@ use crate::notice::Asker;
 use crate::notice::Reporter;
 use crate::notice::Tone;
 use crate::notice::say;
+use crate::provider::RunPodProvider;
 use crate::regions;
 use crate::regions::RETRY_GAP_S;
 use crate::regions::id;
@@ -101,11 +103,13 @@ enum Stop {
 
 impl From<CommandError> for Stop {
     fn from(error: CommandError) -> Self {
-        // No failover path returns the seam's `CommandError::Provider` yet;
-        // WP 9.37c, which moves failover onto the seam, must map it here too,
-        // or a capacity refusal would end `up` instead of trying on.
+        // A refusal through the seam is one too, or a capacity refusal
+        // would end `up` instead of trying on. Failover is RunPod's, whose
+        // seam errors take `capacity` from this same message, so rebuilding
+        // the client's error from it keeps that; the rest Stop never reads.
         match error {
             CommandError::RunPod(e) => Self::Refused(e),
+            CommandError::Provider(e) => Self::Refused(RunPodError::new(e.message, e.status)),
             other => Self::Command(other),
         }
     }
@@ -142,7 +146,9 @@ pub struct User<'a> {
 pub struct Creation<'a> {
     env: &'a Env<'a>,
     cfg: &'a Config,
-    rp: &'a RunPod,
+    /// RunPod behind the seam: the pod requests and the stock go through
+    /// it; the backup volumes and backups.json are RunPod's own.
+    seam: &'a RunPodProvider,
     vllm_key: &'a str,
     pubkey: Option<&'a str>,
     user: User<'a>,
@@ -150,8 +156,9 @@ pub struct Creation<'a> {
     primary: String,
     /// GPU_PREFERRED's types and the others, when it splits GPU_TYPE_IDS.
     tiers: Option<(Vec<String>, Vec<String>)>,
-    /// The pod body, built once; each request sets its region and volume.
-    body: Value,
+    /// The engine's pod request, built once; each attempt sets its region,
+    /// volume and GPU types.
+    request: PodRequest,
     /// Whether a request was sent, which "Creating pod in" announces.
     tried: bool,
     waited: Duration,
@@ -164,7 +171,7 @@ impl<'a> Creation<'a> {
     pub fn new(
         env: &'a Env<'a>,
         cfg: &'a Config,
-        rp: &'a RunPod,
+        seam: &'a RunPodProvider,
         vllm_key: &'a str,
         pubkey: Option<&'a str>,
         user: User<'a>,
@@ -172,7 +179,7 @@ impl<'a> Creation<'a> {
         Self {
             env,
             cfg,
-            rp,
+            seam,
             vllm_key,
             pubkey,
             user,
@@ -181,7 +188,7 @@ impl<'a> Creation<'a> {
                 let owned = |gpus: Vec<&str>| gpus.into_iter().map(str::to_string).collect();
                 (owned(preferred), owned(others))
             }),
-            body: Value::Null,
+            request: PodRequest::default(),
             tried: false,
             waited: Duration::ZERO,
             requested: false,
@@ -222,10 +229,10 @@ impl<'a> Creation<'a> {
         volume_is_new: bool,
     ) -> Result<Created, CommandError> {
         let primary = self.primary.clone();
-        // Only dataCenterIds and networkVolumeId differ between requests.
-        self.body = engine::for_config(self.cfg)
+        // Only the region, volume and GPU types differ between requests.
+        self.request = engine::for_config(self.cfg)
             .map_err(CommandError::Exit)?
-            .pod_body(self.cfg, self.vllm_key, volume_id, self.pubkey)
+            .pod_request(self.cfg, self.vllm_key, volume_id, self.pubkey)
             .map_err(|e| CommandError::Exit(e.to_string()))?;
         let first = self.first();
         let mut refused = match self
@@ -286,10 +293,10 @@ impl<'a> Creation<'a> {
     /// in is the boot's only; the next `viy up` starts from the primary.
     pub async fn run_on_backup(mut self) -> Result<Created, CommandError> {
         self.requested = true;
-        // Only dataCenterIds and networkVolumeId differ between requests.
-        self.body = engine::for_config(self.cfg)
+        // Only the region, volume and GPU types differ between requests.
+        self.request = engine::for_config(self.cfg)
             .map_err(CommandError::Exit)?
-            .pod_body(self.cfg, self.vllm_key, "", self.pubkey)
+            .pod_request(self.cfg, self.vllm_key, "", self.pubkey)
             .map_err(|e| CommandError::Exit(e.to_string()))?;
         let (message, capacity) = match self.failover("").await {
             Ok(won) => {
@@ -374,19 +381,19 @@ impl<'a> Creation<'a> {
         quiet: bool,
         ask: Ask,
     ) -> Result<Value, RunPodError> {
-        let mut body = self.body.clone();
-        body["dataCenterIds"] = json!([region]);
-        body["networkVolumeId"] = json!(volume_id);
+        let mut request = self.request.clone();
+        request.region = region.to_string();
+        request.volume = Some(volume_id.to_string()).filter(|v| !v.is_empty());
         let (role, none) = match (ask, &self.tiers) {
             (Ask::Preferred, Some((preferred, _))) => {
-                body["gpuTypeIds"] = json!(preferred);
+                request.gpu_types.clone_from(preferred);
                 (
                     format!("{role}, preferred types"),
                     "no preferred GPU type free",
                 )
             }
             (Ask::Others, Some((_, others))) => {
-                body["gpuTypeIds"] = json!(others);
+                request.gpu_types.clone_from(others);
                 (format!("{role}, other types"), "no other GPU type free")
             }
             _ => (role.to_string(), "no GPU free"),
@@ -405,7 +412,7 @@ impl<'a> Creation<'a> {
         }
         self.tried = true;
         let result = self
-            .request(region, volume_id, role, quiet, &mut body)
+            .create(region, volume_id, role, quiet, &mut request)
             .await;
         if let Err(error) = &result
             && is_capacity_error(error)
@@ -416,20 +423,20 @@ impl<'a> Creation<'a> {
         result
     }
 
-    async fn request(
+    async fn create(
         &mut self,
         region: &str,
         volume_id: &str,
         role: &str,
         quiet: bool,
-        body: &mut Value,
+        request: &mut PodRequest,
     ) -> Result<Value, RunPodError> {
-        let error = match create(self.rp, body.clone()).await {
+        let error = match self.seam.create_v1(request).await {
             Ok(pod) => return Ok(pod),
             Err(error) => error,
         };
         let env = self.env;
-        let gpus = body["gpuTypeIds"].clone();
+        let gpus = json!(request.gpu_types);
         regions::log_failure(
             env.paths,
             env.time,
@@ -440,14 +447,11 @@ impl<'a> Creation<'a> {
             &gpus,
             &crate::provider::error_of(&error),
         );
-        let asked: Vec<String> = serde_json::from_value(gpus.clone()).unwrap_or_default();
-        let filtered = body
-            .get("allowedCudaVersions")
-            .and_then(Value::as_array)
-            .is_some_and(|v| !v.is_empty());
+        let asked = request.gpu_types.clone();
+        let filtered = !request.cuda.is_empty();
         if !(is_capacity_error(&error)
             && filtered
-            && regions::any_cuda_is_safe(self.rp, self.cfg, region, &asked).await)
+            && regions::any_cuda_is_safe(self.seam, self.cfg, region, &asked).await)
         {
             return Err(error);
         }
@@ -463,10 +467,8 @@ impl<'a> Creation<'a> {
                 ),
             );
         }
-        if let Some(body) = body.as_object_mut() {
-            body.shift_remove("allowedCudaVersions");
-        }
-        create(self.rp, body.clone()).await.inspect_err(|error| {
+        request.cuda.clear();
+        self.seam.create_v1(request).await.inspect_err(|error| {
             let role = format!("{role}, any cuda");
             regions::log_failure(
                 env.paths,
@@ -570,7 +572,8 @@ impl<'a> Creation<'a> {
     async fn failover(&mut self, primary_volume: &str) -> Result<Won, Stop> {
         let (paths, time) = (self.env.paths, self.env.time);
         let primary = self.primary.clone();
-        let backup = regions::find_backup(self.rp, paths, self.cfg, regions::now(time)).await?;
+        let backup =
+            regions::find_backup(self.seam.client(), paths, self.cfg, regions::now(time)).await?;
         let backup_region = backup
             .as_ref()
             .map(|b| crate::api::shown(b.get("dataCenterId")));
@@ -621,7 +624,7 @@ impl<'a> Creation<'a> {
             "Checking RunPod's stock of our GPU types in every region with network volumes...",
         );
         let sampled = regions::sample_stock(
-            self.rp,
+            self.seam,
             paths,
             time,
             self.cfg,
@@ -630,7 +633,7 @@ impl<'a> Creation<'a> {
         )
         .await
         .map_err(|error| {
-            let first = regions::first_line(&error);
+            let first = error.message.lines().next().unwrap_or_default().to_string();
             Stop::NoCapacity(format!("Could not read RunPod's stock: {first}"))
         });
         let old = backup.as_ref().zip(backup_region.as_deref());
@@ -937,7 +940,7 @@ impl<'a> Creation<'a> {
             let deleted = tokio::select! {
                 biased;
                 () = self.user.interrupt.next() => continue,
-                deleted = regions::delete_empty(self.rp, paths, volume, self.user.report) => deleted,
+                deleted = regions::delete_empty(self.seam.client(), paths, volume, self.user.report) => deleted,
             };
             self.keep(deleted);
         }
@@ -994,7 +997,8 @@ impl<'a> Creation<'a> {
             )))
         })?;
         let volume = self
-            .rp
+            .seam
+            .client()
             .create_volume(
                 &regions::backup_name(self.cfg),
                 size_gb,
@@ -1007,14 +1011,6 @@ impl<'a> Creation<'a> {
             .ok_or_else(|| Stop::Refused(RunPodError::new("RunPod created no volume", None)))?;
         regions::record_unused(self.env.paths, &volume, regions::now(self.env.time))?;
         Ok(volume)
-    }
-}
-
-/// One create request: the pod, or why there is none.
-async fn create(rp: &RunPod, body: Value) -> Result<Value, RunPodError> {
-    match rp.create_pod(body).await? {
-        Some(pod) if pod.get("id").and_then(Value::as_str).is_some() => Ok(pod),
-        _ => Err(RunPodError::new("RunPod created no pod", None)),
     }
 }
 

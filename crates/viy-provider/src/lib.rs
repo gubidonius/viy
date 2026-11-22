@@ -167,6 +167,45 @@ pub trait Provider: Send + Sync {
     fn volumes(&self) -> Option<&dyn Volumes> {
         None
     }
+    /// Its regions' GPU stock, if it shows one: what failover ranks.
+    fn regions(&self) -> Option<&dyn Regions> {
+        None
+    }
+}
+
+/// A region a pod can mount a network volume in, and the GPU types it
+/// shows free there, in the provider's order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionStock {
+    pub region: String,
+    pub free: Vec<String>,
+}
+
+/// One GPU type in one region, by its hosts' CUDA driver: free on a host
+/// at or above the floor asked for (`fit`), and free on one of the older
+/// versions asked about (`old`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CudaStock {
+    pub region: String,
+    pub gpu: String,
+    pub fit: bool,
+    pub old: bool,
+}
+
+/// A provider's GPU stock by region, as failover and `viy backup` read it.
+pub trait Regions: Send + Sync {
+    /// Every region that takes a network volume and lists its stock, with
+    /// the GPU types it shows free.
+    fn stock(&self) -> BoxFuture<'_, Result<Vec<RegionStock>>>;
+    /// The stock of `gpus` in `regions` by CUDA driver: at or above `floor`,
+    /// and on any of `older`.
+    fn cuda_stock<'a>(
+        &'a self,
+        regions: &'a [String],
+        gpus: &'a [String],
+        floor: &'a str,
+        older: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<CudaStock>>>;
 }
 
 /// A provider's persistent volumes.

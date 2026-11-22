@@ -33,6 +33,7 @@ use viy_testkit::scratch::ScratchDir;
 use viy_testkit::time::FakeTime;
 
 use super::*;
+use crate::api::RunPod;
 use crate::notice::Asking;
 use crate::notice::Report;
 use crate::regions::Snapshot;
@@ -281,7 +282,7 @@ async fn run_case(case: &Value) -> Replayed {
         time: &time,
         exe: Path::new("/opt/viy/bin/viy"),
     };
-    let rp = RunPod::new(API_KEY, http.clone());
+    let rp = RunPodProvider::new(RunPod::new(API_KEY, http.clone()), &cfg);
     let home = dir.path().display().to_string();
     let said = Arc::new(Mutex::new(Vec::new()));
     let note = {
@@ -389,7 +390,7 @@ async fn run_case(case: &Value) -> Replayed {
         "retire_replaced" => {
             let mut say = |t: String| note(Tone::Dim, &t);
             let volume = case["volume"].as_str().unwrap_or_default();
-            let gone = regions::retire_replaced(&rp, &paths, &cfg, volume, &mut say)
+            let gone = regions::retire_replaced(rp.client(), &paths, &cfg, volume, &mut say)
                 .await
                 .unwrap();
             json!({"ok": gone})
@@ -397,7 +398,7 @@ async fn run_case(case: &Value) -> Replayed {
         "expire" => {
             let mut say = |t: String| note(Tone::Plain, &t);
             let now = case["now"].as_f64().unwrap_or_default();
-            let gone = regions::expire(&rp, &paths, &cfg, now, &mut say)
+            let gone = regions::expire(rp.client(), &paths, &cfg, now, &mut say)
                 .await
                 .unwrap();
             json!({"ok": gone.iter().map(regions::id).collect::<Vec<_>>()})
@@ -414,6 +415,10 @@ async fn run_case(case: &Value) -> Replayed {
             match result {
                 Ok(()) => json!({"stdout": printed}),
                 Err(CommandError::RunPod(e)) => json!({"error": e.to_string(), "stdout": printed}),
+                // The stock comes through the seam's Regions (WP 9.37c).
+                Err(CommandError::Provider(e)) => {
+                    json!({"error": e.to_string(), "stdout": printed})
+                }
                 Err(other) => panic!("{name}: {other}"),
             }
         }
@@ -784,7 +789,7 @@ async fn without_a_cuda_filter_no_stock_is_asked() {
     let mut cfg = Config::defaults();
     cfg.set("CUDA_VERSIONS", "");
     let http = Arc::new(FakeHttp::new([]));
-    let rp = RunPod::new(API_KEY, http.clone());
+    let rp = RunPodProvider::new(RunPod::new(API_KEY, http.clone()), &cfg);
     let gpus = regions::stock_types(&cfg);
     assert!(!regions::any_cuda_is_safe(&rp, &cfg, "EUR-IS-1", &gpus).await);
     assert!(http.sent().is_empty());
@@ -1398,4 +1403,23 @@ async fn a_region_without_the_backups_storage_tier_is_dropped_and_the_rest_go_on
     assert!(asked_tier);
     assert_eq!(r.creates().last().unwrap().0, "EU-RO-1");
     assert!(r.backups().get("new2").is_some());
+}
+
+/// A refusal that reaches failover through the seam is a refusal, as one
+/// from the client is: its message and capacity kept, so failover goes on.
+#[test]
+fn a_refusal_through_the_seam_stays_a_refusal() {
+    let seam = viy_provider::ProviderError {
+        message: "POST /pods -> HTTP 400\nThere are no instances currently available".into(),
+        status: Some(400),
+        capacity: true,
+        transient: false,
+        retry_after: None,
+    };
+    let Stop::Refused(error) = Stop::from(CommandError::Provider(seam.clone())) else {
+        panic!("not a refusal");
+    };
+    assert_eq!(error.to_string(), seam.message);
+    assert_eq!(error.status_code(), Some(400));
+    assert!(is_capacity_error(&error));
 }

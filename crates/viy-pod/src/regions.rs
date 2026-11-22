@@ -35,6 +35,8 @@ use viy_config::redact::Redactor;
 use viy_time::TimeProvider;
 
 use viy_provider::Pod;
+use viy_provider::ProviderError;
+use viy_provider::Regions;
 
 use crate::api::RunPod;
 use crate::api::RunPodError;
@@ -417,11 +419,6 @@ pub fn cuda_floor(cfg: &Config) -> Option<String> {
         .map(str::to_string)
 }
 
-fn secure(cfg: &Config) -> bool {
-    let cloud = cfg.get("CLOUD_TYPE").filter(|c| !c.is_empty());
-    cloud.unwrap_or("SECURE").to_uppercase() != "COMMUNITY"
-}
-
 /// The first of our GPU types RunPod shows free, for every listed region
 /// that supports network volumes; each snapshot kept in `stock.jsonl`.
 ///
@@ -430,46 +427,30 @@ fn secure(cfg: &Config) -> bool {
 /// pod, their free hosts being on 13.2 drivers or older than 13.0. With
 /// CUDA_VERSIONS set, a second query asks for hosts at or above its floor.
 pub async fn stock_snapshot(
-    rp: &RunPod,
+    stock: &dyn Regions,
     paths: &Paths,
     time: &dyn TimeProvider,
     cfg: &Config,
-) -> Result<Snapshot, RunPodError> {
+) -> Result<Snapshot, ProviderError> {
     let wanted = stock_types(cfg);
     let mut snap = Snapshot::new();
-    for dc in rp.data_centers().await? {
-        let usable =
-            dc.get("storageSupport").is_some_and(truthy) && dc.get("listed").is_some_and(truthy);
-        let Some(region) = text(&dc, "id").filter(|_| usable) else {
-            continue;
-        };
-        let free: Vec<&str> = dc
-            .get("gpuAvailability")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|g| g.get("available").is_some_and(truthy))
-            .filter_map(|g| text(g, "gpuTypeId"))
-            .collect();
-        let first = wanted.iter().find(|w| free.contains(&w.as_str())).cloned();
-        snap.insert(region.to_string(), first);
+    for row in stock.stock().await? {
+        let first = wanted.iter().find(|w| row.free.contains(w)).cloned();
+        snap.insert(row.region, first);
     }
     if let Some(floor) = cuda_floor(cfg)
         && !snap.is_empty()
         && !wanted.is_empty()
     {
         let regions: Vec<String> = snap.keys().cloned().collect();
-        let stock = rp
-            .cuda_stock(&regions, &wanted, &floor, &[], secure(cfg))
-            .await?;
+        let by_cuda = stock.cuda_stock(&regions, &wanted, &floor, &[]).await?;
         for (region, free) in &mut snap {
             *free = wanted
                 .iter()
                 .find(|g| {
-                    stock
-                        .get(&(region.clone(), (*g).clone()))
-                        .and_then(|s| s.fit.as_deref())
-                        .is_some_and(|s| !s.is_empty())
+                    by_cuda
+                        .iter()
+                        .any(|s| s.region == *region && s.gpu == **g && s.fit)
                 })
                 .cloned();
         }
@@ -490,7 +471,12 @@ pub async fn stock_snapshot(
 /// and caps at 13.0, so the pod can land on a 13.1 or 13.2 host. One
 /// GraphQL request for `gpus`, the types the refused request asked for;
 /// any doubt (no floor, an error) is a no.
-pub async fn any_cuda_is_safe(rp: &RunPod, cfg: &Config, region: &str, gpus: &[String]) -> bool {
+pub async fn any_cuda_is_safe(
+    stock: &dyn Regions,
+    cfg: &Config,
+    region: &str,
+    gpus: &[String],
+) -> bool {
     let Some(floor) = cuda_floor(cfg) else {
         return false;
     };
@@ -499,15 +485,14 @@ pub async fn any_cuda_is_safe(rp: &RunPod, cfg: &Config, region: &str, gpus: &[S
         .filter(|v| version(v) < version(&floor))
         .map(|v| (*v).to_string())
         .collect();
-    let Ok(stock) = rp
-        .cuda_stock(&[region.to_string()], gpus, &floor, &older, secure(cfg))
+    let Ok(by_cuda) = stock
+        .cuda_stock(&[region.to_string()], gpus, &floor, &older)
         .await
     else {
         return false;
     };
-    let free = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.is_empty());
-    let fit = stock.values().any(|s| free(&s.fit));
-    let old = stock.values().any(|s| free(&s.old));
+    let fit = by_cuda.iter().any(|s| s.fit);
+    let old = by_cuda.iter().any(|s| s.old);
     fit && !old
 }
 
@@ -600,19 +585,19 @@ pub fn free_in(samples: &[Snapshot], region: &str) -> usize {
 
 /// `n` stock snapshots [`SAMPLE_GAP`] apart: stock flickers.
 pub async fn sample_stock(
-    rp: &RunPod,
+    stock: &dyn Regions,
     paths: &Paths,
     time: &dyn TimeProvider,
     cfg: &Config,
     n: usize,
     gap: Duration,
-) -> Result<Vec<Snapshot>, RunPodError> {
+) -> Result<Vec<Snapshot>, ProviderError> {
     let mut samples = Vec::with_capacity(n);
     for i in 0..n {
         if i > 0 {
             tokio::time::sleep(gap).await;
         }
-        samples.push(stock_snapshot(rp, paths, time, cfg).await?);
+        samples.push(stock_snapshot(stock, paths, time, cfg).await?);
     }
     Ok(samples)
 }
@@ -1058,7 +1043,8 @@ pub async fn backup(
     samples: u32,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let rp = crate::commands::connect(env, cfg)?;
+    let seam = crate::commands::provider(env, cfg)?;
+    let rp = seam.client();
     let print = |line: String| say(report, Tone::Plain, line);
     let now = now(env.time);
     let primary = cfg.get("DATA_CENTER_ID").unwrap_or("");
@@ -1068,7 +1054,7 @@ pub async fn backup(
         volume_id.unwrap_or("?"),
         cfg.get("NETWORK_VOLUME_NAME").unwrap_or("")
     ));
-    let backup = find_backup(&rp, env.paths, cfg, now).await?;
+    let backup = find_backup(rp, env.paths, cfg, now).await?;
     let backup_region = backup.as_ref().map(|b| shown(b.get("dataCenterId")));
     if let Some(backup) = &backup {
         let record = load_backups(env.paths).get(id(backup)).cloned();
@@ -1100,7 +1086,7 @@ pub async fn backup(
 
     let past = history(env.paths, now, HISTORY_DAYS);
     let n = samples.max(1) as usize;
-    let taken = sample_stock(&rp, env.paths, env.time, cfg, n, Duration::from_secs(5)).await?;
+    let taken = sample_stock(&seam, env.paths, env.time, cfg, n, Duration::from_secs(5)).await?;
     let mut exclude = HashSet::from([primary]);
     exclude.extend(backup_region.as_deref());
     let types = stock_types(cfg);

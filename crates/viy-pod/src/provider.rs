@@ -9,27 +9,32 @@
 //! `stop`, `down`'s sweep, the shutdown's running-pod check and the reaper
 //! go through it since WP 9.36; `up`'s resume and volumes since 9.37, the
 //! engines' requests since 9.38, the waits, ssh and the tunnel since 9.37b;
-//! create and failover move in 9.37c. Two stay RunPod's: `tracked` finds
-//! and caches the pod by RunPod's rules while rp shares `pod.json` (the
-//! commands get a [`Pod`]), and `capture-boot` records RunPod's host
-//! facts.
+//! since 9.37c failover asks with the engine's [`PodRequest`] through
+//! [`RunPodProvider::create_v1`] and reads the stock through [`Regions`].
+//! What stays RunPod's: `tracked` finds and caches the pod by RunPod's rules
+//! while rp shares `pod.json` (the commands get a [`Pod`]), the backup
+//! volumes and backups.json, and `capture-boot`'s host facts.
 
 use std::time::Duration;
 
 use serde_json::Value;
 use viy_config::Config;
 use viy_provider::BoxFuture;
+use viy_provider::CudaStock;
 use viy_provider::LogLine;
 use viy_provider::Pod;
 use viy_provider::PodRequest;
 use viy_provider::PodState;
 use viy_provider::Provider;
 use viy_provider::ProviderError;
+use viy_provider::RegionStock;
+use viy_provider::Regions;
 use viy_provider::Volume;
 use viy_provider::Volumes;
 
 use crate::api::RunPod;
 use crate::api::RunPodError;
+use crate::api::truthy;
 use crate::regions::is_capacity_error;
 use crate::tracked::pod_volume_id;
 
@@ -43,7 +48,8 @@ pub struct RunPodProvider {
 }
 
 impl RunPodProvider {
-    /// The client, for what stays RunPod's (tracking, regions, failover).
+    /// The client, for what stays RunPod's: tracking the pod in pod.json and
+    /// the backup volumes.
     pub fn client(&self) -> &RunPod {
         &self.rp
     }
@@ -61,6 +67,27 @@ impl RunPodProvider {
     /// (`viy_engine::pod::runpod_body`), with this provider's settings.
     pub fn body(&self, request: &PodRequest) -> Value {
         viy_engine::pod::runpod_body(&self.cloud, &self.gpu_priority, request)
+    }
+
+    /// [`Provider::create`] in RunPod's own shape, for what `up` stores
+    /// where rp reads it (pod.json's `costPerHr` as RunPod sent it): the
+    /// pod, or "RunPod created no pod" for an answer without its id.
+    pub async fn create_v1(&self, request: &PodRequest) -> Result<Value, RunPodError> {
+        match self.rp.create_pod(self.body(request)).await? {
+            Some(pod) if pod.get("id").and_then(Value::as_str).is_some() => Ok(pod),
+            _ => Err(RunPodError::new("RunPod created no pod", None)),
+        }
+    }
+
+    /// Whether the stock is read for SECURE cloud: CLOUD_TYPE, SECURE when
+    /// unset, anything but COMMUNITY.
+    fn secure(&self) -> bool {
+        let cloud = if self.cloud.is_empty() {
+            "SECURE"
+        } else {
+            &self.cloud
+        };
+        cloud.to_uppercase() != "COMMUNITY"
     }
 }
 
@@ -209,10 +236,8 @@ impl Provider for RunPodProvider {
 
     fn create<'a>(&'a self, request: &'a PodRequest) -> BoxFuture<'a, viy_provider::Result<Pod>> {
         Box::pin(async move {
-            let created = self.rp.create_pod(self.body(request)).await.map_err(err)?;
-            created
-                .as_ref()
-                .map(pod_of)
+            let created = pod_of(&self.create_v1(request).await.map_err(err)?);
+            Some(created)
                 .filter(|p| !p.id.is_empty())
                 .ok_or_else(|| without_id("pod"))
         })
@@ -252,6 +277,67 @@ impl Provider for RunPodProvider {
     fn volumes(&self) -> Option<&dyn Volumes> {
         Some(self)
     }
+
+    fn regions(&self) -> Option<&dyn Regions> {
+        Some(self)
+    }
+}
+
+/// RunPod's stock: GraphQL's `dataCenters` and its CUDA-filtered prices.
+impl Regions for RunPodProvider {
+    fn stock(&self) -> BoxFuture<'_, viy_provider::Result<Vec<RegionStock>>> {
+        Box::pin(async move {
+            let centers = self.rp.data_centers().await.map_err(err)?;
+            Ok(centers.iter().filter_map(region_stock).collect())
+        })
+    }
+
+    fn cuda_stock<'a>(
+        &'a self,
+        regions: &'a [String],
+        gpus: &'a [String],
+        floor: &'a str,
+        older: &'a [String],
+    ) -> BoxFuture<'a, viy_provider::Result<Vec<CudaStock>>> {
+        Box::pin(async move {
+            let stock = self
+                .rp
+                .cuda_stock(regions, gpus, floor, older, self.secure())
+                .await
+                .map_err(err)?;
+            let free = |s: &Option<String>| s.as_deref().is_some_and(|s| !s.is_empty());
+            Ok(stock
+                .into_iter()
+                .map(|((region, gpu), s)| CudaStock {
+                    region,
+                    gpu,
+                    fit: free(&s.fit),
+                    old: free(&s.old),
+                })
+                .collect())
+        })
+    }
+}
+
+/// A data center that supports network volumes and is listed, with the GPU
+/// types it shows available; `None` for any other.
+fn region_stock(dc: &Value) -> Option<RegionStock> {
+    let usable =
+        dc.get("storageSupport").is_some_and(truthy) && dc.get("listed").is_some_and(truthy);
+    let region = dc.get("id").and_then(Value::as_str).filter(|_| usable)?;
+    let free = dc
+        .get("gpuAvailability")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|g| g.get("available").is_some_and(truthy))
+        .filter_map(|g| g.get("gpuTypeId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    Some(RegionStock {
+        region: region.to_string(),
+        free,
+    })
 }
 
 impl Volumes for RunPodProvider {

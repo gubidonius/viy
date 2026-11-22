@@ -319,7 +319,7 @@ async fn up_until(
     let mut timeline = Timeline::start(env.time);
     let runpod = Arc::new(provider(env, cfg)?);
     let seam: Arc<dyn Provider> = runpod.clone();
-    // Failover and the backups are still the client's (WP 9.37c).
+    // The backup volumes are RunPod's own (docs/provider-seam.md 2).
     let rp = runpod.client();
     let vllm_key = profiles::ensure_vllm_api_key(cfg, env.paths)?;
 
@@ -495,7 +495,7 @@ async fn up_until(
         interrupt,
         abort_at,
     };
-    let creation = Creation::new(env, cfg, rp, &vllm_key, pubkey.as_deref(), user);
+    let creation = Creation::new(env, cfg, &runpod, &vllm_key, pubkey.as_deref(), user);
     let created = if backup {
         creation.run_on_backup().await?
     } else {
