@@ -6,6 +6,7 @@
 //! model server) is noticed and the same line goes to it; on quit, where
 //! the chat was saved and rp's billing hint.
 
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use serde_json::Value;
@@ -29,6 +30,10 @@ fn the_chat_opens_without_a_pod_keeps_the_draft_and_notices_one_brought_up() {
     let home = scratch.path().join("home");
     let project = scratch.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
+    let notify = scratch.path().join("notify-send");
+    let notifications = scratch.path().join("notifications");
+    std::fs::write(&notify, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$POPUPS\"\n").unwrap();
+    std::fs::set_permissions(&notify, std::fs::Permissions::from_mode(0o755)).unwrap();
     let pty = Pty::open(30, 100).unwrap();
     let mut child = pty
         .spawn(
@@ -41,7 +46,12 @@ fn the_chat_opens_without_a_pod_keeps_the_draft_and_notices_one_brought_up() {
                 .env_remove("XDG_STATE_HOME")
                 .env_remove("RUNPOD_API_KEY")
                 .env_remove("VLLM_BASE_URL")
-                .env_remove("DISPLAY")
+                .env("DISPLAY", ":test")
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", scratch.path().display()),
+                )
+                .env("POPUPS", &notifications)
                 .env_remove("WAYLAND_DISPLAY")
                 .env("VLLM_API_KEY", "fake-key")
                 .env("TUNNEL", "1")
@@ -95,6 +105,10 @@ fn the_chat_opens_without_a_pod_keeps_the_draft_and_notices_one_brought_up() {
     .unwrap();
     pty.send(b"\r").unwrap();
     pty.wait_for("the answer", |s| s.contents().contains("the answer is 4"));
+    pty.wait_for("one response-ready popup", |_| {
+        std::fs::read_to_string(&notifications)
+            .is_ok_and(|args| args == "-a\nviy\n-u\nnormal\nviy\nResponse ready.\n")
+    });
     let user = mock
         .requests()
         .iter()

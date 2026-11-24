@@ -11,6 +11,50 @@ use viy_testkit::scratch::ScratchDir;
 
 use crate::Terminal;
 
+#[test]
+fn desktop_notification_fires_once_per_completed_response() {
+    use viy_protocol::{DeltaEvent, EventMsg, TurnCompleteEvent, TurnOutcome};
+    use viy_testkit::exec::{FakeExec, Reply};
+
+    let exec = FakeExec::new([Reply::Exited(0), Reply::Exited(0)]);
+    let complete = |outcome| {
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn".into(),
+            outcome,
+        })
+    };
+    let delta = DeltaEvent {
+        delta: "part".into(),
+    };
+    for event in [
+        EventMsg::ReasoningContentDelta(delta.clone()),
+        EventMsg::AgentMessageContentDelta(delta),
+        complete(TurnOutcome::Failed {
+            message: "offline".into(),
+        }),
+    ] {
+        super::notify_response(&exec, &event);
+    }
+    assert!(exec.sent().is_empty());
+    for (count, outcome) in [(1, TurnOutcome::Answered), (2, TurnOutcome::Capped)] {
+        super::notify_response(&exec, &complete(outcome));
+        let sent = exec.sent();
+        assert_eq!(sent.len(), count);
+        assert_eq!(
+            sent[count - 1].argv(),
+            [
+                "notify-send",
+                "-a",
+                "viy",
+                "-u",
+                "normal",
+                "viy",
+                "Response ready."
+            ]
+        );
+    }
+}
+
 /// Runs `viy dev ARGS` as `crate::run` does, but with `home` as its home
 /// (`Paths::under`), as the other session-writing tests have their own: the
 /// env's `target/test-home` is shared by every test and every `cargo test`

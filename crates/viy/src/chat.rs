@@ -146,6 +146,7 @@ pub fn cmd_chat(
                 history,
                 dev::tab_title(&cfg),
                 dev::chat_header(&cfg),
+                terminal.desktop,
             )
             .await?;
         }

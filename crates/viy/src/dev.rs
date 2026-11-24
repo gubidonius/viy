@@ -48,13 +48,16 @@ use viy_agent::stream::Endpoint;
 use viy_config::Config;
 use viy_config::Paths;
 use viy_config::Project;
+use viy_exec::{ExecBackend, SystemExec};
 use viy_http::HttpClient;
 use viy_http::ReqwestHttp;
 use viy_pod::backend::Backend;
 use viy_pod::idle;
+use viy_pod::notice::{Alert, desktop_notify};
 use viy_protocol::Answer;
 use viy_protocol::EventMsg;
 use viy_protocol::Op;
+use viy_protocol::{TurnCompleteEvent, TurnOutcome};
 use viy_term::app::App;
 use viy_term::header::Colors;
 use viy_term::header::Header;
@@ -323,7 +326,7 @@ fn chat_ui(
             let history = project
                 .saved_history()
                 .map_or_else(History::default, History::load);
-            tui_chat(engine, history, tab, chat_header(&cfg)).await?;
+            tui_chat(engine, history, tab, chat_header(&cfg), false).await?;
         }
         Ok::<_, Failure>(turns.with_chat(|c| c.session_id()).flatten())
     })?;
@@ -385,6 +388,7 @@ pub(crate) async fn tui_chat(
     history: History,
     tab: bool,
     header: Option<Header>,
+    desktop: bool,
 ) -> Result<(), Failure> {
     let terminal = |e| Failure::from(format!("the terminal: {e}"));
     let mut tui = Tui::init().map_err(terminal)?;
@@ -404,6 +408,9 @@ pub(crate) async fn tui_chat(
                 }
                 event = engine.next_event() => {
                     let Some(event) = event else { return };
+                    if desktop {
+                        notify_response(&SystemExec, &event.msg);
+                    }
                     if events_tx.send(event).is_err() {
                         return;
                     }
@@ -421,6 +428,25 @@ pub(crate) async fn tui_chat(
     let result = viy_term::app::run(&mut tui, &mut app, &mut events).await;
     drop(tui);
     result.map_err(|e| Failure::from(format!("the terminal: {e}")))
+}
+
+fn notify_response(exec: &dyn ExecBackend, msg: &EventMsg) {
+    if matches!(
+        msg,
+        EventMsg::TurnComplete(TurnCompleteEvent {
+            outcome: TurnOutcome::Answered | TurnOutcome::Capped,
+            ..
+        })
+    ) {
+        desktop_notify(
+            exec,
+            &Alert {
+                title: "viy".into(),
+                body: "Response ready.".into(),
+                urgent: false,
+            },
+        );
+    }
 }
 
 /// The chat in the plain renderer: each of `lines` is sent (a slash command
