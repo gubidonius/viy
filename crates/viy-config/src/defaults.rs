@@ -325,9 +325,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("TOOLS_ENABLED", "1"),
     // The mode rp chat starts in (rpctl/modes.py; Shift+Tab cycles them):
     //   normal    every question waits for your answer
-    //   auto-yes  says yes to destructive commands, env-file reads and
-    //             ask_claude; internet-facing questions and writes to the
-    //             client's own files still ask
+    //   auto-yes  says yes to destructive commands, env-file reads,
+    //             ask_claude, network commands, fetch_url and commands on
+    //             /ssh servers; writes to the client's own files still ask,
+    //             and once untrusted text is in the chat so does whatever
+    //             could send data to a host nobody trusted (kb d196)
     // A project's .rpctl/config cannot set it.
     ("CHAT_MODE", "normal"),
     // Where sandboxed network commands can connect (netaccess Stage 6):

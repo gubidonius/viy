@@ -326,8 +326,22 @@ impl Chat {
             card.detail = Some("denied".into());
             return (refusal, card);
         }
+        if !host.boxed
+            && let Some(taint) = &self.web_taint
+        {
+            // kb d196: lent with full, the command has the server's internet.
+            reason.push(line(
+                NoticeLevel::Warn,
+                format!(
+                    "  no chat mode answers this: untrusted text is in this chat ({taint}) and \
+                     {} lends its own internet",
+                    host.alias
+                ),
+            ));
+        }
         let question = Question {
             reason,
+            always_waits: !host.boxed && self.web_taint.is_some(),
             ..Question::yes_no(
                 Some(QuestionKind::Remote),
                 format!("  run it on {}?", host.alias),

@@ -460,3 +460,21 @@ fn a_trailing_unicode_full_stop_is_still_a_local_name() {
         want(&[])
     );
 }
+
+/// kb d196: the hosts a command names that nobody trusted: not registries,
+/// not SANDBOX_NET_ALLOW (exact or `*.`), not allowed by the user, not typed
+/// by the user.
+#[test]
+fn untrusted_hosts_are_the_commands_hosts_nobody_trusted() {
+    let typed: HashSet<String> = ["typed.test".to_string()].into_iter().collect();
+    let p = Policy::new(
+        "curl https://evil.test/x https://pypi.org/simple https://typed.test/a \
+         https://ok.test/b https://a.mirror.test/c https://mirror.corp.test/d; \
+         git clone https://zzz.test/r.git",
+        ["ok.test"],
+        "mirror.corp.test,*.mirror.test",
+    );
+    assert_eq!(p.untrusted_hosts(&typed), ["evil.test", "zzz.test"]);
+    let none = Policy::new("pip install requests", [], "");
+    assert!(none.untrusted_hosts(&typed).is_empty());
+}

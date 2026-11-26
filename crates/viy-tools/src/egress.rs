@@ -33,6 +33,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::sync::LazyLock;
 
@@ -671,6 +672,23 @@ impl Policy {
                 .allow_suffixes
                 .iter()
                 .any(|s| host.ends_with(s.as_str()))
+    }
+
+    /// The hosts the command names that nobody trusted (kb d196): not a
+    /// registry, not allowed by the user or SANDBOX_NET_ALLOW, not in
+    /// `typed` (the hosts of URLs the user wrote in the chat). Sorted.
+    pub fn untrusted_hosts<'a>(&'a self, typed: &HashSet<String>) -> Vec<&'a str> {
+        self.command_hosts
+            .keys()
+            .map(String::as_str)
+            .filter(|h| {
+                !REGISTRIES.contains(h)
+                    && !typed.contains(*h)
+                    && !self.user_hosts.contains(*h)
+                    && !self.allow_exact.contains(*h)
+                    && !self.allow_suffixes.iter().any(|s| h.ends_with(s.as_str()))
+            })
+            .collect()
     }
 
     /// `None` when `host:port` may be reached, else the reason.

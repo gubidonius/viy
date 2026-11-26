@@ -14,6 +14,7 @@
 //! without a kind always waits, and with nobody to ask nothing is answered
 //! yes (the engine's `attended`).
 
+use viy_protocol::Question;
 use viy_protocol::QuestionKind;
 
 /// rpctl's `modes.KINDS`, in its order.
@@ -48,13 +49,16 @@ pub static MODES: [Mode; 2] = [
     },
     // Writes to code that runs outside the sandbox and unsandboxed commands
     // still ask (the author, 2026-07-11); internet-facing questions joined the
-    // yes list on 2026-07-13, commands on /ssh servers on 2026-07-16.
+    // yes list on 2026-07-13, commands on /ssh servers on 2026-07-16. With
+    // untrusted text in the chat, a question that could send data to a host
+    // nobody trusted always waits (kb d196, `Question::always_waits`).
     Mode {
         name: "auto-yes",
         label: "⏵⏵ auto-yes",
         blurb: "says yes to destructive commands, env-file reads, ask_claude, network \
                 commands, fetch_url and commands on /ssh servers; the client's own files \
-                still ask",
+                still ask, and so does what could send data to a host nobody trusted \
+                once untrusted text is in the chat",
         auto_yes: &[
             QuestionKind::Destructive,
             QuestionKind::SecretRead,
@@ -73,6 +77,12 @@ impl Mode {
     /// Whether this mode says yes to a question of `kind`.
     pub fn answers(&self, kind: Option<QuestionKind>) -> bool {
         kind.is_some_and(|k| self.auto_yes.contains(&k))
+    }
+
+    /// Whether this mode says yes to `question`: its kind, unless the
+    /// question always waits (kb d196).
+    pub fn answers_question(&self, question: &Question) -> bool {
+        !question.always_waits && self.answers(question.kind)
     }
 
     /// rp chat's mode line: the label (or name), the blurb, the key.

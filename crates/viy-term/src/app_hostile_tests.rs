@@ -127,6 +127,7 @@ const WIDGETS: &[(&str, Show)] = &[
                 default: Answer::No,
                 unattended: Answer::No,
                 options: Vec::new(),
+                always_waits: false,
                 reason: vec![NoticeEvent {
                     level: NoticeLevel::Warn,
                     code: "test".into(),

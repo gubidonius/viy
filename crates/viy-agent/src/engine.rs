@@ -384,7 +384,7 @@ impl Questions {
     fn auto_yes(state: &mut QuestionsState, asker: &str, question: &Question) -> Option<AutoYes> {
         let kind = question
             .kind
-            .filter(|_| state.attended && state.mode.answers(question.kind))?;
+            .filter(|_| state.attended && state.mode.answers_question(question))?;
         state.auto_yessed.push(kind);
         Some(AutoYes {
             asker: asker.to_string(),
@@ -402,7 +402,8 @@ impl Questions {
         let (mode, answered, tracer) = {
             let mut state = self.lock();
             state.mode = modes::after(state.mode);
-            let answers = |open: &Open| state.attended && state.mode.answers(open.question.kind);
+            let answers =
+                |open: &Open| state.attended && state.mode.answers_question(&open.question);
             let pending = id
                 .filter(|id| state.open.get(*id).is_some_and(answers))
                 .and_then(|id| Some((id.to_string(), state.open.remove(id)?)));

@@ -36,14 +36,17 @@ impl Turns for StandIn {
                 delta: "thinking".into(),
             }));
             // "askall" asks once per kind, always offered; "askpw" a
-            // protected write; "asknone" a question without a kind; any
-            // other "ask" a destructive command.
+            // protected write; "asknone" a question without a kind;
+            // "askwaits" a fetch that always waits (kb d196); any other
+            // "ask" a destructive command.
             let kinds: Vec<Option<QuestionKind>> = if text.contains("askall") {
                 modes::KINDS.iter().copied().map(Some).collect()
             } else if text.contains("askpw") {
                 vec![Some(QuestionKind::ProtectedWrite)]
             } else if text.contains("asknone") {
                 vec![None]
+            } else if text.contains("askwaits") {
+                vec![Some(QuestionKind::Fetch)]
             } else if text.contains("ask") {
                 vec![Some(QuestionKind::Destructive)]
             } else {
@@ -53,7 +56,10 @@ impl Turns for StandIn {
                 let question = if text.contains("askall") {
                     Question::yes_no_always(kind, "  run it?")
                 } else {
-                    Question::yes_no(kind, "  rm -rf build?")
+                    Question {
+                        always_waits: text.contains("askwaits"),
+                        ..Question::yes_no(kind, "  rm -rf build?")
+                    }
                 };
                 let answer = ctx.ask(&question).await;
                 ctx.emit(delta(format!("answered {answer:?}")));
@@ -716,6 +722,61 @@ async fn shift_tab_asks_again_when_the_new_mode_does_not_answer() {
         .unwrap();
     let rest = until(&mut engine, turn_done(&id)).await;
     assert!(msgs(&rest).contains(&delta("answered No")));
+}
+
+/// kb d196: a question that always waits reaches the user in auto-yes,
+/// though auto-yes answers its kind, and Shift+Tab into auto-yes at it does
+/// not answer it.
+#[tokio::test]
+async fn a_question_that_always_waits_is_never_auto_answered() {
+    let mut engine = Engine::spawn_with(Arc::new(StandIn), auto(), true);
+    let events = turn_answering(&mut engine, "askwaits", Answer::No).await;
+    assert_eq!(requests(&events).len(), 1);
+    assert!(requests(&events)[0].always_waits);
+    assert!(msgs(&events).contains(&delta("answered No")));
+    assert!(notices_coded(&events, "auto_yes").is_empty());
+
+    let mut engine = Engine::spawn_with(Arc::new(StandIn), modes::DEFAULT, true);
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "askwaits".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
+    let events = until(&mut engine, |e| {
+        matches!(e.msg, EventMsg::QuestionRequest(_))
+    })
+    .await;
+    let EventMsg::QuestionRequest(request) = &events.last().unwrap().msg else {
+        unreachable!()
+    };
+    let qid = request.question_id.clone();
+    engine
+        .submit(Op::CycleMode {
+            question: Some(qid.clone()),
+        })
+        .unwrap();
+    let changed = until(&mut engine, |e| matches!(e.msg, EventMsg::ModeChanged(_))).await;
+    assert!(
+        msgs(&changed).contains(&EventMsg::ModeChanged(ModeChangedEvent {
+            mode: "auto-yes".into(),
+            label: "⏵⏵ auto-yes".into(),
+        }))
+    );
+    assert!(
+        !msgs(&changed)
+            .iter()
+            .any(|m| matches!(m, EventMsg::QuestionResolved(_)))
+    );
+    engine
+        .submit(Op::QuestionAnswer {
+            id: qid,
+            answer: Answer::No,
+        })
+        .unwrap();
+    let rest = until(&mut engine, turn_done(&id)).await;
+    assert!(msgs(&rest).contains(&delta("answered No")));
+    assert!(notices_coded(&rest, "auto_yes").is_empty());
 }
 
 /// Shift+Tab typed ahead names no question: the mode changes and nothing is

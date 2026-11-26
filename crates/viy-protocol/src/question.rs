@@ -35,6 +35,10 @@ pub struct Question {
     /// What [`Choices::Pick`] picks from, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// No chat mode answers it, whatever its kind: with untrusted text in
+    /// the chat, it could send data to a host nobody trusted (kb d196).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always_waits: bool,
 }
 
 impl Question {
@@ -48,6 +52,7 @@ impl Question {
             unattended: Answer::No,
             reason: Vec::new(),
             options: Vec::new(),
+            always_waits: false,
         }
     }
 

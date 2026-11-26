@@ -1159,6 +1159,19 @@ impl Chat {
             message: text,
         };
         let mut q = Question::yes_no_always(Some(QuestionKind::Consult), "Hand this to Claude?");
+        // kb d196: Claude Code runs the task with the host's network and
+        // tools, so with untrusted text in the chat no mode answers this.
+        if let Some(taint) = &self.web_taint {
+            q.always_waits = true;
+            q.reason.push(NoticeEvent {
+                level: NoticeLevel::Warn,
+                code: "ask_claude".into(),
+                message: format!(
+                    "  no chat mode answers this: untrusted text is in this chat ({taint}) and \
+                     Claude runs the task with this machine's network"
+                ),
+            });
+        }
         let model = if self.consult.model.is_empty() {
             "default model".to_string()
         } else {

@@ -165,6 +165,10 @@ pub(crate) struct Web {
     pub(crate) known_urls: HashSet<String>,
     /// Hosts of URLs from the user or a search.
     pub(crate) known_hosts: HashSet<String>,
+    /// Hosts of URLs the user wrote (a subset of `known_hosts`): under
+    /// untrusted text the only ones trusted for URLs nobody gave, and for
+    /// network commands (kb d196).
+    pub(crate) user_hosts: HashSet<String>,
     /// Hosts the user allowed for this chat ("always" at a fetch question);
     /// proxied commands may reach them too.
     pub(crate) allowed_hosts: BTreeSet<String>,
@@ -187,6 +191,7 @@ impl Web {
             sources_turn: None,
             known_urls: HashSet::new(),
             known_hosts: HashSet::new(),
+            user_hosts: HashSet::new(),
             allowed_hosts: BTreeSet::new(),
             max_bytes: get("FETCH_MAX_BYTES").parse().unwrap_or(3_000_000),
             deadline: get("FETCH_TIMEOUT")
@@ -204,6 +209,7 @@ impl Web {
     pub(crate) fn clear(&mut self) {
         self.known_urls.clear();
         self.known_hosts.clear();
+        self.user_hosts.clear();
         self.allowed_hosts.clear();
         self.pages.clear();
         self.last_sources.clear();
@@ -223,7 +229,19 @@ impl Web {
             self.known_hosts.insert(t.host);
         }
     }
+
+    /// [`Web::note_url`] for a URL the user wrote: its host is the user's.
+    pub(crate) fn note_user_url(&mut self, url: &str) {
+        if let Ok(t) = netguard::parse(url) {
+            self.user_hosts.insert(t.host);
+        }
+        self.note_url(url, true);
+    }
 }
+
+/// Why no chat mode answers a fetch question under untrusted text (kb d196).
+pub const FETCH_WAITS: &str =
+    "  no chat mode answers this while untrusted text is in the chat: the URL could carry data out";
 
 /// What fetch_url does with a URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,15 +305,21 @@ fn user_text(c: &Value) -> String {
 }
 
 impl Chat {
-    /// Remembers the URLs the user wrote in this chat, hosts and all.
-    fn note_user_urls(&mut self) {
+    /// Remembers the URLs the user wrote in this chat, hosts and all. A
+    /// compaction's summary is filed as a user message but the model wrote
+    /// it, so its URLs are not the user's (kb d196; rpctl counts them).
+    pub(crate) fn note_user_urls(&mut self) {
+        let summary = |c: &Value| {
+            c.as_str()
+                .is_some_and(|c| c.starts_with(crate::sessions::SUMMARY_PREFIX))
+        };
         let texts: Vec<String> = self
             .turn_user
             .iter()
             .chain(
                 self.messages
                     .iter()
-                    .filter(|m| m["role"] == "user")
+                    .filter(|m| m["role"] == "user" && !summary(&m["content"]))
                     .map(|m| &m["content"]),
             )
             .map(user_text)
@@ -305,7 +329,7 @@ impl Chat {
                 let u = u
                     .as_str()
                     .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '\'', '"']);
-                self.web.note_url(u, true);
+                self.web.note_user_url(u);
             }
         }
     }
@@ -346,14 +370,27 @@ impl Chat {
                 ),
             );
         }
-        if self.web.known_hosts.contains(&t.host) || well_known(&t.host) {
+        // Under untrusted text a host only a search gave is trusted for the
+        // search's own URLs, not for one built on it, which can carry data
+        // to whoever runs the host (kb d196; rpctl trusts the host).
+        let searched = self.web.known_hosts.contains(&t.host);
+        let trusted = self.web.user_hosts.contains(&t.host) || well_known(&t.host);
+        if trusted || (searched && self.web_taint.is_none()) {
             return FetchDecision::Go(t);
         }
         if let Some(taint) = &self.web_taint {
-            let why = format!(
-                "untrusted text is in this chat ({taint}) and neither you, a search nor a \
-                 fetched page gave this URL"
-            );
+            let why = if searched {
+                format!(
+                    "untrusted text is in this chat ({taint}) and a search gave this host, \
+                     not this URL: a URL built on a search's host can carry data to whoever \
+                     runs it"
+                )
+            } else {
+                format!(
+                    "untrusted text is in this chat ({taint}) and neither you, a search nor a \
+                     fetched page gave this URL"
+                )
+            };
             return FetchDecision::Ask(t, why);
         }
         FetchDecision::Go(t)
@@ -558,6 +595,16 @@ impl Chat {
                     code: "fetch".into(),
                     message: format!("  {why}"),
                 });
+                if self.web_taint.is_some() {
+                    // kb d196: the URL leaves this machine for a host nobody
+                    // trusted, chosen in a chat holding untrusted text.
+                    q.always_waits = true;
+                    q.reason.push(NoticeEvent {
+                        level: NoticeLevel::Warn,
+                        code: "fetch".into(),
+                        message: FETCH_WAITS.into(),
+                    });
+                }
                 match ctx.ask(&q).await {
                     Answer::Yes => {}
                     Answer::Always => {

@@ -542,6 +542,7 @@ impl<'a> Creation<'a> {
             unattended: answer,
             reason: Vec::new(),
             options: Vec::new(),
+            always_waits: false,
         };
         let Some(asking) = (self.user.ask)(&question) else {
             let shown = if default { "yes" } else { "no" };

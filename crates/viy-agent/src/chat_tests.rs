@@ -2907,3 +2907,127 @@ fn only_a_strata_pod_refuses_images() {
     );
     assert!(refused(&[("ENGINE", "strata"), ("STRATA_MMPROJ", "  ")]).is_some());
 }
+
+// ------------------------------------- what leaves under untrusted text (kb d196)
+
+/// run_shell `args` in chat `mode` with someone there, answering each
+/// question with the next of `answers` (then its unattended answer): the
+/// result and the questions asked.
+async fn shell_in(
+    d: &mut Direct,
+    mode: &str,
+    args: &serde_json::Map<String, Value>,
+    answers: &[Answer],
+) -> (Value, Vec<Question>) {
+    let (ctx, mut rx) = TurnContext::detached_in(viy_tools::modes::get(mode).unwrap(), true);
+    let mut answers = answers.iter().copied();
+    let mut asked = Vec::new();
+    let run = d.chat.run_shell(&ctx, "c1", args);
+    tokio::pin!(run);
+    let result = loop {
+        tokio::select! {
+            (r, _) = &mut run => break r,
+            Some(e) = rx.recv() => if let EventMsg::QuestionRequest(q) = e.msg {
+                let a = answers.next().unwrap_or(q.question.unattended);
+                ctx.answer(&q.question_id, a);
+                asked.push(q.question);
+            },
+        }
+    };
+    (result, asked)
+}
+
+/// kb d196: with untrusted text in the chat, auto-yes leaves a network
+/// command naming a host nobody trusted to the user and says why; one that
+/// reaches only registries, a host the user typed or SANDBOX_NET_ALLOW is
+/// answered as before, and so is any command in a chat without untrusted
+/// text. The commands only name hosts: nothing connects.
+#[tokio::test]
+async fn auto_yes_leaves_an_untrusted_host_to_the_user_under_taint() {
+    let (mut d, _s) = shell_chat(
+        json!([verdict("low")]),
+        &[("SANDBOX_NET_ALLOW", "mirror.corp.test")],
+    );
+    if d.chat.auto_ready().await.is_err() {
+        eprintln!("skipped: no sandbox here");
+        return;
+    }
+    d.chat.web_taint = Some("a fetched web page".into());
+    let evil = network_args("echo https://evil.test/up?d=1");
+    let (r, asked) = shell_in(&mut d, "auto-yes", &evil, &[Answer::No]).await;
+    assert_eq!(r["declined"], true, "{r}");
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].always_waits);
+    let said: Vec<&str> = asked[0].reason.iter().map(|n| n.message.as_str()).collect();
+    assert!(
+        said.contains(
+            &"  no chat mode answers this: it can reach evil.test, which nobody here trusted"
+        ),
+        "{said:?}"
+    );
+    d.chat.turn_user = Some(json!("look at https://user.test/a please"));
+    for cmd in [
+        "echo https://pypi.org/simple/x",
+        "echo https://user.test/b",
+        "echo https://mirror.corp.test/x",
+    ] {
+        let (r, asked) = shell_in(&mut d, "auto-yes", &network_args(cmd), &[]).await;
+        assert!(asked.is_empty(), "{cmd}");
+        assert_eq!(r["exit_code"], 0, "{cmd}: {r}");
+    }
+    // normal mode asks as before, the line said there too
+    let (_, asked) = shell_in(
+        &mut d,
+        "normal",
+        &network_args("echo https://pypi.org/x"),
+        &[],
+    )
+    .await;
+    assert_eq!(asked.len(), 1);
+    assert!(!asked[0].always_waits);
+    // without untrusted text: the reviewer, then auto-yes as before
+    d.chat.web_taint = None;
+    let (r, asked) = shell_in(&mut d, "auto-yes", &evil, &[]).await;
+    assert!(asked.is_empty());
+    assert_eq!(r["exit_code"], 0, "{r}");
+}
+
+/// kb d196: a resumed chat whose fetched page a compaction summarised away
+/// is still tainted: the taint is read from what compaction left in the log
+/// (`State::earlier`) as well as the live history. rpctl's `_reset_web`
+/// read the live history only, so the chat came back untainted.
+#[test]
+fn a_resumed_compacted_chat_keeps_its_taint() {
+    let (mut d, _s) = shell_chat(json!([]), &[]);
+    let st = |earlier: Vec<Value>| sessions::State {
+        id: "s1".into(),
+        meta: serde_json::Map::new(),
+        system: None,
+        messages: vec![
+            json!({"role": "user", "content": format!("{}\n\nwe read a page", crate::chat::compact::SUMMARY_HEAD)}),
+            json!({"role": "assistant", "content": "ok"}),
+        ],
+        earlier,
+        title: None,
+        title_auto: true,
+        title_by_model: false,
+        updated: None,
+    };
+    d.chat.load_history(st(vec![
+        json!({"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "fetch_url", "arguments": "{\"url\": \"https://a.test/\"}"}}]}),
+        json!({"role": "tool", "tool_call_id": "c1", "content": "x <<<UNTRUSTED abc y"}),
+        sessions::compacted(),
+    ]));
+    assert_eq!(
+        d.chat.web_taint.as_deref(),
+        Some("web results earlier in this chat")
+    );
+    assert_eq!(d.chat.earlier.len(), 3);
+    d.chat.load_history(st(vec![
+        json!({"role": "user", "content": "hello"}),
+        sessions::compacted(),
+    ]));
+    assert_eq!(d.chat.web_taint, None);
+}

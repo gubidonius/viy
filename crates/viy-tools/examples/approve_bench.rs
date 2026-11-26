@@ -73,7 +73,7 @@ impl Hearing for Script {
         let attended = self.answers != ['-'];
         let letter = self.answers[self.asked.min(self.answers.len() - 1)];
         self.asked += 1;
-        let (answer, shown) = if attended && self.mode.answers(question.kind) {
+        let (answer, shown) = if attended && self.mode.answers_question(&question) {
             (Answer::Yes, "auto")
         } else {
             match (letter, always) {
@@ -126,11 +126,17 @@ fn main() -> std::io::Result<()> {
     for base in job["bases"].as_array().into_iter().flatten() {
         let rules: Vec<Vec<String>> =
             serde_json::from_value(base["rules"].clone()).unwrap_or_default();
+        let command = base["cmd"].as_str().unwrap_or_default();
+        // As run_shell computes it (kb d196), nobody's hosts typed or allowed.
+        let reach = viy_tools::egress::Policy::new(command, [], "")
+            .untrusted_hosts(&std::collections::HashSet::new())
+            .join(", ");
         let facts = Facts {
-            command: base["cmd"].as_str().unwrap_or_default(),
+            command,
             needs_network: base["net"].as_bool().unwrap_or(false),
             workspace: Path::new(&workspace),
             web_taint: base["taint"].as_str(),
+            untrusted_reach: Some(reach.as_str()).filter(|r| !r.is_empty()),
             rules: &rules,
             rules_path: "{RULES}",
         };

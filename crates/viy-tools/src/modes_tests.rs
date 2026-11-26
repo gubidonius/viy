@@ -90,7 +90,16 @@ fn the_table_is_rpctls() {
     for (m, t) in MODES.iter().zip(theirs) {
         assert_eq!(m.name, t["name"]);
         assert_eq!(m.label, t["label"]);
-        assert_eq!(m.blurb, t["blurb"]);
+        // viy's auto-yes also says what always waits (kb d196).
+        let blurb = t["blurb"].as_str().unwrap().to_string();
+        let blurb = if m.name == "auto-yes" {
+            blurb
+                + ", and so does what could send data to a host nobody trusted once untrusted \
+                   text is in the chat"
+        } else {
+            blurb
+        };
+        assert_eq!(m.blurb, blurb);
         let ours: Vec<_> = KINDS
             .iter()
             .filter(|k| m.auto_yes.contains(k))
@@ -106,5 +115,19 @@ fn the_table_is_rpctls() {
     for pair in case["after"].as_array().unwrap() {
         let m = get(pair[0].as_str().unwrap()).unwrap();
         assert_eq!(after(m).name, pair[1]);
+    }
+}
+
+/// kb d196: a question that always waits is answered by no mode, whatever
+/// its kind; otherwise the kind decides as before.
+#[test]
+fn a_question_that_always_waits_is_answered_by_no_mode() {
+    let auto = get("auto-yes").unwrap();
+    let mut q = Question::yes_no(Some(QuestionKind::Fetch), "  read it?");
+    assert!(auto.answers_question(&q));
+    assert!(!DEFAULT.answers_question(&q));
+    q.always_waits = true;
+    for m in &MODES {
+        assert!(!m.answers_question(&q), "{}", m.name);
     }
 }

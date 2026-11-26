@@ -163,6 +163,7 @@ fn hostile_strings_write_no_escape_and_reach_no_terminal_feature() {
                         code: "test".into(),
                         message: (*text).into(),
                     }],
+                    always_waits: false,
                 },
             }),
         ]);

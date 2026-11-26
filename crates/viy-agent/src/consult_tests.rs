@@ -562,6 +562,47 @@ async fn always_switches_approval_off_for_the_chat() {
     assert_eq!(asked.load(Ordering::SeqCst), 1);
 }
 
+/// kb d196: Claude Code runs a consult with this machine's network, so with
+/// untrusted text in the chat auto-yes leaves the question to the user and
+/// says why; without it auto-yes answers as before.
+#[tokio::test]
+async fn auto_yes_leaves_a_consult_to_the_user_under_taint() {
+    let mut f = Fx::new("done", &[("CONSULT_APPROVAL", "ask")]);
+    let (ctx, rx) = TurnContext::detached_in(viy_tools::modes::get("auto-yes").unwrap(), true);
+    f.d.ctx = ctx;
+    f.d.rx = rx;
+    f.d.chat.web_taint = Some("a fetched web page".into());
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<viy_protocol::Question>::new()));
+    let seen = Arc::clone(&asked);
+    let answerer = f.d.ctx.clone();
+    let mut events = std::mem::replace(&mut f.d.rx, tokio::sync::mpsc::unbounded_channel().1);
+    let task = tokio::spawn(async move {
+        while let Some(e) = events.recv().await {
+            if let EventMsg::QuestionRequest(q) = e.msg {
+                seen.lock().unwrap().push(q.question);
+                answerer.answer(&q.question_id, Answer::No);
+            }
+        }
+    });
+    let r = f.ask(json!({})).await;
+    assert_eq!(r["status"], "not_run", "{r}");
+    assert!(!f.root.path().join("fake.log").exists());
+    {
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].always_waits);
+        assert!(asked[0].reason.iter().any(|n| n.message
+            == "  no chat mode answers this: untrusted text is in this chat (a fetched web \
+                page) and Claude runs the task with this machine's network"));
+    }
+    f.d.chat.web_taint = None;
+    let r = f.ask(json!({})).await;
+    assert_eq!(r["status"], "done", "{r}");
+    tokio::task::yield_now().await;
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    task.abort();
+}
+
 // ---- AvailabilityTests, PruneTests ----------------------------------------------
 
 #[tokio::test]

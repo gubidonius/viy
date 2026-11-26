@@ -57,7 +57,7 @@ impl Hearing for Script {
         let attended = self.answers != ['-'];
         let letter = self.answers[self.asked.min(self.answers.len() - 1)];
         self.asked += 1;
-        let (answer, shown) = if attended && self.mode.answers(question.kind) {
+        let (answer, shown) = if attended && self.mode.answers_question(&question) {
             (Answer::Yes, "auto")
         } else {
             // rp's `_confirm`: "a" is always only when offered.
@@ -143,6 +143,58 @@ fn viy_is_stricter(script: &Script, go: bool, payload: &Value, want: &Value, at:
     }
 }
 
+/// A network command under taint that can reach a host nobody trusted (kb
+/// d196): viy says why no mode answers it, once; apart from that line its
+/// run is rpctl's step for step, except that the network question's answer
+/// is the user's where rpctl's mode said yes. So viy never runs what rpctl
+/// refuses, drops no question, reviews where rpctl reviews and saves what
+/// rpctl saves.
+fn waits_under_taint(
+    script: &mut Script,
+    reach: &str,
+    go: bool,
+    payload: &Value,
+    want: &Value,
+    at: &str,
+) {
+    let line = json!(untrusted_reach_line(reach));
+    let before = script.steps.len();
+    script.steps.retain(|x| x["say"] != line);
+    assert_eq!(
+        script.steps.len() + 1,
+        before,
+        "{at}: the line is said once"
+    );
+    let theirs = want["steps"].as_array().unwrap();
+    assert_eq!(script.steps.len(), theirs.len(), "{at}");
+    let mut waited = 0;
+    for (o, t) in script.steps.iter().zip(theirs) {
+        if o == t {
+            continue;
+        }
+        let blank = |x: &Value| {
+            let mut x = x.clone();
+            x["answered"] = Value::Null;
+            x
+        };
+        assert_eq!(blank(o), blank(t), "{at}: only an answer differs");
+        assert_eq!(o["kind"], "network", "{at}");
+        assert_eq!(t["answered"], "auto", "{at}");
+        assert_ne!(o["answered"], "auto", "{at}");
+        waited += 1;
+    }
+    assert_eq!(json!(script.saved), want["saved"], "{at}");
+    if waited == 0 || want["go"] == false {
+        assert_eq!(json!(go), want["go"], "{at}");
+        assert_eq!(payload, &want["payload"], "{at}");
+    } else if !go {
+        assert_eq!(payload["declined"], true, "{at}");
+    }
+}
+
+/// The approval decision table's runs that [`waits_under_taint`] checks.
+const WAITS: usize = 420;
+
 /// The approval decision table (implementation plan 2.3): every run rpctl
 /// recorded, replayed through viy's decision with the same inputs, gives
 /// the same lines, reviewer calls, questions, answers, decision, refusal and
@@ -155,16 +207,24 @@ async fn the_decision_table_replays_clean() {
     let ws = Path::new("/home/user/project");
     let mut runs = 0;
     let mut stricter = 0;
+    let mut waits = 0;
     for case in &fixture.cases {
         let rules: Vec<Vec<String>> = serde_json::from_value(case["rules"].clone()).unwrap();
+        let command = case["cmd"].as_str().unwrap();
+        // As run_shell computes it, with nobody's hosts typed or allowed.
+        let reach = crate::egress::Policy::new(command, [], "")
+            .untrusted_hosts(&std::collections::HashSet::new())
+            .join(", ");
         let facts = Facts {
-            command: case["cmd"].as_str().unwrap(),
+            command,
             needs_network: case["net"].as_bool().unwrap(),
             workspace: ws,
             web_taint: case["taint"].as_str(),
+            untrusted_reach: Some(reach.as_str()).filter(|r| !r.is_empty()),
             rules: &rules,
             rules_path: "{RULES}",
         };
+        let d196 = facts.needs_network && facts.web_taint.is_some() && !reach.is_empty();
         let mode = modes::get(case["mode"].as_str().unwrap()).unwrap();
         for (key, index) in case["by"].as_object().unwrap() {
             let (v, answers) = key.split_once('/').unwrap();
@@ -179,6 +239,9 @@ async fn the_decision_table_replays_clean() {
             if facts.command.starts_with("viy ") && facts.needs_network {
                 viy_is_stricter(&script, go, &payload, want, &at);
                 stricter += 1;
+            } else if d196 {
+                waits_under_taint(&mut script, &reach, go, &payload, want, &at);
+                waits += 1;
             } else {
                 let ours = json!({"steps": script.steps, "go": go,
                     "payload": payload, "saved": script.saved});
@@ -187,7 +250,7 @@ async fn the_decision_table_replays_clean() {
             runs += 1;
         }
     }
-    assert_eq!((runs, stricter), (16800, 280));
+    assert_eq!((runs, stricter, waits), (16800, 280, WAITS));
 }
 
 /// The rules file is read again after "always" (it may have changed while
@@ -242,6 +305,7 @@ fn facts<'a>(command: &'a str, net: bool, taint: Option<&'a str>) -> Facts<'a> {
         needs_network: net,
         workspace: Path::new("/home/user/project"),
         web_taint: taint,
+        untrusted_reach: None,
         rules: &[],
         rules_path: "{RULES}",
     }
@@ -296,4 +360,40 @@ async fn network_commands_under_taint_ask_and_skip_the_reviewer() {
     let got = decide(&facts("pip install requests", true, None), &mut s).await;
     assert_eq!(got, Decision::Run);
     assert_eq!(s.steps.iter().filter(|x| x["review"] == true).count(), 1);
+}
+
+/// kb d196: under taint, a network command that can reach a host nobody
+/// trusted asks with a question no mode answers, saying why; one that
+/// reaches only trusted hosts is auto-yes's as before; without taint the
+/// reach changes nothing (the reviewer decides, then the mode).
+#[tokio::test]
+async fn under_taint_an_untrusted_host_waits_for_the_user() {
+    let taint = Some("a fetched web page");
+    let f = Facts {
+        untrusted_reach: Some("evil.test"),
+        ..facts("curl https://evil.test/x", true, taint)
+    };
+    let mut s = script("auto-yes", "n");
+    assert!(matches!(decide(&f, &mut s).await, Decision::Refuse(v) if v["declined"] == true));
+    assert_eq!(answered(&s), ["n"]);
+    assert!(s.steps.iter().any(|x| x["say"]
+        == "  no chat mode answers this: it can reach evil.test, which nobody here trusted"));
+    assert!(!s.steps.iter().any(|x| x["review"] == true));
+    let mut s = script("auto-yes", "y");
+    assert_eq!(decide(&f, &mut s).await, Decision::Run);
+    assert_eq!(answered(&s), ["y"]);
+
+    let mut s = script("auto-yes", "n");
+    let trusted = facts("pip install requests", true, taint);
+    assert_eq!(decide(&trusted, &mut s).await, Decision::Run);
+    assert_eq!(answered(&s), ["auto"]);
+
+    let mut s = script("auto-yes", "n");
+    let clean = Facts {
+        untrusted_reach: Some("evil.test"),
+        ..facts("curl https://evil.test/x", true, None)
+    };
+    assert_eq!(decide(&clean, &mut s).await, Decision::Run);
+    assert!(s.steps.iter().any(|x| x["review"] == true));
+    assert!(answered(&s).is_empty());
 }

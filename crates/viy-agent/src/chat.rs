@@ -746,7 +746,7 @@ impl Chat {
         self.compact_failed = false;
         self.abort_background();
         self.mem_files = FileHistory::in_memory();
-        self.reset_web(&[]);
+        self.reset_web(&[] as &[Value]);
         self.mount_note = self.mounts_note();
         // a lent server stays lent in a new chat, and it is told again
         self.ssh_note = self.ssh_hosts_note();
@@ -785,6 +785,7 @@ impl Chat {
                     unattended: Answer::No,
                     reason: Vec::new(),
                     options: Vec::new(),
+                    always_waits: false,
                 };
                 if ctx.ask(&question).await != Answer::Yes {
                     return false;
@@ -834,7 +835,9 @@ impl Chat {
         self.compact_failed = false;
         self.abort_background();
         let history = std::mem::take(&mut self.messages);
-        self.reset_web(&history);
+        let earlier = std::mem::take(&mut self.earlier);
+        self.reset_web(earlier.iter().chain(&history));
+        self.earlier = earlier;
         self.messages = history;
         self.mount_note = self.mounts_note();
         self.ssh_note = self.ssh_hosts_note();
@@ -895,9 +898,11 @@ impl Chat {
     }
 
     /// Forgets the old chat's web state; taints again if `messages` (a
-    /// resumed chat) already hold internet text or files from a mount (rp's
-    /// `_reset_web`).
-    pub(crate) fn reset_web(&mut self, messages: &[Value]) {
+    /// resumed chat, with what its compactions summarised away) already hold
+    /// internet text or files from a mount (rp's `_reset_web`, which reads
+    /// the live history only, so a compacted chat came back untainted: kb
+    /// d196).
+    pub(crate) fn reset_web<'a>(&mut self, messages: impl IntoIterator<Item = &'a Value>) {
         const WEB: &str = "web results earlier in this chat";
         self.web.clear();
         let mut taint: Option<&str> = None;

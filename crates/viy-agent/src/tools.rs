@@ -679,11 +679,24 @@ impl Chat {
             let loaded = approve::load_rules(&rules);
             let rules_shown = rules.display().to_string();
             let taint = self.web_taint.clone();
+            // kb d196: what the command can reach that nobody trusted.
+            let untrusted = match net {
+                Some(Net::Host) => Some("any host (SANDBOX_NET=host)".to_string()),
+                Some(_) if taint.is_some() => {
+                    self.note_user_urls();
+                    policy
+                        .as_ref()
+                        .map(|p| p.untrusted_hosts(&self.web.user_hosts).join(", "))
+                        .filter(|hosts| !hosts.is_empty())
+                }
+                _ => None,
+            };
             let facts = Facts {
                 command: &cmd,
                 needs_network: need_net,
                 workspace: &ws,
                 web_taint: taint.as_deref(),
+                untrusted_reach: untrusted.as_deref(),
                 rules: &loaded,
                 rules_path: &rules_shown,
             };

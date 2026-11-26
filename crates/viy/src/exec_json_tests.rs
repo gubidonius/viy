@@ -326,6 +326,7 @@ fn caller_answers_picks_and_order() {
         unattended: Answer::No,
         reason: Vec::new(),
         options: vec!["a".into(), "b".into()],
+        always_waits: false,
     };
     for id in ["q10", "q9"] {
         let none = json
