@@ -20,6 +20,14 @@
 //! keep their `!` as text, and a `!` followed within 8 ms by another key
 //! came from a paste and goes back into the text. A recalled shell command
 //! comes back in its mode: the history keeps the mode apart from the text.
+//!
+//! Images (kb d191, Codex's `chat_composer/attachment_state.rs`): each is
+//! an element of the text, `[Image #N]`, that edits as one piece; deleting
+//! it drops the image. The placeholders are numbered from 1 in the order
+//! they stand in the text, renumbered after every edit, and the images go
+//! with the message in that order (Codex numbers them in the order they
+//! were attached; by position, a line given back or a draft put back in
+//! front of what is typed keeps its numbers in step with the text).
 
 use std::time::Duration;
 
@@ -49,8 +57,9 @@ pub const POPUP_ROWS: usize = 6;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
-    /// Send this, trimmed and not empty: a message or a slash command.
-    Submit(String),
+    /// Send this, trimmed and not empty: a message or a slash command, and
+    /// the images of its `[Image #N]` placeholders, in their order.
+    Submit(String, Vec<ImageInput>),
     /// Run this in the shell, trimmed and not empty (`!` or `!!`).
     Shell {
         command: String,
@@ -118,8 +127,35 @@ pub struct Composer {
     /// after it shows it was typed by a person.
     shell: Option<Shell>,
     shell_typed: Option<Instant>,
-    /// The images the next message carries (kb d191).
-    images: Vec<ImageInput>,
+    /// The images of the text's elements, by element id (kb d191).
+    attachments: Vec<(u64, ImageInput)>,
+}
+
+/// The placeholder of the `n`th image, from 1 (Codex's
+/// `local_image_label_text`).
+pub fn image_label(n: usize) -> String {
+    format!("[Image #{n}]")
+}
+
+/// The byte ranges of the `[Image #N]` placeholders written in `text`, in
+/// order.
+fn labels_in(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find("[Image #").map(|i| from + i) {
+        let digits = text[at + 8..]
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .count();
+        let end = at + 8 + digits;
+        if digits > 0 && text[end..].starts_with(']') {
+            found.push(at..end + 1);
+            from = end + 1;
+        } else {
+            from = at + 8;
+        }
+    }
+    found
 }
 
 impl Composer {
@@ -149,28 +185,89 @@ impl Composer {
     pub fn clear(&mut self) {
         self.area.take();
         self.leave_shell();
-        self.images.clear();
+        self.attachments.clear();
     }
 
-    /// The images the next message carries.
-    pub fn images(&self) -> &[ImageInput] {
-        &self.images
+    /// The images the text's placeholders stand for, in their order.
+    pub fn images(&self) -> Vec<ImageInput> {
+        self.area
+            .elements()
+            .iter()
+            .filter_map(|(id, _)| self.attachments.iter().find(|(a, _)| a == id))
+            .map(|(_, image)| image.clone())
+            .collect()
     }
 
-    /// The images `/rewind` puts back with its message, in place of any.
-    pub fn set_images(&mut self, images: Vec<ImageInput>) {
-        self.images = images;
+    /// Attaches `image` at the cursor as its `[Image #N]`, in place of the
+    /// selection.
+    pub fn attach(&mut self, image: ImageInput) {
+        let id = self.area.insert_element(&image_label(0));
+        self.attachments.push((id, image));
+        self.reconcile(0);
     }
 
-    /// The images of a line not sent, ahead of those attached since.
-    pub fn give_back_images(&mut self, mut images: Vec<ImageInput>) {
-        images.append(&mut self.images);
-        self.images = images;
+    /// A draft in the box in place of what it held: `/rewind`'s message
+    /// and its images.
+    pub fn set_draft(&mut self, text: &str, images: Vec<ImageInput>) {
+        self.set_text("");
+        self.splice(0..0, "", text, images, "");
     }
 
-    /// The images, for the message being sent.
-    pub fn take_images(&mut self) -> Vec<ImageInput> {
-        std::mem::take(&mut self.images)
+    /// Writes `before`, `text` and `after` in place of `range` (which holds
+    /// no image), `text`'s `[Image #N]` placeholders standing for `images`
+    /// in order; images it has no placeholder for get one after it. The
+    /// cursor goes to the end. Where the written text ends, once every
+    /// placeholder is numbered again.
+    pub fn splice(
+        &mut self,
+        range: std::ops::Range<usize>,
+        before: &str,
+        text: &str,
+        images: Vec<ImageInput>,
+        after: &str,
+    ) -> usize {
+        let mut text = text.to_string();
+        for n in labels_in(&text).len()..images.len() {
+            if !text.is_empty() && !text.ends_with(char::is_whitespace) {
+                text.push(' ');
+            }
+            text.push_str(&image_label(n + 1));
+        }
+        self.area.remove_range(range.clone());
+        let at = range.start + before.len();
+        self.area
+            .insert_at(range.start, &format!("{before}{text}{after}"));
+        let mut images = images.into_iter();
+        for label in labels_in(&text) {
+            let Some(image) = images.next() else { break };
+            if let Some(id) = self.area.mark(at + label.start..at + label.end) {
+                self.attachments.push((id, image));
+            }
+        }
+        let end = self.reconcile(at + text.len());
+        self.area.move_to_end();
+        end
+    }
+
+    /// Drops the images whose placeholder an edit took, and numbers the
+    /// placeholders left from 1 in text order (Codex's
+    /// `remove_deleted_local_placeholders` and `relabel_local_images`).
+    /// `pos` again, after the numbers that came before it changed length.
+    fn reconcile(&mut self, mut pos: usize) -> usize {
+        let elements = self.area.elements();
+        self.attachments
+            .retain(|(id, _)| elements.iter().any(|(e, _)| e == id));
+        // Numbered from the last, so the ranges not renamed yet still hold.
+        for (n, (id, range)) in elements.into_iter().enumerate().rev() {
+            let delta = self
+                .area
+                .rename_element(id, &image_label(n + 1))
+                .unwrap_or(0);
+            if range.end <= pos {
+                pos = pos.saturating_add_signed(delta);
+            }
+        }
+        pos
     }
 
     /// Puts `text` in the box to edit: `/rewind`'s prefill, a line given
@@ -178,12 +275,20 @@ impl Composer {
     pub fn set_text(&mut self, text: &str) {
         self.leave_shell();
         self.area.set_text(text);
+        self.attachments.clear();
+    }
+
+    /// Shell mode becomes text: its `!` goes in front, the images kept (a
+    /// line given back makes the box text, kb d149).
+    pub fn shell_to_text(&mut self) {
+        self.shell_was_pasted();
     }
 
     /// Puts back a shell command the user typed and the chat could not
     /// take (it was closing), in its mode.
     pub fn set_shell(&mut self, command: &str, shell: Shell) {
         self.area.set_text(command);
+        self.attachments.clear();
         self.shell = Some(shell);
         self.shell_typed = None;
     }
@@ -197,8 +302,8 @@ impl Composer {
     /// text, at the start.
     fn shell_was_pasted(&mut self) {
         if let Some(shell) = self.shell.take() {
-            let rest = self.area.text().to_string();
-            self.area.set_text(&format!("{}{rest}", shell.bang()));
+            self.area.insert_at(0, shell.bang());
+            self.area.move_to_end();
         }
         self.shell_typed = None;
     }
@@ -211,6 +316,7 @@ impl Composer {
     pub fn paste(&mut self, text: &str) {
         self.burst.clear();
         self.area.insert_str(text);
+        self.reconcile(0);
     }
 
     /// The popup's offers for the input now; none once Esc closed it, and
@@ -271,7 +377,9 @@ impl Composer {
 
     /// Removes the selected text and returns it (Ctrl+X).
     pub fn cut(&mut self) -> Option<String> {
-        self.area.take_selection()
+        let cut = self.area.take_selection();
+        self.reconcile(0);
+        cut
     }
 
     pub fn clear_selection(&mut self) {
@@ -336,9 +444,9 @@ impl Composer {
             // kitty keyboard protocol, [`crate::tui`]; kb d153).
             KeyCode::Enter if alt || shift => self.newline(),
             KeyCode::Enter if self.area.text().ends_with('\\') => {
-                let text = self.area.text();
-                let kept = text[..text.len() - 1].to_string();
-                self.area.set_text(&kept);
+                let end = self.area.text().len();
+                self.area.remove_range(end - 1..end);
+                self.area.move_to_end();
                 self.newline()
             }
             // With the popup open, Enter takes its choice as Codex's command
@@ -415,6 +523,7 @@ impl Composer {
         };
         if self.area.text() != before {
             self.selected = 0;
+            self.reconcile(0);
         }
         action
     }
@@ -451,9 +560,11 @@ impl Composer {
         Action::None
     }
 
-    /// A history entry in the box, in the mode the history kept for it.
+    /// A history entry in the box, in the mode the history kept for it,
+    /// with the images it was sent with in this chat.
     fn recall(&mut self, text: &str) {
-        self.area.set_text(text);
+        let images = self.history.shown_images();
+        self.set_draft(text, images);
         self.shell = self.history.shown_shell();
         self.shell_typed = None;
     }
@@ -463,8 +574,10 @@ impl Composer {
     /// never the message (rp ignores the same failure).
     fn submit(&mut self) -> Action {
         let text = self.area.text().trim().to_string();
+        let images = self.images();
         if let Some(shell) = self.shell {
             self.area.take();
+            self.attachments.clear();
             self.leave_shell();
             if text.is_empty() {
                 return Action::ShellHelp;
@@ -479,9 +592,10 @@ impl Composer {
             return Action::None;
         }
         self.area.take();
+        self.attachments.clear();
         self.dismissed = None;
-        let _ = self.history.record(&text);
-        Action::Submit(text)
+        let _ = self.history.record_with_images(&text, images.clone());
+        Action::Submit(text, images)
     }
 }
 

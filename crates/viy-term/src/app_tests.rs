@@ -1037,37 +1037,64 @@ fn a_line_given_back_leaves_a_shell_draft_as_visible_text() {
     );
 }
 
-/// The images `/rewind` puts back go with the next message, and come back
-/// with a line the engine refused (kb d191).
+/// The images `/rewind` puts back show as placeholders and go with the
+/// next message; a line the engine refused comes back in front of what was
+/// typed since, its images numbered first (kb d191).
 #[test]
 fn a_messages_images_go_with_it_and_come_back_with_it() {
-    let image = viy_protocol::ImageInput::DataUrl {
-        url: "data:image/png;base64,AA".into(),
+    let image = |n: u8| viy_protocol::ImageInput::DataUrl {
+        url: format!("data:image/png;base64,{n}"),
     };
-    let mut f = fixture(50, 6);
+    let mut f = fixture(50, 8);
     f.app
         .event(EventMsg::InputPrefill(viy_protocol::InputPrefillEvent {
             text: "what is this".into(),
-            images: vec![image.clone()],
+            images: vec![image(1)],
         }));
+    assert!(
+        f.screen()
+            .iter()
+            .any(|row| row.contains("› what is this [Image #1]")),
+        "{:?}",
+        f.screen()
+    );
     f.key(KeyCode::Enter);
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "what is this".into(),
-            images: vec![image.clone()],
+            text: "what is this [Image #1]".into(),
+            images: vec![image(1)],
         }]
     );
-    assert!(f.app.composer.images().is_empty());
+    f.type_text("also ");
+    f.app.composer.attach(image(2));
     f.app
         .event(EventMsg::TurnRefused(viy_protocol::TurnRefusedEvent {
-            text: "what is this".into(),
-            images: vec![image.clone()],
+            text: "what is this [Image #1]".into(),
+            images: vec![image(1)],
             message: "no pod is ready".into(),
         }));
-    assert_eq!(f.app.composer.text(), "what is this");
-    assert_eq!(f.app.composer.images(), std::slice::from_ref(&image));
-    // Ctrl-C with a draft empties the box, its images too.
+    assert_eq!(
+        f.app.composer.text(),
+        "what is this [Image #1]\nalso [Image #2]"
+    );
+    assert_eq!(f.app.composer.images(), vec![image(1), image(2)]);
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::UserTurn {
+            text: "what is this [Image #1]\nalso [Image #2]".into(),
+            images: vec![image(1), image(2)],
+        }]
+    );
+    // Ctrl-C with a draft, and nothing running, empties the box, its
+    // images too.
+    let mut f = fixture(50, 8);
+    f.app
+        .event(EventMsg::InputPrefill(viy_protocol::InputPrefillEvent {
+            text: String::new(),
+            images: vec![image(3)],
+        }));
     f.ctrl('c');
     assert!(f.app.composer.images().is_empty());
 }

@@ -238,3 +238,103 @@ fn a_click_selects_nothing_and_a_row_move_drops_a_selection() {
         "first line\nsecond line\nthird line".len() + 1
     );
 }
+
+// -------------------------------------------------- elements (kb d191)
+
+/// "see [Image #1] now", the placeholder an element.
+fn with_element() -> (TextArea, u64) {
+    let mut area = area("see ");
+    let id = area.insert_element("[Image #1]");
+    area.insert_str(" now");
+    (area, id)
+}
+
+#[test]
+fn moves_step_over_an_element() {
+    let (mut area, _) = with_element();
+    area.move_home();
+    area.move_word_right();
+    area.move_right();
+    assert_eq!(area.cursor(), 4, "at the element's start");
+    area.move_right();
+    assert_eq!(area.cursor(), 14, "over it in one step");
+    area.move_left();
+    assert_eq!(area.cursor(), 4);
+    // A word move never stops inside it either.
+    area.move_to_end();
+    area.move_word_left();
+    area.move_word_left();
+    assert_eq!(area.cursor(), 4);
+}
+
+#[test]
+fn backspace_and_delete_take_an_element_whole() {
+    let (mut area, _) = with_element();
+    area.move_home();
+    for _ in 0..4 {
+        area.move_right();
+    }
+    area.delete();
+    assert_eq!((area.text(), area.elements()), ("see  now", vec![]));
+    let (mut area, _) = with_element();
+    for _ in 0..4 {
+        area.move_left();
+    }
+    area.backspace();
+    assert_eq!(area.text(), "see  now");
+}
+
+#[test]
+fn an_edit_that_touches_an_element_takes_all_of_it() {
+    let (mut area, _) = with_element();
+    // A selection from inside "see" to inside the placeholder.
+    area.select(1, 8);
+    assert_eq!(area.selected(), Some("ee [Image #1]"));
+    assert_eq!(area.take_selection().as_deref(), Some("ee [Image #1]"));
+    assert_eq!(area.text(), "s now");
+    // A kill takes its text, and Ctrl-Y gives back plain text.
+    let (mut area, _) = with_element();
+    area.move_to_end();
+    area.move_word_left();
+    area.delete_word_left();
+    assert_eq!(area.text(), "see now");
+    area.yank();
+    assert_eq!(area.text(), "see [Image #1] now");
+    assert_eq!(area.elements(), vec![]);
+}
+
+#[test]
+fn typing_around_an_element_moves_it() {
+    let (mut area, id) = with_element();
+    area.move_home();
+    area.insert_str(">> ");
+    assert_eq!(area.elements(), vec![(id, 7..17)]);
+    assert_eq!(&area.text()[7..17], "[Image #1]");
+    // A click inside it puts the cursor on its nearer edge.
+    area.select(9, 9);
+    assert_eq!(area.cursor(), 7);
+    area.select(15, 15);
+    assert_eq!(area.cursor(), 17);
+}
+
+#[test]
+fn an_element_renamed_stays_one() {
+    let (mut area, id) = with_element();
+    assert_eq!(area.rename_element(id, "[Image #10]"), Some(1));
+    assert_eq!(area.text(), "see [Image #10] now");
+    assert_eq!(area.elements(), vec![(id, 4..15)]);
+    assert_eq!(area.cursor(), area.text().len());
+    assert_eq!(area.mark(5..7), None, "inside an element");
+    let words = area.mark(16..19).unwrap();
+    assert_eq!(area.elements(), vec![(id, 4..15), (words, 16..19)]);
+}
+
+/// A placeholder is never broken across rows.
+#[test]
+fn the_layout_keeps_an_element_on_one_row() {
+    let (kept, _) = with_element();
+    let (rows, _) = kept.layout(10);
+    assert_eq!(rows, ["see ", "[Image #1] ", "now"]);
+    let (rows, _) = area("see [Image #1] now").layout(10);
+    assert_eq!(rows, ["see [Image ", "#1] now"], "plain text breaks there");
+}

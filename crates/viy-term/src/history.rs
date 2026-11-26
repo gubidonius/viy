@@ -31,6 +31,7 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::Value;
 use serde_json::json;
+use viy_protocol::ImageInput;
 
 /// Entries kept: rp's `readline.set_history_length(2000)`.
 pub const MAX_ENTRIES: usize = 2000;
@@ -71,6 +72,9 @@ impl Shell {
 struct Entry {
     text: String,
     shell: Option<Shell>,
+    /// The images it was sent with, in this chat only: the file keeps the
+    /// text (kb d191, as Codex's `history.jsonl`).
+    images: Vec<ImageInput>,
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +105,7 @@ impl History {
                         .get("shell")
                         .and_then(Value::as_str)
                         .and_then(Shell::from_bang),
+                    images: Vec::new(),
                 })
             })
             .collect();
@@ -128,20 +133,32 @@ impl History {
     /// Adds a message that was sent, unless it repeats the newest entry,
     /// and appends it to the file. Browsing starts again from the newest.
     pub fn record(&mut self, text: &str) -> io::Result<()> {
-        self.record_entry(text, None)
+        self.record_entry(text, None, Vec::new())
+    }
+
+    /// [`History::record`] for a message with images, which the entry
+    /// keeps for this chat; the file gets the text.
+    pub fn record_with_images(&mut self, text: &str, images: Vec<ImageInput>) -> io::Result<()> {
+        self.record_entry(text, None, images)
     }
 
     /// [`History::record`] for a command run with `!` or `!!`.
     pub fn record_shell(&mut self, command: &str, shell: Shell) -> io::Result<()> {
-        self.record_entry(command, Some(shell))
+        self.record_entry(command, Some(shell), Vec::new())
     }
 
-    fn record_entry(&mut self, text: &str, shell: Option<Shell>) -> io::Result<()> {
+    fn record_entry(
+        &mut self,
+        text: &str,
+        shell: Option<Shell>,
+        images: Vec<ImageInput>,
+    ) -> io::Result<()> {
         self.at = None;
         self.recalled = None;
         let entry = Entry {
             text: text.to_string(),
             shell,
+            images,
         };
         if text.trim().is_empty() || self.entries.last() == Some(&entry) {
             return Ok(());
@@ -161,6 +178,14 @@ impl History {
         self.at
             .and_then(|i| self.entries.get(i))
             .and_then(|e| e.shell)
+    }
+
+    /// The images of the entry last recalled.
+    pub fn shown_images(&self) -> Vec<ImageInput> {
+        self.at
+            .and_then(|i| self.entries.get(i))
+            .map(|e| e.images.clone())
+            .unwrap_or_default()
     }
 
     /// Whether Up and Down browse, for the box's `text` and `cursor`.

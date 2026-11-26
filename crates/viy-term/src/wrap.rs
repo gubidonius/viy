@@ -224,11 +224,18 @@ fn units(line: &str) -> Vec<Unit> {
 /// the next row starts with the next word. Each line gives at least one
 /// row.
 pub fn word_wrap(text: &str, width: usize) -> Vec<TextRow> {
+    word_wrap_keeping(text, width, &[])
+}
+
+/// [`word_wrap`], never breaking a row inside one of the `whole` byte
+/// ranges (the input box's elements, kb d191) unless it is longer than
+/// the row, which is then cut as a long word is.
+pub fn word_wrap_keeping(text: &str, width: usize, whole: &[Range<usize>]) -> Vec<TextRow> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut offset = 0;
     for line in text.split('\n') {
-        wrap_one(line, offset, width, &mut rows);
+        wrap_one(line, offset, width, whole, &mut rows);
         offset += line.len() + 1;
     }
     rows
@@ -323,7 +330,13 @@ pub fn text_width(text: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn wrap_one(line: &str, offset: usize, width: usize, rows: &mut Vec<TextRow>) {
+fn wrap_one(
+    line: &str,
+    offset: usize,
+    width: usize,
+    whole: &[Range<usize>],
+    rows: &mut Vec<TextRow>,
+) {
     let units = units(line);
     let start_of = |i: usize| offset + units.get(i).map_or(line.len(), |u| u.range.start);
     let mut first = 0;
@@ -362,7 +375,12 @@ fn wrap_one(line: &str, offset: usize, width: usize, rows: &mut Vec<TextRow>) {
         });
         column += w;
         i += 1;
-        if unit.kind != Kind::Other && units.get(i).is_some_and(|u| u.kind != Kind::Space) {
+        if unit.kind != Kind::Other
+            && units.get(i).is_some_and(|u| {
+                let at = offset + u.range.start;
+                u.kind != Kind::Space && !whole.iter().any(|r| r.start < at && at < r.end)
+            })
+        {
             gap = Some(i);
         }
     }

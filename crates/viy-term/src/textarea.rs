@@ -7,6 +7,13 @@
 //! Backspace, Delete and a paste replace it, a move or another edit drops
 //! it (Codex's textarea `mouse_selection`).
 //!
+//! Elements (Codex's text elements, kb d191) are ranges of the text that
+//! edit as one piece: an image's `[Image #N]`. The cursor and a
+//! selection's ends never stop inside one, a move steps over it, Backspace
+//! and Delete take it whole, an edit that touches one takes all of it, and
+//! the layout never breaks a row inside one. A kill takes its text, which
+//! Ctrl-Y gives back as plain text.
+//!
 //! The text is kept as typed or pasted, and sent so; what is drawn goes
 //! through the sanitizer (ui-plan 7, kb d076): a pasted escape shows as
 //! `␛`, and the rows measure what is drawn. Codex keeps only text that is
@@ -15,13 +22,14 @@
 
 use std::cell::Ref;
 use std::cell::RefCell;
+use std::ops::Range;
 
 use ratatui::layout::Position;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::wrap::TextRow;
 use crate::wrap::row_of;
-use crate::wrap::word_wrap;
+use crate::wrap::word_wrap_keeping;
 
 #[derive(Debug, Default, Clone)]
 pub struct TextArea {
@@ -36,6 +44,17 @@ pub struct TextArea {
     anchor: Option<usize>,
     /// The rows for the last width laid out.
     rows: RefCell<Option<(usize, Vec<TextRow>)>>,
+    /// The elements, in text order, none overlapping.
+    elements: Vec<Element>,
+    next_id: u64,
+}
+
+/// A range that edits as one piece, and the id that names it while its
+/// range moves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Element {
+    id: u64,
+    range: Range<usize>,
 }
 
 impl PartialEq for TextArea {
@@ -79,16 +98,18 @@ impl TextArea {
     }
 
     /// Replaces the text and puts the cursor at its end: a prefill or a
-    /// recalled history entry.
+    /// recalled history entry. No element is left.
     pub fn set_text(&mut self, text: &str) {
         self.text = normalize_newlines(text);
         self.cursor = self.text.len();
+        self.elements.clear();
         self.changed();
     }
 
     /// Empties the box and returns what it held.
     pub fn take(&mut self) -> String {
         self.cursor = 0;
+        self.elements.clear();
         self.changed();
         std::mem::take(&mut self.text)
     }
@@ -99,23 +120,127 @@ impl TextArea {
     pub fn insert_str(&mut self, text: &str) {
         self.take_selection();
         let text = normalize_newlines(text);
-        self.text.insert_str(self.cursor, &text);
-        self.cursor += text.len();
+        let at = self.cursor;
+        self.text.insert_str(at, &text);
+        self.shift(at, 0, text.len());
+        self.cursor = at + text.len();
         self.changed();
     }
 
     pub fn insert_char(&mut self, c: char) {
         self.take_selection();
-        self.text.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
+        let at = self.cursor;
+        self.text.insert(at, c);
+        self.shift(at, 0, c.len_utf8());
+        self.cursor = at + c.len_utf8();
         self.changed();
+    }
+
+    /// Inserts `text` at `pos` (moved off any element), the cursor kept on
+    /// the text it was on: a `!` that goes back into the text, a line given
+    /// back.
+    pub fn insert_at(&mut self, pos: usize, text: &str) {
+        let text = normalize_newlines(text);
+        let at = self.nearest_edge(self.snap(pos));
+        self.text.insert_str(at, &text);
+        self.shift(at, 0, text.len());
+        if self.cursor >= at {
+            self.cursor += text.len();
+        }
+        self.changed();
+    }
+
+    /// Inserts `text` at the cursor as one element, in place of the
+    /// selection; its id.
+    pub fn insert_element(&mut self, text: &str) -> u64 {
+        self.take_selection();
+        let at = self.cursor;
+        self.insert_str(text);
+        self.add_element(at..at + text.len())
+    }
+
+    /// Makes `range` of the text an element; `None` when it is empty, off
+    /// a char boundary, or meets an element (Codex's `add_element_range`).
+    pub fn mark(&mut self, range: Range<usize>) -> Option<u64> {
+        let ok = range.start < range.end
+            && range.end <= self.text.len()
+            && self.text.is_char_boundary(range.start)
+            && self.text.is_char_boundary(range.end)
+            && !self
+                .elements
+                .iter()
+                .any(|e| e.range.start < range.end && e.range.end > range.start);
+        if !ok {
+            return None;
+        }
+        let id = self.add_element(range);
+        // A cursor inside it goes to its end.
+        self.cursor = self.nearest_edge(self.cursor);
+        Some(id)
+    }
+
+    fn add_element(&mut self, range: Range<usize>) -> u64 {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.elements.push(Element { id, range });
+        self.elements.sort_by_key(|e| e.range.start);
+        *self.rows.get_mut() = None;
+        id
+    }
+
+    /// The elements in text order: their ids and ranges.
+    pub fn elements(&self) -> Vec<(u64, Range<usize>)> {
+        self.elements
+            .iter()
+            .map(|e| (e.id, e.range.clone()))
+            .collect()
+    }
+
+    /// The cursor to the end of the text.
+    pub fn move_to_end(&mut self) {
+        self.move_to(self.text.len());
+    }
+
+    /// Writes `text` in place of element `id`'s, which stays one element
+    /// (Codex's `replace_element_payload`); how many bytes longer the
+    /// text became, if the element is there.
+    pub fn rename_element(&mut self, id: u64, text: &str) -> Option<isize> {
+        let range = self.elements.iter().find(|e| e.id == id)?.range.clone();
+        if self.text[range.clone()] == *text {
+            return Some(0);
+        }
+        self.text.replace_range(range.clone(), text);
+        let delta = text.len() as isize - range.len() as isize;
+        for e in &mut self.elements {
+            if e.id == id {
+                e.range.end = range.start + text.len();
+            } else if e.range.start >= range.end {
+                e.range.start = e.range.start.saturating_add_signed(delta);
+                e.range.end = e.range.end.saturating_add_signed(delta);
+            }
+        }
+        if self.cursor >= range.end {
+            self.cursor = self.cursor.saturating_add_signed(delta);
+        } else if self.cursor > range.start {
+            self.cursor = range.start + text.len();
+        }
+        if let Some(anchor) = self.anchor.filter(|&a| a >= range.end) {
+            self.anchor = Some(anchor.saturating_add_signed(delta));
+        }
+        *self.rows.get_mut() = None;
+        Some(delta)
+    }
+
+    /// Removes `range` of the text, widened to whole elements.
+    pub fn remove_range(&mut self, range: Range<usize>) {
+        self.remove(range);
     }
 
     pub fn backspace(&mut self) {
         if self.take_selection().is_some() {
             return;
         }
-        let start = self.prev_boundary(self.cursor);
+        let start = self.prev_atomic(self.cursor);
         self.remove(start..self.cursor);
     }
 
@@ -123,26 +248,26 @@ impl TextArea {
         if self.take_selection().is_some() {
             return;
         }
-        let end = self.next_boundary(self.cursor);
+        let end = self.next_atomic(self.cursor);
         self.remove(self.cursor..end);
     }
 
     pub fn move_left(&mut self) {
-        self.move_to(self.prev_boundary(self.cursor));
+        self.move_to(self.prev_atomic(self.cursor));
     }
 
     pub fn move_right(&mut self) {
-        self.move_to(self.next_boundary(self.cursor));
+        self.move_to(self.next_atomic(self.cursor));
     }
 
     /// To the start of the word before the cursor (Alt-B, Ctrl-Left).
     pub fn move_word_left(&mut self) {
-        self.move_to(self.word_start(self.cursor));
+        self.move_to(self.edge(self.word_start(self.cursor), false));
     }
 
     /// To the end of the word after the cursor (Alt-F, Ctrl-Right).
     pub fn move_word_right(&mut self) {
-        self.move_to(self.word_end(self.cursor));
+        self.move_to(self.edge(self.word_end(self.cursor), true));
     }
 
     /// To the start of the cursor's line.
@@ -237,7 +362,8 @@ impl TextArea {
     fn rows(&self, width: usize) -> Ref<'_, [TextRow]> {
         let stale = self.rows.borrow().as_ref().is_none_or(|(w, _)| *w != width);
         if stale {
-            *self.rows.borrow_mut() = Some((width, word_wrap(&self.text, width)));
+            let whole: Vec<Range<usize>> = self.elements.iter().map(|e| e.range.clone()).collect();
+            *self.rows.borrow_mut() = Some((width, word_wrap_keeping(&self.text, width, &whole)));
         }
         Ref::map(self.rows.borrow(), |rows| match rows {
             Some((_, rows)) => rows.as_slice(),
@@ -262,7 +388,7 @@ impl TextArea {
         };
         match target {
             Some(pos) => {
-                self.cursor = pos;
+                self.cursor = self.nearest_edge(pos);
                 self.preferred = Some(column);
                 self.anchor = None;
                 true
@@ -280,18 +406,102 @@ impl TextArea {
         self.anchor = None;
     }
 
-    fn remove(&mut self, range: std::ops::Range<usize>) {
+    fn remove(&mut self, range: Range<usize>) {
+        let range = self.whole(range);
         self.text.replace_range(range.clone(), "");
+        self.shift(range.start, range.len(), 0);
         self.cursor = range.start;
         self.changed();
     }
 
-    fn kill(&mut self, range: std::ops::Range<usize>) {
+    fn kill(&mut self, range: Range<usize>) {
+        let range = self.whole(range);
         if range.is_empty() {
             return;
         }
         self.killed = self.text[range.clone()].to_string();
         self.remove(range);
+    }
+
+    /// `range` widened to every element it meets (Codex's
+    /// `expand_range_to_element_boundaries`).
+    fn whole(&self, mut range: Range<usize>) -> Range<usize> {
+        for e in &self.elements {
+            if e.range.start < range.end && e.range.end > range.start {
+                range.start = range.start.min(e.range.start);
+                range.end = range.end.max(e.range.end);
+            }
+        }
+        range
+    }
+
+    /// The elements after an edit at `at` that removed `removed` bytes
+    /// and inserted `inserted`: those inside the removed bytes are gone,
+    /// those after move (Codex's `shift_elements`; edits are widened to
+    /// whole elements first, so none is cut).
+    fn shift(&mut self, at: usize, removed: usize, inserted: usize) {
+        let end = at + removed;
+        if removed > 0 {
+            self.elements
+                .retain(|e| !(e.range.start >= at && e.range.end <= end));
+        }
+        for e in &mut self.elements {
+            if e.range.start >= end {
+                e.range.start = e.range.start - removed + inserted;
+                e.range.end = e.range.end - removed + inserted;
+            }
+        }
+    }
+
+    /// The element `pos` is strictly inside.
+    fn inside(&self, pos: usize) -> Option<&Range<usize>> {
+        self.elements
+            .iter()
+            .map(|e| &e.range)
+            .find(|r| r.start < pos && pos < r.end)
+    }
+
+    /// `pos`, or the edge of the element it is inside: its end when
+    /// `to_end`, else its start.
+    fn edge(&self, pos: usize, to_end: bool) -> usize {
+        match self.inside(pos) {
+            Some(r) if to_end => r.end,
+            Some(r) => r.start,
+            None => pos,
+        }
+    }
+
+    /// `pos`, or the nearer edge of the element it is inside.
+    fn nearest_edge(&self, pos: usize) -> usize {
+        match self.inside(pos) {
+            Some(r) if pos - r.start <= r.end - pos => r.start,
+            Some(r) => r.end,
+            None => pos,
+        }
+    }
+
+    /// One step back: over a grapheme, or over the element ending here.
+    fn prev_atomic(&self, pos: usize) -> usize {
+        match self
+            .elements
+            .iter()
+            .find(|e| e.range.start < pos && pos <= e.range.end)
+        {
+            Some(e) => e.range.start,
+            None => self.edge(self.prev_boundary(pos), false),
+        }
+    }
+
+    /// One step on: over a grapheme, or over the element starting here.
+    fn next_atomic(&self, pos: usize) -> usize {
+        match self
+            .elements
+            .iter()
+            .find(|e| e.range.start <= pos && pos < e.range.end)
+        {
+            Some(e) => e.range.end,
+            None => self.edge(self.next_boundary(pos), true),
+        }
     }
 
     fn changed(&mut self) {
@@ -311,11 +521,18 @@ impl TextArea {
     }
 
     /// Selects from `anchor` to `cursor`, both put on the grapheme they
-    /// are in, the cursor at `cursor`; the same place for both selects
-    /// nothing and only moves the cursor.
+    /// are in, the cursor at `cursor`; a selection that reaches into an
+    /// element takes all of it. The same place for both selects nothing
+    /// and only moves the cursor, to the nearer edge of an element it is
+    /// in.
     pub fn select(&mut self, anchor: usize, cursor: usize) {
-        self.cursor = self.snap(cursor);
-        let anchor = self.snap(anchor);
+        let (anchor, cursor) = (self.snap(anchor), self.snap(cursor));
+        let (anchor, cursor) = match anchor.cmp(&cursor) {
+            std::cmp::Ordering::Equal => (self.nearest_edge(cursor), self.nearest_edge(cursor)),
+            std::cmp::Ordering::Less => (self.edge(anchor, false), self.edge(cursor, true)),
+            std::cmp::Ordering::Greater => (self.edge(anchor, true), self.edge(cursor, false)),
+        };
+        self.cursor = cursor;
         self.anchor = (anchor != self.cursor).then_some(anchor);
         self.preferred = None;
     }

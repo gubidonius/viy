@@ -656,10 +656,7 @@ impl App {
                 self.points.clear();
                 self.push(compacted_cell(&e));
             }
-            EventMsg::InputPrefill(e) => {
-                self.composer.set_text(&e.text);
-                self.composer.set_images(e.images);
-            }
+            EventMsg::InputPrefill(e) => self.composer.set_draft(&e.text, e.images),
             EventMsg::ShutdownComplete => self.stopped = true,
             _ => {}
         }
@@ -938,7 +935,7 @@ impl App {
                 // Typing: no question takes a key until it stops.
                 self.questions.typed(now);
                 match self.composer.key(key, now) {
-                    Action::Submit(text) => self.submit(text),
+                    Action::Submit(text, images) => self.submit(text, images),
                     Action::Shell { command, shell } => self.submit_shell(command, shell),
                     Action::ShellHelp => {
                         self.push(Cell::lines(vec![Line::from(SHELL_HELP.dim())]));
@@ -953,11 +950,12 @@ impl App {
         None
     }
 
-    /// Sends what the input box gave: a slash command, or a message, which
-    /// the engine starts when the turn running ends.
-    fn submit(&mut self, text: String) {
+    /// Sends what the input box gave: a slash command, or a message with
+    /// its images, which the engine starts when the turn running ends. A
+    /// command takes none: its placeholders are text to it.
+    fn submit(&mut self, text: String, images: Vec<ImageInput>) {
         if self.closing {
-            self.composer.set_text(&text);
+            self.composer.set_draft(&text, images);
             return;
         }
         let op = if let Some(rest) = text.strip_prefix('/') {
@@ -966,7 +964,6 @@ impl App {
             }
             Op::Command { text }
         } else {
-            let images = self.composer.take_images();
             self.queued.push_back((text.clone(), images.clone()));
             Op::UserTurn { text, images }
         };
@@ -997,31 +994,26 @@ impl App {
     /// lines given back before it, so several come back in the order they
     /// were sent, and ahead of anything typed since; its images likewise.
     fn give_back(&mut self, text: &str, images: Vec<ImageInput>) {
-        self.composer.give_back_images(images);
         // A shell command being typed keeps its `!` in sight: the lines
         // put back are text, and so is it now (kb d149).
-        let draft = match self.composer.shell() {
-            Some(shell) => format!("{}{}", shell.bang(), self.composer.text()),
-            None => self.composer.text().to_string(),
-        };
+        self.composer.shell_to_text();
+        let draft = self.composer.text().to_string();
         let earlier = if !self.given_back.is_empty() && draft.starts_with(&self.given_back) {
-            std::mem::take(&mut self.given_back)
+            self.given_back.len()
         } else {
-            String::new()
+            0
         };
-        let typed = draft[earlier.len()..].trim_start_matches('\n');
-        let back = if earlier.is_empty() {
-            text.to_string()
-        } else {
-            format!("{earlier}\n{text}")
-        };
-        let whole = if typed.is_empty() {
-            back.clone()
-        } else {
-            format!("{back}\n{typed}")
-        };
-        self.composer.set_text(&whole);
-        self.given_back = back;
+        // The newlines between what was given back and what was typed
+        // since make way for the line, which goes in between, its images
+        // with it (kb d191).
+        let rest = &draft[earlier..];
+        let newlines = rest.len() - rest.trim_start_matches('\n').len();
+        let before = if earlier > 0 { "\n" } else { "" };
+        let after = if rest.len() > newlines { "\n" } else { "" };
+        let end = self
+            .composer
+            .splice(earlier..earlier + newlines, before, text, images, after);
+        self.given_back = self.composer.text()[..end].to_string();
     }
 
     /// Nothing runs or waits: no turn, no queued line, no question.
