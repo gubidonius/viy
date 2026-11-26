@@ -4,6 +4,8 @@ mod chat_pty;
 #[cfg(test)]
 mod completion;
 #[cfg(test)]
+mod live_images;
+#[cfg(test)]
 mod nebius_login;
 #[cfg(test)]
 mod resume_pty;
