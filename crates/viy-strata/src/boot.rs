@@ -74,6 +74,28 @@ fn whole_in(
     }
 }
 
+/// STRATA_MMPROJ: a GGUF file inside MODEL_REPO, or empty (no images).
+/// The pod downloads it into a folder of its own, so a path that would
+/// leave it is refused here.
+fn projector(cfg: &Config) -> Result<String, BadValue> {
+    let value = at(cfg, "STRATA_MMPROJ").trim();
+    let inside = !value.starts_with('/')
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    if value.is_empty() || (inside && value.to_ascii_lowercase().ends_with(".gguf")) {
+        Ok(value.to_string())
+    } else {
+        Err(BadValue {
+            key: "STRATA_MMPROJ",
+            value: value.to_string(),
+            kind: "a .gguf file of MODEL_REPO, as a path inside it, or empty",
+        })
+    }
+}
+
 /// The boot script's settings, in order: what `strata_pod.py` and the
 /// script read.
 pub fn settings(cfg: &Config) -> Result<Vec<(&'static str, String)>, BadValue> {
@@ -117,6 +139,7 @@ pub fn settings(cfg: &Config) -> Result<Vec<(&'static str, String)>, BadValue> {
             .to_string(),
         ),
         ("STRATA_YARN_ORIG_CTX", original_context.to_string()),
+        ("STRATA_MMPROJ", projector(cfg)?),
         (
             "STRATA_PARALLEL",
             whole_in(cfg, "STRATA_PARALLEL", 1..=8, "a whole number from 1 to 8")?.to_string(),
@@ -151,6 +174,7 @@ pub fn settings(cfg: &Config) -> Result<Vec<(&'static str, String)>, BadValue> {
             "STRATA_HUGE_PAGES",
             one_of(cfg, "STRATA_HUGE_PAGES", HUGE_PAGES, "auto or off")?.to_string(),
         ),
+        ("STRATA_VISION_ELASTIC", flag("STRATA_VISION_ELASTIC")?),
         ("STRATA_HOST", host.to_string()),
         (
             "STRATA_ENGINE_LOG",

@@ -414,7 +414,7 @@ fn a_strata_overrun_gets_stratas_hint() {
         stage("pull", "GPU allocation + image pull", 150.0),
         stage(
             "prepare",
-            "boot script (first boot: release, model, pack)",
+            "boot script (first boot: release, model, pack; vision projector)",
             40.0,
         ),
     ];

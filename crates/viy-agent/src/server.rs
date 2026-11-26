@@ -25,6 +25,10 @@ pub struct Ready {
     pub model: String,
     /// Capacity returned by the readiness probe, when available.
     pub context_window: Option<u64>,
+    /// Whether the server reads images, when its readiness probe says
+    /// (Strata's `/health` `images`: whether it started with its image
+    /// encoder; kb d191).
+    pub images: Option<bool>,
 }
 
 /// The model's server, watched for the chat.

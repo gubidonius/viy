@@ -188,6 +188,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("MODEL_FILES", ""),
     // A profile can opt into YaRN beyond the model's trained window.
     ("STRATA_YARN_ORIG_CTX", ""),
+    // The model's vision projector, a file of MODEL_REPO (e.g.
+    // mmproj/mmproj-Qwen3.8-Flash-Next-heretic-2-BF16.gguf): the first boot
+    // with it fetches it once and Strata reads images. Empty: no images,
+    // and a message with one is not sent (kb d191).
+    ("STRATA_MMPROJ", ""),
     // Batch slots, and each slot verifying MTP proposals: two requests at
     // once without queueing, 147 tok/s together (kb d166).
     ("STRATA_PARALLEL", "2"),
@@ -209,6 +214,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // before reading the experts on a host whose memory compaction mostly
     // failed (kb f169); Strata warns compaction can stall its load (kb d175).
     ("STRATA_HUGE_PAGES", "off"),
+    // 1: the image encoder starts with the first picture and stops after
+    // 120 s without one, the expert cache making room for it; 0: it loads
+    // with the model and keeps its VRAM (kb d194).
+    ("STRATA_VISION_ELASTIC", "1"),
     // The host RAM a Strata pod asks for (minRamPerGpu): the model's
     // experts and table live in RAM. RunPod lists RTX PRO 6000 hosts from
     // 62 GB. Not sent for vLLM, whose pod body stays rpctl's (kb d003).

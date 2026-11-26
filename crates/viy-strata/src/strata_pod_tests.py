@@ -562,5 +562,189 @@ class ReviewFixTests(unittest.TestCase):
         self.assertIsNotNone(self.watch_until(flag_age_s=pod.PREPARE_GRACE_S + 60, until=3 * 600))
 
 
+
+VISION = {"repo": "org/M-GGUF", "file": "mmproj/mmproj-M-BF16.gguf",
+          "mmproj": "/v/vision/mmproj/mmproj-M-BF16.gguf"}
+
+
+class VisionTests(unittest.TestCase):
+    """WP 9.49 (kb d191): the vision projector, fetched once into a folder of its own, and the
+    run settings' vision section."""
+
+    def test_no_projector_no_images(self):
+        cfg = pod.settings(READY, ENV)
+        self.assertNotIn("--vision", cfg["args"])
+        self.assertNotIn("vision", cfg)
+        self.assertNotIn("vram_elastic", cfg)
+
+    def test_the_vision_section_as_strata_setup_writes_it_elastic_first(self):
+        cfg = pod.settings(READY, ENV, vision=VISION)
+        self.assertEqual(cfg["args"][-1], "--vision")
+        self.assertEqual(cfg["vision"], {
+            "exe": "/v/release/0.2.16/engine/x/strata-vision",
+            "mmproj": "/v/vision/mmproj/mmproj-M-BF16.gguf",
+            "model": "/v/model/Q5_K_M/M-00001-of-00006.gguf", "gpu": True, "max_tokens": 1024,
+            "elastic": True})
+        self.assertIs(cfg["vram_elastic"], True)
+        # the batch slots and the draft head stay as they were
+        self.assertEqual(cfg["parallel"], 2)
+        self.assertIn("--batch-mtp", cfg["args"])
+
+    def test_not_elastic_the_encoder_loads_with_the_model(self):
+        cfg = pod.settings(READY, dict(ENV, STRATA_VISION_ELASTIC="0"), vision=VISION)
+        self.assertIs(cfg["vision"]["elastic"], False)
+        self.assertNotIn("vram_elastic", cfg)
+        self.assertIn("--vision", cfg["args"])
+
+    def test_a_projector_path_that_leaves_the_folder_is_none(self):
+        for name in ("/etc/passwd", "../x.gguf", "mmproj/../../x.gguf", "a\\b.gguf", "", "  "):
+            self.assertEqual(pod.projector_file({"STRATA_MMPROJ": name}), "", name)
+        self.assertEqual(pod.projector_file({"STRATA_MMPROJ": " mmproj/m.gguf "}), "mmproj/m.gguf")
+        self.assertEqual(pod.projector_file({}), "")
+
+    def volume(self, d, **extra):
+        """A prepared volume at d, its engine folder with strata-vision; the environment."""
+        engine = Path(d) / "release" / "engine"
+        engine.mkdir(parents=True)
+        (engine / "strata").write_bytes(b"")
+        (engine / "strata-vision").write_bytes(b"")
+        ready = dict(READY, engine=str(engine / "strata"))
+        (Path(d) / "ready.json").write_text(json.dumps(ready))
+        return dict(ENV, STRATA_ROOT=d, STRATA_VERSION="0.2.16", RPCTL_MODEL_REPO="org/M-GGUF",
+                    STRATA_MODEL_FILES="Q5_K_M/*", STRATA_MMPROJ=VISION["file"], **extra)
+
+    def fake_download(self, calls, fail=False, preparing=None):
+        """run() standing in for the venv's hf_hub_download: writes the file it was asked for,
+        checking the PREPARING flag is up while it runs."""
+        def run(*argv, **kwargs):
+            calls.append([str(a) for a in argv])
+            if preparing is not None:
+                assert preparing.exists(), "the download runs inside the PREPARING window"
+            if fail:
+                raise pod.subprocess.CalledProcessError(1, argv)
+            repo, folder, name = argv[-3:]
+            target = Path(folder) / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"GGUF projector")
+        return run
+
+    def boot(self, d, env, calls, fail=False, first=False):
+        """prepare() on the volume at d; what it printed. `first`: the volume is not prepared,
+        and _prepare stands in for the first boot's work, writing the ready record."""
+        flag = Path(d) / "preparing"
+        ready = json.loads((Path(d) / "ready.json").read_text())
+
+        def first_boot():
+            assert flag.exists(), "_prepare runs inside the PREPARING window"
+            (Path(d) / "ready.json").write_text(json.dumps(ready))
+        if first:
+            (Path(d) / "ready.json").unlink()
+        with patch.dict("os.environ", env), \
+                patch.object(pod, "_prepare", side_effect=first_boot if first
+                             else AssertionError("prepared again")), \
+                patch.object(pod, "hub_python", return_value=Path("/venv/bin/python")), \
+                patch.object(pod, "run", side_effect=self.fake_download(calls, fail, flag)), \
+                patch.object(pod, "PREPARING", flag), \
+                patch("sys.stdout", io.StringIO()) as out:
+            pod.prepare()
+        self.assertFalse(flag.exists())
+        return out.getvalue()
+
+    def test_a_prepared_volume_gains_only_the_projector_once(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            env = self.volume(d)
+            out = self.boot(d, env, calls) + self.boot(d, env, calls)
+            with patch.dict("os.environ", env):
+                record = pod.vision_record()
+            self.assertEqual(len(calls), 1, calls)
+            self.assertEqual(calls[0][-3:], ["org/M-GGUF", str(Path(d) / "vision"), VISION["file"]])
+            self.assertEqual(record["mmproj"], str(Path(d) / "vision" / VISION["file"]))
+            self.assertEqual(record["bytes"], len(b"GGUF projector"))
+            self.assertEqual(out.count("RPCTL_PHASE fetching the vision projector\n"), 1, out)
+            self.assertIn("RPCTL_PHASE vision projector fetched", out)
+            # the model's folder and the ready record are untouched
+            self.assertFalse((Path(d) / "model").exists())
+            # another projector: fetched into an emptied folder
+            self.boot(d, dict(env, STRATA_MMPROJ="mmproj/other.gguf"), calls)
+            self.assertEqual(len(calls), 2)
+            self.assertFalse((Path(d) / "vision" / VISION["file"]).exists())
+            self.assertTrue((Path(d) / "vision" / "mmproj" / "other.gguf").exists())
+
+    def test_a_first_boot_prepares_then_fetches_in_one_window(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            env = self.volume(d)
+            out = self.boot(d, env, calls, first=True)
+            self.assertIn("RPCTL_PHASE preparing the volume (first boot)", out)
+            self.assertEqual(len(calls), 1)
+
+    def test_a_projector_that_will_not_come_is_tried_three_boots(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            env = self.volume(d)
+            run_config = Path(d) / "container" / "strata-run.json"
+            outs = [self.boot(d, env, calls, fail=True) for _ in range(4)]
+            self.assertIn("RPCTL_PHASE vision projector not fetched (CalledProcessError); "
+                          "images are off this boot", outs[0])
+            self.assertEqual(len(calls), 3)
+            self.assertNotIn("not asked again", outs[1])
+            for out in outs[2:]:
+                self.assertIn("RPCTL_PHASE vision projector not fetched 3 boots running; not asked "
+                              "again until STRATA_MMPROJ or MODEL_REPO changes", out)
+            self.assertNotIn("fetching", outs[3])
+            with patch.dict("os.environ", env), patch.object(pod, "RUN_CONFIG", run_config), \
+                    patch("sys.stdout", io.StringIO()):
+                self.assertIsNone(pod.vision_record())
+                self.assertFalse(pod.projector_wanted())
+                pod.config()
+            self.assertNotIn("vision", json.loads(run_config.read_text()))
+            # another file is tried again, and a fetch that comes clears the count
+            self.boot(d, dict(env, STRATA_MMPROJ="mmproj/other.gguf"), calls)
+            self.assertEqual(len(calls), 4)
+            with patch.dict("os.environ", dict(env, STRATA_MMPROJ="mmproj/other.gguf")):
+                self.assertNotIn("failures", pod.vision_record())
+
+    def test_config_writes_the_section_and_its_first_line_stays_the_servers(self):
+        with tempfile.TemporaryDirectory() as d:
+            env = self.volume(d)
+            run_config = Path(d) / "container" / "strata-run.json"
+            self.boot(d, env, [])
+            for engine_has_it in (True, False):
+                if not engine_has_it:
+                    (Path(d) / "release" / "engine" / "strata-vision").unlink()
+                    out = self.boot(d, env, [])
+                    self.assertIn("RPCTL_PHASE no strata-vision next to the engine; "
+                                  "images are off this boot", out)
+                with patch.dict("os.environ", env), patch.object(pod, "RUN_CONFIG", run_config), \
+                        patch("sys.stdout", io.StringIO()) as out:
+                    pod.config()
+                cfg = json.loads(run_config.read_text())
+                self.assertEqual(len(out.getvalue().splitlines()), 1)
+                self.assertEqual(out.getvalue().split()[1],
+                                 "/v/release/0.2.16/control/serve/server.py")
+                self.assertEqual("vision" in cfg, engine_has_it)
+                self.assertEqual("--vision" in cfg["args"], engine_has_it)
+            # STRATA_MMPROJ emptied: the record is not this boot's, nothing is fetched
+            with patch.dict("os.environ", dict(env, STRATA_MMPROJ="")):
+                self.assertIsNone(pod.vision_record())
+                self.assertFalse(pod.projector_wanted())
+
+    def test_the_venv_is_reused_without_pip_when_it_has_the_hub(self):
+        with tempfile.TemporaryDirectory() as d:
+            python = Path(d) / "venv" / "bin" / "python"
+            python.parent.mkdir(parents=True)
+            python.symlink_to(sys.executable)
+            with patch.dict("os.environ", {"STRATA_ROOT": d}), \
+                    patch.object(pod, "hub_venv", side_effect=AssertionError("pip")), \
+                    patch.object(pod.subprocess, "run",
+                                 return_value=pod.subprocess.CompletedProcess([], 0)):
+                self.assertEqual(pod.hub_python(), python)
+            with patch.dict("os.environ", {"STRATA_ROOT": d}), \
+                    patch.object(pod, "hub_venv", return_value=Path(d) / "venv"), \
+                    patch.object(pod.subprocess, "run",
+                                 return_value=pod.subprocess.CompletedProcess([], 1)):
+                self.assertEqual(pod.hub_python(), python)
+
 if __name__ == "__main__":
     unittest.main()

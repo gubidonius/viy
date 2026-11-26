@@ -49,13 +49,13 @@ impl EngineName {
     }
 
     /// Whether the profile's server reads images (kb d191): vLLM's does
-    /// (`--limit-mm-per-prompt`); Strata's needs a vision section in its run
-    /// settings, which viy does not write yet (WP 9.49, kb f194).
+    /// (`--limit-mm-per-prompt`); Strata's with the model's vision projector
+    /// (STRATA_MMPROJ), which its pod fetches and writes a vision section
+    /// for (kb f193, f194).
     pub fn reads_images(self, cfg: &Config) -> bool {
-        let _ = cfg;
         match self {
             Self::Vllm => true,
-            Self::Strata => false,
+            Self::Strata => !cfg.get("STRATA_MMPROJ").unwrap_or("").trim().is_empty(),
         }
     }
 }

@@ -13,7 +13,7 @@ pub const STAGES: [(&str, &str, &str); 4] = [
     ("pull", "GPU allocation + image pull", "=== boot "),
     (
         "prepare",
-        "boot script (first boot: release, model, pack)",
+        "boot script (first boot: release, model, pack; vision projector)",
         "RPCTL_PHASE starting Strata",
     ),
     ("experts", "experts to RAM", "[strata] experts loaded:"),
@@ -29,8 +29,9 @@ pub fn hint(key: &str) -> &'static str {
              runpod/pytorch image (kb d172)"
         }
         "prepare" => {
-            "the first boot prepares the volume (release, model, pack); on a later boot \
-             something in the boot script ran in the foreground"
+            "the first boot prepares the volume (release, model, pack), and the first with \
+             STRATA_MMPROJ fetches the vision projector; on a later boot something in the \
+             boot script ran in the foreground"
         }
         "experts" => {
             "network-volume read of the experts; STRATA_PLE_IO=ram reads the n-gram table here too"

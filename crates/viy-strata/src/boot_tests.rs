@@ -78,6 +78,8 @@ fn the_settings_are_exported_before_the_script() {
         "export STRATA_VRAM_RESERVE_MIB=1536",
         "export STRATA_KV=int8",
         "export STRATA_HUGE_PAGES=off",
+        "export STRATA_MMPROJ=''",
+        "export STRATA_VISION_ELASTIC=1",
         "export STRATA_HOST=127.0.0.1",
         "export RPCTL_PORT=8000",
         "export RPCTL_CACHE_DIR=/workspace/rpctl-cache",
@@ -165,9 +167,56 @@ fn bad_settings_are_refused_before_a_pod_is_made() {
             "lots",
             r#"MIN_RAM_GB must be a whole number, not "lots""#,
         ),
+        (
+            "STRATA_VISION_ELASTIC",
+            "yes",
+            r#"STRATA_VISION_ELASTIC must be 0 or 1, not "yes""#,
+        ),
     ] {
         let error = build_pod_body(&with([(key, value)]), "k", "v", None).unwrap_err();
         assert_eq!(error.to_string(), said, "{key}");
+    }
+}
+
+/// STRATA_MMPROJ (kb d191, WP 9.49): a GGUF file inside MODEL_REPO, which
+/// the pod downloads into a folder of its own, or empty for no images.
+#[test]
+fn the_projector_is_a_gguf_file_inside_the_repo() {
+    let exported = |value: &str| {
+        let script = build_boot_script(&with([("STRATA_MMPROJ", value)])).unwrap();
+        script
+            .lines()
+            .find_map(|l| l.strip_prefix("export STRATA_MMPROJ="))
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        exported(" mmproj/mmproj-Qwen3.8-Flash-Next-heretic-2-BF16.gguf "),
+        "mmproj/mmproj-Qwen3.8-Flash-Next-heretic-2-BF16.gguf"
+    );
+    assert_eq!(exported("mmproj.gguf"), "mmproj.gguf");
+    assert_eq!(exported("mmproj/M-MMPROJ.GGUF"), "mmproj/M-MMPROJ.GGUF");
+    assert_eq!(exported(""), "''");
+    for value in [
+        "/etc/mmproj.gguf",
+        "../mmproj.gguf",
+        "mmproj/../../x.gguf",
+        "mmproj/./x.gguf",
+        "mmproj//x.gguf",
+        "mmproj\\x.gguf",
+        "mmproj/x.gguf\nexport X=1",
+        "mmproj/",
+        "mmproj/x.safetensors",
+    ] {
+        let error = build_boot_script(&with([("STRATA_MMPROJ", value)])).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "STRATA_MMPROJ must be a .gguf file of MODEL_REPO, as a path inside it, or \
+                 empty, not {value:?}"
+            ),
+            "{value:?}"
+        );
     }
 }
 
@@ -228,7 +277,7 @@ fn strata_pod_passes_its_tests() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("Ran 44 tests"), "{stderr}");
+    assert!(stderr.contains("Ran 53 tests"), "{stderr}");
 }
 
 /// The body's keys in order, held apart from the code that writes them

@@ -178,7 +178,7 @@ impl Turns for NoImages {
     }
 
     fn images_refused(&self) -> Option<String> {
-        Some("not sent: Strata on this profile reads no images yet".into())
+        Some("not sent: Strata reads no images on this profile (STRATA_MMPROJ is empty)".into())
     }
 }
 
@@ -220,7 +220,8 @@ async fn a_line_whose_images_cannot_go_comes_back_with_them() {
         [EventMsg::TurnRefused(TurnRefusedEvent {
             text: "look".into(),
             images: good.clone(),
-            message: "not sent: Strata on this profile reads no images yet".into(),
+            message: "not sent: Strata reads no images on this profile (STRATA_MMPROJ is empty)"
+                .into(),
         })]
     );
     let bad = vec![

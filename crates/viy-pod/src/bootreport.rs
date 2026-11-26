@@ -69,12 +69,13 @@ pub const BOOT_KEYS: [&str; 26] = [
 ];
 
 /// The config keys a Strata boot's record keeps. No secrets.
-pub const STRATA_BOOT_KEYS: [&str; 24] = [
+pub const STRATA_BOOT_KEYS: [&str; 26] = [
     "ENGINE",
     "STRATA_IMAGE",
     "MODEL_REPO",
     "MODEL_FILES",
     "STRATA_YARN_ORIG_CTX",
+    "STRATA_MMPROJ",
     "MAX_MODEL_LEN",
     "STRATA_PARALLEL",
     "STRATA_BATCH_MTP",
@@ -83,6 +84,7 @@ pub const STRATA_BOOT_KEYS: [&str; 24] = [
     "STRATA_VRAM_RESERVE_MIB",
     "STRATA_KV",
     "STRATA_HUGE_PAGES",
+    "STRATA_VISION_ELASTIC",
     "MIN_RAM_GB",
     "GPU_TYPE_IDS",
     "GPU_TYPE_PRIORITY",

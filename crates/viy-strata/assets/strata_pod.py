@@ -1,6 +1,7 @@
 """viy's helper on a Strata pod (docs/strata-engine.md 4.3), standard library only.
 
-    python3 strata_pod.py prepare   first boot: Strata's release, the model, its pack, draft head
+    python3 strata_pod.py prepare   first boot: Strata's release, the model, its pack, draft head;
+                                    the first with STRATA_MMPROJ: the vision projector
     python3 strata_pod.py config    Strata's run settings, from the environment, every boot
     python3 strata_pod.py watch     the idle watchdog, then ready, then the table's warm read
 
@@ -11,6 +12,7 @@ the watchdog's limits and keys. The volume, at STRATA_ROOT:
     model/                              MODEL_REPO's files (MODEL_FILES)
     pack/, mtp/                         Strata's pack of the model and its draft head
     ready.json                          what the first boot prepared; its absence starts one
+    vision/, vision.json                the vision projector (STRATA_MMPROJ) and its record
 
 The run settings hold the server's API key, so `config` writes them to the container
 (/run/strata-run.json), never to the volume, as vLLM keeps its key in the pod's env alone.
@@ -52,6 +54,12 @@ RUN_CONFIG = Path("/run/strata-run.json")
 # activity for at most PREPARE_GRACE_S from its creation (the hard cap still applies).
 PREPARING = Path("/run/strata-preparing")
 PREPARE_GRACE_S = 2 * 3600
+# Image tokens a picture may become: Strata's setup writes this for a GPU reader
+# (setup.VISION["gpu"]["max_tokens"], v0.2.16).
+VISION_TOKENS = 1024
+# Boots that try a projector that will not come (a typo, a file not in the repo) before the
+# helper stops asking: each try costs a boot a few seconds.
+PROJECTOR_TRIES = 3
 
 
 def phase(message):
@@ -241,17 +249,36 @@ def run(*argv, **kwargs):
     subprocess.run([str(a) for a in argv], check=True, **kwargs)
 
 
+def hub_venv():
+    """The volume's venv with huggingface_hub, made once."""
+    venv = root() / "venv"
+    if not (venv / "bin" / "python").exists():
+        run(sys.executable, "-m", "venv", venv)
+    run(venv / "bin" / "pip", "install", "-q", HF_HUB)
+    return venv
+
+
 def prepare():
     """First boot, or a new release or model: everything Strata needs, onto the volume, the
-    ready record last. A boot whose volume is ready returns at once."""
-    if prepared():
-        return
-    phase("preparing the volume (first boot)")
-    PREPARING.touch()
-    try:
-        _prepare()
-    finally:
-        PREPARING.unlink(missing_ok=True)
+    ready record last; then the vision projector when it is wanted and not there. One
+    PREPARING window for both, so the watchdog's grace starts once a boot. A boot whose volume
+    is ready and has its projector returns at once."""
+    ready = prepared()
+    if not ready or projector_wanted():
+        PREPARING.touch()
+        try:
+            if not ready:
+                phase("preparing the volume (first boot)")
+                _prepare()
+            projector()
+        finally:
+            PREPARING.unlink(missing_ok=True)
+    ready = prepared()
+    if ready and projector_file() and not vision_record() and not projector_wanted():
+        phase(f"vision projector not fetched {PROJECTOR_TRIES} boots running; not asked again "
+              "until STRATA_MMPROJ or MODEL_REPO changes or vision.json is deleted; images are off")
+    elif ready and vision_record() and not vision_exe(ready).is_file():
+        phase("no strata-vision next to the engine; images are off this boot")
 
 
 def _prepare():
@@ -265,10 +292,7 @@ def _prepare():
     py = rel / "control" / "python" / "bin" / "python3"
     control = rel / "control"
 
-    venv = root() / "venv"
-    if not (venv / "bin" / "python").exists():
-        run(sys.executable, "-m", "venv", venv)
-    run(venv / "bin" / "pip", "install", "-q", HF_HUB)
+    venv = hub_venv()
     repo, files = env("RPCTL_MODEL_REPO"), os.environ.get("STRATA_MODEL_FILES", "")
     model = model_folder(root() / "model", repo, files)
     patterns = file_patterns(files)
@@ -303,11 +327,98 @@ def _prepare():
     phase(f"volume prepared ({ready['prepared_s']:.0f} s)")
 
 
+def projector_file(environ=os.environ):
+    """STRATA_MMPROJ: the vision projector, a file of MODEL_REPO; "" for none. One that would
+    leave the download folder is none (the client refuses it before a pod is made)."""
+    name = (environ.get("STRATA_MMPROJ") or "").strip()
+    if name.startswith("/") or "\\" in name or ".." in Path(name).parts:
+        return ""
+    return name
+
+
+def vision_json():
+    """vision.json when it is this boot's projector's (repo and file), else None."""
+    name = projector_file()
+    if not name:
+        return None
+    try:
+        record = json.loads((root() / "vision.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(record, dict) or record.get("repo") != env("RPCTL_MODEL_REPO")
+            or record.get("file") != name):
+        return None
+    return record
+
+
+def vision_record():
+    """The projector's record when it is this boot's and its file is there, else None."""
+    record = vision_json()
+    if record and record.get("mmproj") and Path(record["mmproj"]).is_file():
+        return record
+    return None
+
+
+def projector_wanted():
+    """Whether this boot should fetch the projector: one is named, it is not there, and it has
+    not failed PROJECTOR_TRIES boots running."""
+    if not projector_file() or vision_record():
+        return False
+    return int((vision_json() or {}).get("failures") or 0) < PROJECTOR_TRIES
+
+
+def vision_exe(ready):
+    """The release's image encoder, next to the engine."""
+    return Path(ready["engine"]).parent / "strata-vision"
+
+
+def hub_python():
+    """The volume venv's python for a download after the first boot: pip only when the venv
+    lacks huggingface_hub."""
+    python = root() / "venv" / "bin" / "python"
+    if python.exists() and subprocess.run([str(python), "-c", "import huggingface_hub"],
+                                          capture_output=True).returncode == 0:
+        return python
+    return hub_venv() / "bin" / "python"
+
+
+def projector():
+    """STRATA_MMPROJ into vision/, apart from model/: model_folder empties model/ when
+    MODEL_FILES changes, and the projector must not make the model be fetched and packed
+    again. Once per volume and file, a cut download resuming. A failure leaves images off
+    for this boot and does not stop it; after PROJECTOR_TRIES of them in a row the helper
+    stops asking until STRATA_MMPROJ or MODEL_REPO changes, or vision.json is deleted."""
+    if not projector_wanted():
+        return
+    name, repo = projector_file(), env("RPCTL_MODEL_REPO")
+    failures = int((vision_json() or {}).get("failures") or 0)
+    phase("fetching the vision projector")
+    t0 = time.time()
+    try:
+        folder = model_folder(root() / "vision", repo, name)
+        run(hub_python(), "-c",
+            "import sys; from huggingface_hub import hf_hub_download; "
+            "hf_hub_download(sys.argv[1], sys.argv[3], local_dir=sys.argv[2])",
+            repo, folder, name)
+        mmproj = folder / name
+        if not mmproj.is_file():
+            raise OSError(f"{mmproj} is not there after the download")
+        fetched = round(time.time() - t0, 1)
+        atomic_json(root() / "vision.json", {"repo": repo, "file": name, "mmproj": str(mmproj),
+                                             "bytes": mmproj.stat().st_size, "fetched_s": fetched})
+        phase(f"vision projector fetched ({fetched:.0f} s)")
+    except (subprocess.CalledProcessError, OSError) as error:
+        atomic_json(root() / "vision.json", {"repo": repo, "file": name, "mmproj": None,
+                                             "failures": failures + 1})
+        phase(f"vision projector not fetched ({type(error).__name__}); images are off this boot")
+
+
 # ------------------------------------------------------------------ every boot
 
-def settings(ready, environ=os.environ):
-    """Strata's run settings for server.py --config, from the ready record and the
-    environment. The client checked every value before the pod was made (viy-strata)."""
+def settings(ready, environ=os.environ, vision=None):
+    """Strata's run settings for server.py --config, from the ready record, the projector's
+    record (`vision`, None: no images) and the environment. The client checked every value
+    before the pod was made (viy-strata)."""
     get = environ.get
     parallel = int(get("STRATA_PARALLEL") or 1)
     ple_io = get("STRATA_PLE_IO") or "mmap"
@@ -337,6 +448,8 @@ def settings(ready, environ=os.environ):
     if 0 < original_context < max_context:
         args += ["--rope-scaling", "yarn", "--rope-scale", f"{max_context / original_context:.12g}",
                  "--yarn-orig-ctx", str(original_context)]
+    if vision:
+        args.append("--vision")
     cfg = {"exe": ready["engine"], "args": args, "cwd": str(Path(ready["pack"]).parent),
            "tokenizer": str(Path(ready["pack"]) / "tokenizer"),
            "model_name": get("STRATA_MODEL_NAME") or "model",
@@ -350,6 +463,18 @@ def settings(ready, environ=os.environ):
         # the expert arena without transparent huge pages, whose compaction can stall
         # the load on a host short of free 2 MiB blocks (Strata #2126).
         cfg["env"] = {"STRATA_NO_ARENA_THP": "1"}
+    if vision:
+        # The section Strata's setup writes (setup.py, v0.2.16): the release's encoder, the
+        # projector, the text model opened vocab-only, on the GPU. Elastic, the encoder starts
+        # with the first picture and stops after 120 s without one, the expert cache making its
+        # room (vram_elastic); Strata picks that itself only without batch slots. Not elastic,
+        # it loads with the model and keeps its VRAM.
+        elastic = get("STRATA_VISION_ELASTIC") != "0"
+        cfg["vision"] = {"exe": str(vision_exe(ready)),
+                         "mmproj": vision["mmproj"], "model": ready["trunk"], "gpu": True,
+                         "max_tokens": VISION_TOKENS, "elastic": elastic}
+        if elastic:
+            cfg["vram_elastic"] = True
     return cfg
 
 
@@ -357,7 +482,11 @@ def config():
     ready = prepared()
     if not ready:
         raise SystemExit("strata_pod: the volume is not prepared (prepare first)")
-    atomic_json(RUN_CONFIG, settings(ready))
+    # prepare said so when the encoder is missing; stdout's first line is the boot script's
+    vision = vision_record()
+    if vision and not vision_exe(ready).is_file():
+        vision = None
+    atomic_json(RUN_CONFIG, settings(ready, vision=vision))
     # for the boot script: Strata's Python and its server
     print(f"{ready['control']}/python/bin/python3 {ready['control']}/serve/server.py")
 

@@ -170,6 +170,8 @@ pub struct Chat {
     /// The system prompt's date, fixed at the chat's start.
     today: String,
     max_model_len: u64,
+    /// Whether the server said, when last probed, that it reads images.
+    server_images: Option<bool>,
     /// Whether this server was asked for its context length.
     discovered: bool,
     estimator: Estimator,
@@ -413,6 +415,7 @@ impl Chat {
             earlier: Vec::new(),
             today,
             max_model_len: max_model_len(cfg),
+            server_images: None,
             discovered: false,
             estimator: Estimator::default(),
             auto_compact: on("AUTO_COMPACT", "1"),
@@ -499,16 +502,24 @@ impl Chat {
     }
 
     /// Why this chat's model is sent no images (kb d191): a pod whose
-    /// engine reads none on this profile. A local vLLM reads them, and an
-    /// OpenAI-compatible address answers for itself.
+    /// engine reads none on this profile, or whose server said it started
+    /// without its image encoder (a projector that was not fetched, a pod
+    /// booted before STRATA_MMPROJ was set). A local vLLM reads them, and
+    /// an OpenAI-compatible address answers for itself.
     pub fn images_refused(&self) -> Option<String> {
         if self.endpoint.backend != "runpod" {
             return None;
         }
         let engine = viy_engine::EngineName::resolve(&self.cfg).ok()?;
-        (!engine.reads_images(&self.cfg)).then(|| {
+        if !engine.reads_images(&self.cfg) {
+            return Some(format!(
+                "not sent: {} reads no images on this profile (STRATA_MMPROJ is empty)",
+                engine.label()
+            ));
+        }
+        (self.server_images == Some(false)).then(|| {
             format!(
-                "not sent: {} on this profile reads no images yet",
+                "not sent: this pod's {} started without its image encoder (viy logs says why)",
                 engine.label()
             )
         })
@@ -1204,6 +1215,7 @@ impl Chat {
         if let Some(window) = ready.context_window {
             self.max_model_len = window;
         }
+        self.server_images = ready.images;
         self.refresh_gauge_limits(ctx);
     }
 

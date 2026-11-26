@@ -65,6 +65,15 @@ fn rig(
     state: Option<Value>,
     answer: impl Fn(&viy_http::Request) -> Reply + Send + Sync + 'static,
 ) -> Rig {
+    rig_with(&[], state, answer)
+}
+
+/// [`rig`] with `over` set in the config.
+fn rig_with(
+    over: &[(&str, &str)],
+    state: Option<Value>,
+    answer: impl Fn(&viy_http::Request) -> Reply + Send + Sync + 'static,
+) -> Rig {
     let dir = ScratchDir::new("pod-server").unwrap();
     let paths = Paths::under(dir.path().join("home"));
     if let Some(state) = state {
@@ -72,7 +81,10 @@ fn rig(
     }
     let project = dir.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    let cfg = config();
+    let mut cfg = config();
+    for (key, value) in over {
+        cfg.set(key, value);
+    }
     // RunPod scripted in v1, as rpctl's tests have it (kb d151).
     let api = Arc::new(V1::new(Arc::new(RouteHttp::new(answer))));
     let http: Arc<dyn HttpClient> = api.clone();
@@ -754,4 +766,62 @@ fn rig_down() -> Rig {
         }
         no_runpod(r)
     })
+}
+
+/// A Strata pod's /health says whether it started with its image encoder
+/// (kb d191, WP 9.49): with STRATA_MMPROJ set, a line with an image goes
+/// to a pod that reads images and is given back, saying why, by one that
+/// started without (a projector not fetched, a pod older than the key).
+#[tokio::test(start_paused = true)]
+async fn a_strata_pod_without_its_image_encoder_gets_no_image() {
+    const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    for (images, said) in [
+        (
+            false,
+            Some(
+                "not sent: this pod's Strata started without its image encoder (viy logs says why)",
+            ),
+        ),
+        (true, None),
+    ] {
+        let mut state = tracked();
+        state["engine"] = json!("strata");
+        let mut rig = rig_with(
+            &[
+                ("ENGINE", "strata"),
+                ("STRATA_MMPROJ", "mmproj/mmproj-M-BF16.gguf"),
+            ],
+            Some(state),
+            move |r| {
+                if r.url == format!("{PROXY}/health") {
+                    return json_reply(
+                        json!({"status": "ok", "loaded": true, "max_context": 131072, "images": images}),
+                    );
+                }
+                vllm(r).unwrap_or_else(|| no_runpod(r))
+            },
+        );
+        rig.pod_state(PodState::Ready).await;
+        let id = rig
+            .engine
+            .submit(Op::UserTurn {
+                text: "what is this [Image #1]".into(),
+                images: vec![viy_protocol::ImageInput::DataUrl { url: PIXEL.into() }],
+            })
+            .unwrap();
+        let events = rig
+            .until(|m| {
+                matches!(
+                    m,
+                    EventMsg::TurnRefused(_) | EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+                )
+            })
+            .await;
+        assert_eq!(events.last().unwrap().id, id);
+        assert_eq!(
+            refused(&events).map(|r| r.message).as_deref(),
+            said,
+            "images {images}: {events:#?}"
+        );
+    }
 }

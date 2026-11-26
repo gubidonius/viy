@@ -230,10 +230,16 @@ impl PodServer {
             .base_url(&self.env(paths), cfg, false, &report)
             .await
             .map_err(|e| e.to_string())?;
-        let ready = |base, context_window| Ready {
+        let ready = |base, health: Option<Value>| Ready {
             base,
             model: backend.model_name(cfg),
-            context_window,
+            context_window: health
+                .as_ref()
+                .and_then(|health| health["max_context"].as_u64())
+                .filter(|n| *n > 0),
+            images: health
+                .as_ref()
+                .and_then(|health| health["images"].as_bool()),
         };
         match backend {
             Backend::Openai => base
@@ -247,7 +253,9 @@ impl PodServer {
                     return Err("no pod is running: /up starts one.".into());
                 };
                 if let Some(response) = self.health(&base).await {
-                    let window = if cfg.get("ENGINE").map(str::trim) == Some("strata")
+                    // Strata's /health says its context and whether it reads
+                    // images; vLLM's is empty.
+                    let health = if cfg.get("ENGINE").map(str::trim) == Some("strata")
                         && response.status == 200
                     {
                         response
@@ -255,12 +263,10 @@ impl PodServer {
                             .await
                             .ok()
                             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                            .and_then(|health| health["max_context"].as_u64())
-                            .filter(|n| *n > 0)
                     } else {
                         None
                     };
-                    Ok(ready(base, window))
+                    Ok(ready(base, health))
                 } else {
                     Err("the pod is not answering: /status says why, /up brings it back.".into())
                 }
@@ -799,6 +805,7 @@ impl Server for PodServer {
                     base: base.trim_end_matches('/').to_string(),
                     model,
                     context_window: None,
+                    images: None,
                 });
             }
             let busy = self

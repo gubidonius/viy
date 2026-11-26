@@ -2750,6 +2750,7 @@ async fn context_updates_for_limit_changes_history_rewrites_and_a_reused_tunnel(
             base: d.mock.uri(),
             model: "m".into(),
             context_window: Some(131072),
+            images: None,
         },
     );
     assert_eq!(
@@ -2889,11 +2890,20 @@ fn only_a_strata_pod_refuses_images() {
     assert_eq!(refused(&[]), None);
     assert_eq!(
         refused(&[("ENGINE", "strata")]).as_deref(),
-        Some("not sent: Strata on this profile reads no images yet")
+        Some("not sent: Strata reads no images on this profile (STRATA_MMPROJ is empty)")
     );
     assert_eq!(
         refused(&[("ENGINE", "strata"), ("BACKEND", "openai")]),
         None
     );
     assert_eq!(refused(&[("ENGINE", "strata"), ("BACKEND", "local")]), None);
+    // With the model's vision projector its pod reads them (WP 9.49).
+    assert_eq!(
+        refused(&[
+            ("ENGINE", "strata"),
+            ("STRATA_MMPROJ", "mmproj/mmproj-M-BF16.gguf")
+        ]),
+        None
+    );
+    assert!(refused(&[("ENGINE", "strata"), ("STRATA_MMPROJ", "  ")]).is_some());
 }

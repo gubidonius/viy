@@ -60,3 +60,16 @@ fn a_bad_number_names_its_key() {
         "GPU_COUNT must be a whole number, not \"two\""
     );
 }
+
+/// kb d191, WP 9.49: vLLM reads images; Strata with the model's vision
+/// projector only.
+#[test]
+fn strata_reads_images_with_its_projector() {
+    let mut cfg = Config::defaults();
+    assert!(EngineName::Vllm.reads_images(&cfg));
+    assert!(!EngineName::Strata.reads_images(&cfg));
+    cfg.set("STRATA_MMPROJ", " ");
+    assert!(!EngineName::Strata.reads_images(&cfg));
+    cfg.set("STRATA_MMPROJ", "mmproj/mmproj-M-BF16.gguf");
+    assert!(EngineName::Strata.reads_images(&cfg));
+}
