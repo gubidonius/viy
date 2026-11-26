@@ -190,6 +190,11 @@ struct Fake {
     log: Arc<Mutex<Vec<String>>>,
     native_fails: bool,
     held: Option<Arc<Mutex<std_mpsc::Receiver<()>>>>,
+    /// What Ctrl+V finds: a file list, a picture, and the text (the
+    /// default's when `None`).
+    files: Vec<PathBuf>,
+    picture: Option<Result<Picture, String>>,
+    text: Option<String>,
 }
 
 impl Fake {
@@ -221,12 +226,22 @@ impl Backend for Fake {
     fn get(&mut self, selection: Selection) -> Result<String, String> {
         self.wait();
         self.log.lock().unwrap().push(format!("get {selection:?}"));
-        Ok("pasted\ntext".into())
+        Ok(self.text.clone().unwrap_or_else(|| "pasted\ntext".into()))
     }
 
     fn tmux(&mut self, text: &str) -> Result<(), String> {
         self.log.lock().unwrap().push(format!("tmux {text}"));
         Ok(())
+    }
+
+    fn files(&mut self) -> Result<Vec<PathBuf>, String> {
+        self.log.lock().unwrap().push("files".into());
+        Ok(self.files.clone())
+    }
+
+    fn picture(&mut self) -> Result<Option<Picture>, String> {
+        self.log.lock().unwrap().push("picture".into());
+        self.picture.clone().transpose()
     }
 }
 
@@ -333,6 +348,142 @@ async fn a_read_brings_the_text_but_never_over_ssh() {
     let mut remote = clipboard(Place { ssh: true, ..LOCAL }, &fake);
     assert_eq!(remote.read(Selection::Clipboard), Err(Refused::Remote));
     assert_eq!(fake.log(), ["get Clipboard"]);
+}
+
+/// Ctrl+V (kb d191): the file list when every file is an image, else the
+/// picture as PNG, else the text; never over ssh.
+#[tokio::test]
+async fn ctrl_v_takes_image_files_then_the_picture_then_the_text() {
+    let dir = viy_testkit::scratch::ScratchDir::new("clipboard-paste").unwrap();
+    let png = dir.path().join("shot.png");
+    let picture = Picture {
+        width: 1,
+        height: 1,
+        rgba: vec![255, 0, 0, 255],
+    };
+    let url = crate::image_paste::png_data_url(1, 1, picture.rgba.clone()).unwrap();
+    std::fs::write(&png, {
+        use base64::Engine;
+        let encoded = url.strip_prefix("data:image/png;base64,").unwrap();
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap()
+    })
+    .unwrap();
+    let notes = dir.path().join("notes.txt");
+    std::fs::write(&notes, "words").unwrap();
+    let paste = |fake: Fake| async move {
+        let mut clip = clipboard(LOCAL, &fake);
+        let id = clip.paste().unwrap();
+        let done = clip.done().await;
+        assert_eq!(done.id(), id);
+        let Done::Paste { result, .. } = done else {
+            panic!("{done:?}")
+        };
+        (result, fake.log())
+    };
+
+    let files = Fake {
+        files: vec![png.clone(), png.clone()],
+        picture: Some(Ok(picture.clone())),
+        ..Fake::default()
+    };
+    let file = ImageInput::File { path: png.clone() };
+    // The images bring the text beside them, for where none can attach.
+    assert_eq!(
+        paste(files).await,
+        (
+            Ok(Pasted::Images {
+                images: vec![file.clone(), file],
+                text: "pasted\ntext".into()
+            }),
+            vec!["files".to_string(), "get Clipboard".to_string()]
+        )
+    );
+    // A file that is no image: the picture instead.
+    let mixed = Fake {
+        files: vec![png.clone(), notes],
+        picture: Some(Ok(picture)),
+        text: Some(String::new()),
+        ..Fake::default()
+    };
+    assert_eq!(
+        paste(mixed).await,
+        (
+            Ok(Pasted::Images {
+                images: vec![ImageInput::DataUrl { url }],
+                text: String::new()
+            }),
+            vec![
+                "files".to_string(),
+                "picture".to_string(),
+                "get Clipboard".to_string()
+            ]
+        )
+    );
+    assert_eq!(
+        paste(Fake::default()).await,
+        (
+            Ok(Pasted::Text("pasted\ntext".into())),
+            vec![
+                "files".to_string(),
+                "picture".to_string(),
+                "get Clipboard".to_string()
+            ]
+        )
+    );
+    // A picture that could not be read: the text, and said only when
+    // there is none.
+    let broken = Fake {
+        picture: Some(Err("could not read the clipboard's image: bad".into())),
+        ..Fake::default()
+    };
+    assert_eq!(
+        paste(broken.clone()).await.0,
+        Ok(Pasted::Text("pasted\ntext".into()))
+    );
+    let empty = Fake {
+        text: Some(String::new()),
+        ..broken
+    };
+    assert_eq!(
+        paste(empty).await.0,
+        Err("could not read the clipboard's image: bad".into())
+    );
+    // One that reads but cannot be encoded (its size and its bytes do not
+    // agree): the text likewise.
+    let unencoded = Fake {
+        picture: Some(Ok(Picture {
+            width: 2,
+            height: 2,
+            rgba: vec![0; 4],
+        })),
+        ..Fake::default()
+    };
+    assert_eq!(
+        paste(unencoded).await.0,
+        Ok(Pasted::Text("pasted\ntext".into()))
+    );
+    let mut remote = clipboard(Place { ssh: true, ..LOCAL }, &Fake::default());
+    assert_eq!(remote.paste(), Err(Refused::Remote));
+}
+
+/// arboard splits a `text/uri-list` on `\n` only; GTK's lines end in
+/// `\r\n` (Nautilus's copy).
+#[test]
+fn a_uri_lists_carriage_returns_are_taken_off() {
+    assert_eq!(
+        uri_list_paths(vec![
+            PathBuf::from("/home/u/a.png\r"),
+            PathBuf::from("/home/u/b c.png"),
+            PathBuf::from("\r"),
+            PathBuf::from(""),
+        ]),
+        [
+            PathBuf::from("/home/u/a.png"),
+            PathBuf::from("/home/u/b c.png")
+        ]
+    );
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]

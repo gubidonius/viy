@@ -13,6 +13,7 @@ pub mod footer;
 pub mod frame;
 pub mod header;
 pub mod history;
+pub mod image_paste;
 pub mod latex;
 pub mod markdown;
 pub mod palette;

@@ -542,6 +542,151 @@ fn on_a_private_x_display_ctrl_v_pastes_and_a_drag_copies() {
     let _ = xvfb.wait();
 }
 
+/// A 1x1 PNG, base64.
+const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+/// The image URLs of the last user message of the first streamed request
+/// `mock` saw.
+fn sent_images(mock: &MockLlm) -> Vec<String> {
+    let user = mock
+        .requests()
+        .iter()
+        .filter_map(|r| r.body.as_ref())
+        .find(|b| b["stream"] == Value::Bool(true))
+        .and_then(|b| b["messages"].as_array().cloned())
+        .and_then(|m| m.iter().rev().find(|m| m["role"] == "user").cloned())
+        .unwrap_or_default();
+    user["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["image_url"]["url"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// A file dropped on the terminal (a bracketed paste of its quoted path,
+/// as GNOME Terminal sends it) attaches as `[Image #1]`, and Enter sends
+/// the image with the text, byte for byte (kb d191, WP 9.48).
+#[test]
+fn a_dropped_image_file_goes_with_the_message() {
+    use base64::Engine;
+    let mock = one_turn("the answer");
+    let dir = ScratchDir::new("ui-drop").unwrap();
+    let shot = dir.path().join("my shot.png");
+    std::fs::write(
+        &shot,
+        base64::engine::general_purpose::STANDARD
+            .decode(PIXEL_PNG)
+            .unwrap(),
+    )
+    .unwrap();
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = open_chat(&pty, &mock, dir.path());
+    pty.send(format!("\x1b[200~'{}' \x1b[201~", shot.display()).as_bytes())
+        .unwrap();
+    pty.wait_for("the placeholder", |s| s.contents().contains("› [Image #1]"));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    send_and_answer(&pty, &mock, b"what is it");
+    assert_eq!(sent_parts(&mock), ["[Image #1] what is it"]);
+    assert_eq!(
+        sent_images(&mock),
+        [format!("data:image/png;base64,{PIXEL_PNG}")]
+    );
+    close(&pty, child);
+}
+
+/// By hand, with Xvfb and xclip, on a private X display (`:97`): a
+/// picture on that display's clipboard (`xclip -t image/png`), with no
+/// text beside it, attaches on Ctrl+V and goes with the message as PNG;
+/// then a file manager's copy (`text/uri-list`, its lines ending in
+/// `\r\n` as GTK writes them) attaches the file (kb d191, WP 9.48).
+#[test]
+#[ignore = "needs Xvfb and xclip"]
+fn on_a_private_x_display_ctrl_v_attaches_the_clipboards_picture() {
+    use base64::Engine;
+    use std::process::Stdio;
+    let display = ":97";
+    let mut xvfb = Command::new("Xvfb")
+        .args([display, "-nolisten", "tcp"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let dir = ScratchDir::new("ui-x11-picture").unwrap();
+    let pixel = dir.path().join("pixel.png");
+    std::fs::write(
+        &pixel,
+        base64::engine::general_purpose::STANDARD
+            .decode(PIXEL_PNG)
+            .unwrap(),
+    )
+    .unwrap();
+    let put = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "image/png", "-i"])
+        .arg(&pixel)
+        .env("DISPLAY", display)
+        .status()
+        .unwrap();
+    assert!(put.success());
+
+    let mock = one_turn("the answer");
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = pty
+        .spawn(
+            Command::new(env!("CARGO_BIN_EXE_viy"))
+                .args(["dev", "chat", "--url", &mock.uri(), "--dir"])
+                .arg(dir.path())
+                .env("VLLM_API_KEY", "fake-key")
+                .env("DISPLAY", display)
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .env_remove("SSH_TTY")
+                .env_remove("SSH_CONNECTION"),
+        )
+        .unwrap();
+    pty.wait_for("the input box", |s| {
+        s.alternate_screen() && s.contents().contains("› ")
+    });
+    // Ctrl+V.
+    pty.send(b"\x16").unwrap();
+    pty.wait_for("the placeholder", |s| s.contents().contains("› [Image #1]"));
+    let mut list = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "text/uri-list"])
+        .env("DISPLAY", display)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(
+        &mut list.stdin.take().unwrap(),
+        format!("file://{}\r\n", pixel.display()).as_bytes(),
+    )
+    .unwrap();
+    list.wait().unwrap();
+    // Past the repeat guard.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    pty.send(b"\x16").unwrap();
+    pty.wait_for("the second placeholder", |s| {
+        s.contents().contains("› [Image #1][Image #2]")
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    send_and_answer(&pty, &mock, b" what is it");
+    assert_eq!(sent_parts(&mock), ["[Image #1][Image #2] what is it"]);
+    let images = sent_images(&mock);
+    assert_eq!(images.len(), 2, "{images:?}");
+    assert_eq!(images[1], format!("data:image/png;base64,{PIXEL_PNG}"));
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(images[0].strip_prefix("data:image/png;base64,").unwrap())
+        .unwrap();
+    assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"), "{png:?}");
+    close(&pty, child);
+    let _ = Command::new("kill")
+        .args(["-TERM", &xvfb.id().to_string()])
+        .status();
+    let _ = xvfb.wait();
+}
+
 #[test]
 fn context_footer_tracks_a_paused_stream_and_keeps_the_final_usage() {
     let mock = MockLlm::start(&json!({

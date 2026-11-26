@@ -19,7 +19,13 @@
 //! comes back to the UI, which writes it with its frames: only the
 //! renderer writes escape sequences (ui-plan 7), and this one is built
 //! here from constants, the text in base64.
+//!
+//! Ctrl+V asks for what the clipboard holds (kb d191): its file list
+//! when every file is an image, then its picture, then its text, all
+//! within one [`BUDGET`], the picture encoded as PNG on the clipboard's
+//! thread. A right-click and a middle-click read the text only.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
@@ -28,6 +34,7 @@ use base64::Engine;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
+use viy_protocol::ImageInput;
 
 /// How long the UI waits for one clipboard call (Codex's `SETUP_TIMEOUT`).
 pub const BUDGET: Duration = Duration::from_secs(5);
@@ -96,6 +103,23 @@ pub trait Backend: Send + 'static {
     fn get(&mut self, selection: Selection) -> Result<String, String>;
     /// Hands `text` to tmux's buffer and the attached terminal.
     fn tmux(&mut self, text: &str) -> Result<(), String>;
+    /// The files the clipboard holds (a file manager's copy); none when
+    /// it holds no list.
+    fn files(&mut self) -> Result<Vec<PathBuf>, String> {
+        Ok(Vec::new())
+    }
+    /// The clipboard's picture as RGBA, if it holds one.
+    fn picture(&mut self) -> Result<Option<Picture>, String> {
+        Ok(None)
+    }
+}
+
+/// A picture from the clipboard: `width` x `height`, four bytes a pixel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picture {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
 }
 
 /// The desktop's clipboard through arboard, one `Clipboard` kept for the
@@ -148,6 +172,91 @@ impl Backend for X11 {
     fn tmux(&mut self, text: &str) -> Result<(), String> {
         crate::tmux::copy(text)
     }
+
+    fn files(&mut self) -> Result<Vec<PathBuf>, String> {
+        use arboard::GetExtLinux;
+        match self
+            .clipboard()?
+            .get()
+            .clipboard(kind(Selection::Clipboard))
+            .file_list()
+        {
+            Ok(files) => Ok(uri_list_paths(files)),
+            Err(arboard::Error::ContentNotAvailable) => Ok(Vec::new()),
+            Err(e) => Err(format!("could not read the clipboard: {e}")),
+        }
+    }
+
+    fn picture(&mut self) -> Result<Option<Picture>, String> {
+        use arboard::GetExtLinux;
+        match self
+            .clipboard()?
+            .get()
+            .clipboard(kind(Selection::Clipboard))
+            .image()
+        {
+            Ok(image) => Ok(Some(Picture {
+                width: image.width,
+                height: image.height,
+                rgba: image.bytes.into_owned(),
+            })),
+            Err(arboard::Error::ContentNotAvailable) => Ok(None),
+            Err(e) => Err(format!("could not read the clipboard's image: {e}")),
+        }
+    }
+}
+
+/// What Ctrl+V found (Codex's `paste_image_to_temp_png`, then the text
+/// as its Windows fallback): the files when every one is an image, else
+/// the picture as a PNG data URL, else the text. Images bring the text
+/// too, for where none can attach. A picture that could not be read or
+/// encoded is said only when there is no text either.
+fn pasted(backend: &mut dyn Backend) -> Result<Pasted, String> {
+    let files = backend.files().unwrap_or_default();
+    let mut images = crate::image_paste::image_files(&files).map(|files| {
+        files
+            .into_iter()
+            .map(|path| ImageInput::File { path })
+            .collect::<Vec<_>>()
+    });
+    let mut unread = None;
+    if images.is_none() {
+        let url = backend.picture().and_then(|picture| {
+            picture
+                .map(|p| crate::image_paste::png_data_url(p.width, p.height, p.rgba))
+                .transpose()
+        });
+        match url {
+            Ok(url) => images = url.map(|url| vec![ImageInput::DataUrl { url }]),
+            Err(error) => unread = Some(error),
+        }
+    }
+    let text = match backend.get(Selection::Clipboard) {
+        Ok(text) => text,
+        // The images go without it.
+        Err(_) if images.is_some() => String::new(),
+        Err(error) => return Err(error),
+    };
+    match (images, unread) {
+        (Some(images), _) => Ok(Pasted::Images { images, text }),
+        (None, Some(error)) if text.is_empty() => Err(error),
+        (None, _) => Ok(Pasted::Text(text)),
+    }
+}
+
+/// The paths of a `text/uri-list` as arboard splits it, on `\n` only:
+/// the `\r` GTK ends each line with taken off, empty lines dropped.
+fn uri_list_paths(files: Vec<PathBuf>) -> Vec<PathBuf> {
+    files
+        .into_iter()
+        .filter_map(|path| match path.to_str() {
+            Some(line) => {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                (!line.is_empty()).then(|| PathBuf::from(line))
+            }
+            None => Some(path),
+        })
+        .collect()
 }
 
 /// Routes one copy (Codex's `copy_to_clipboard_with`): the desktop's
@@ -213,6 +322,20 @@ pub fn osc52(text: &str, tmux: bool) -> Result<String, String> {
 pub enum Ask {
     Copy,
     Read,
+    Paste,
+}
+
+/// What Ctrl+V brings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pasted {
+    /// Image files, or the clipboard's picture, and the text beside them
+    /// (empty when there is none).
+    Images {
+        images: Vec<ImageInput>,
+        text: String,
+    },
+    /// Text, empty when the clipboard holds none.
+    Text(String),
 }
 
 /// A request done, or given up on.
@@ -231,12 +354,16 @@ pub enum Done {
         id: u64,
         result: Result<String, String>,
     },
+    Paste {
+        id: u64,
+        result: Result<Pasted, String>,
+    },
 }
 
 impl Done {
     pub fn id(&self) -> u64 {
         match self {
-            Self::Copy { id, .. } | Self::Read { id, .. } => *id,
+            Self::Copy { id, .. } | Self::Read { id, .. } | Self::Paste { id, .. } => *id,
         }
     }
 
@@ -297,6 +424,9 @@ enum Request {
     Read {
         id: u64,
         selection: Selection,
+    },
+    Paste {
+        id: u64,
     },
 }
 
@@ -381,6 +511,15 @@ impl Clipboard {
         self.send(Ask::Read, 0, |id| Request::Read { id, selection })
     }
 
+    /// Ctrl+V: what the clipboard holds, images first ([`Pasted`]). Never
+    /// over ssh, as [`Clipboard::read`].
+    pub fn paste(&mut self) -> Result<u64, Refused> {
+        if self.place.ssh {
+            return Err(Refused::Remote);
+        }
+        self.send(Ask::Paste, 0, |id| Request::Paste { id })
+    }
+
     fn send(
         &mut self,
         ask: Ask,
@@ -451,6 +590,10 @@ impl Clipboard {
                             id,
                             result: backend.get(selection),
                         },
+                        Request::Paste { id } => Done::Paste {
+                            id,
+                            result: pasted(backend.as_mut()),
+                        },
                     };
                     if answers.send(done).is_err() {
                         break;
@@ -510,6 +653,10 @@ fn timed_out(pending: Pending) -> Done {
             terminal: None,
         },
         Ask::Read => Done::Read {
+            id: pending.id,
+            result: Err(error),
+        },
+        Ask::Paste => Done::Paste {
             id: pending.id,
             result: Err(error),
         },

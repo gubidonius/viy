@@ -744,6 +744,9 @@ mod repaint;
 #[path = "app_selection_tests.rs"]
 mod selection;
 
+#[path = "app_image_tests.rs"]
+mod images;
+
 /// Typing `/` opens the popup of commands above the input; Tab takes the
 /// choice, and its values follow.
 #[test]

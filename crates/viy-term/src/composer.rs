@@ -206,6 +206,23 @@ impl Composer {
         self.reconcile(0);
     }
 
+    /// Pasted images at the cursor, in place of the selection, a space
+    /// between them; with `space_after` (a dropped file, Codex's
+    /// image-path paste) one after the last too, so typing goes on there.
+    pub fn attach_pasted(&mut self, images: Vec<ImageInput>, space_after: bool) {
+        self.burst.clear();
+        let count = images.len();
+        for (i, image) in images.into_iter().enumerate() {
+            if i > 0 {
+                self.area.insert_str(" ");
+            }
+            self.attach(image);
+        }
+        if space_after && count > 0 {
+            self.area.insert_str(" ");
+        }
+    }
+
     /// A draft in the box in place of what it held: `/rewind`'s message
     /// and its images.
     pub fn set_draft(&mut self, text: &str, images: Vec<ImageInput>) {

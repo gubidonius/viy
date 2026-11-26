@@ -50,7 +50,8 @@ viy-vllm = { path = "crates/viy-vllm", version = "0.3.0" }
 # recorded as a fact (ROADMAP phase 0).
 # preserve_order: object keys keep their order, as in Python dicts (kb d011).
 # The chat's clipboard, Codex's crate and version (kb d150): X11 only, so
-# without the image data and the Wayland data-control backend.
+# without the Wayland data-control backend; viy-term turns on the image
+# data for Ctrl+V's picture (kb d191).
 arboard = { version = "3.6.1", default-features = false }
 # The endpoint key: Codex mints secrets with rand's OsRng and base64
 # (secrets/src/local.rs).
@@ -126,6 +127,8 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 # Graphemes, measured as ratatui measures them (Codex has it too).
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
+# A dropped file's `file://` URL (Codex's `normalize_pasted_path`).
+url = "2.5.8"
 vt100 = "0.16.2"
 
 # Codex's deny list (codex-rs/Cargo.toml at the commit in tests/codex-ref.txt).

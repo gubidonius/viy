@@ -16,18 +16,21 @@ doctest = false
 workspace = true
 
 [dependencies]
-arboard = { workspace = true }
+arboard = { workspace = true, features = ["image-data"] }
 base64 = { workspace = true }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 futures-core = { workspace = true }
+image = { workspace = true }
 libc = { workspace = true }
 pulldown-cmark = { workspace = true }
 ratatui = { workspace = true }
 serde_json = { workspace = true }
+shlex = { workspace = true }
 signal-hook = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "signal", "sync", "time"] }
 unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
+url = { workspace = true }
 viy-protocol = { workspace = true }
 
 [dev-dependencies]

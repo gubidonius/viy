@@ -64,6 +64,7 @@ use crate::cells::Running;
 use crate::cells::ToolCard;
 use crate::clipboard::Clipboard;
 use crate::clipboard::Done;
+use crate::clipboard::Pasted;
 use crate::composer::Action;
 use crate::composer::Composer;
 use crate::composer::POPUP_ROWS;
@@ -72,6 +73,7 @@ use crate::footer::Counts;
 use crate::footer::Status;
 use crate::frame::FrameLimiter;
 use crate::history::History;
+use crate::image_paste;
 use crate::markdown;
 use crate::markdown::Row;
 use crate::question::Questions;
@@ -230,6 +232,9 @@ pub struct App {
     /// The clipboard read a Ctrl+V, right-click or middle-click asked for;
     /// a key or a paste before it comes cancels it.
     pasting: Option<u64>,
+    /// Until when another Ctrl+V is the same one repeating (Codex's
+    /// `suppress_image_paste_until`).
+    paste_until: Option<Instant>,
     /// Where the input box's rows were drawn: the screen row of the first
     /// shown, which of its rows that is, and how many show.
     input_at: (u16, usize, usize),
@@ -241,6 +246,10 @@ pub struct App {
 
 /// How long the footer says what was copied.
 const COPIED_SHOWN: Duration = Duration::from_secs(4);
+/// A Ctrl+V within this of the last, no other key between, pastes
+/// nothing (Codex's `IMAGE_PASTE_REPEAT_WINDOW`): a key held down, or a
+/// terminal that sends it twice, pastes once.
+const PASTE_REPEAT: Duration = Duration::from_millis(250);
 
 /// The copy key while text is selected (Codex's `is_copy_key`): Ctrl+C,
 /// Super+C (Kitty's Cmd+C), Ctrl+Shift+C where the terminal passes it
@@ -273,6 +282,7 @@ impl App {
             copied: None,
             osc52: Vec::new(),
             pasting: None,
+            paste_until: None,
             input_at: (0, 0, 0),
             input_drag: false,
             input_click: None,
@@ -379,48 +389,102 @@ impl App {
 
     /// The clipboard answered. A copy: the footer says so, and one that
     /// went to the terminal is written with the next frame. A read: its
-    /// text goes in as a paste, unless something was typed since.
+    /// text goes in as a paste, unless something was typed since; Ctrl+V's
+    /// images attach.
     fn clipboard_done(&mut self, done: Done) {
-        match &done {
+        let notice = done.notice();
+        match done {
             Done::Copy {
                 result, terminal, ..
             } => {
-                self.osc52.extend(terminal.clone());
-                if let Some(notice) = done.notice() {
+                self.osc52.extend(terminal);
+                if let Some(notice) = notice {
                     self.copied = Some((notice, result.is_err(), Instant::now() + COPIED_SHOWN));
                 }
             }
             Done::Read { id, result } => {
-                if self.pasting != Some(*id) {
+                if self.pasting != Some(id) {
                     return;
                 }
+                self.pasting = None;
                 match result {
-                    Ok(text) if !text.is_empty() => self.paste(text),
+                    Ok(text) if !text.is_empty() => self.paste(&text),
                     Ok(_) => {}
-                    Err(error) => {
-                        self.copied = Some((
-                            format!("not pasted: {error}"),
-                            true,
-                            Instant::now() + COPIED_SHOWN,
-                        ));
-                    }
+                    Err(error) => self.not_pasted(&error),
+                }
+            }
+            Done::Paste { id, result } => {
+                if self.pasting != Some(id) {
+                    return;
+                }
+                self.pasting = None;
+                // Codex's guard starts again once the paste is in: a
+                // Ctrl+V the terminal held back while it ran repeats it.
+                self.paste_until = Some(Instant::now() + PASTE_REPEAT);
+                match result {
+                    Ok(Pasted::Images { images, text }) => self.paste_images(images, &text),
+                    Ok(Pasted::Text(text)) if !text.is_empty() => self.paste(&text),
+                    Ok(Pasted::Text(_)) => {}
+                    Err(error) => self.not_pasted(&error),
                 }
             }
         }
         self.dirty = true;
     }
 
-    /// Asks the clipboard for `selection`'s text, to paste when it comes.
-    fn start_paste(&mut self, selection: crate::clipboard::Selection) {
-        match self.clipboard.read(selection) {
-            Ok(id) => self.pasting = Some(id),
-            Err(refused) => {
-                self.copied = Some((
-                    format!("not pasted: {}", refused.reason()),
-                    true,
-                    Instant::now() + COPIED_SHOWN,
-                ));
+    /// The footer says why nothing was pasted.
+    fn not_pasted(&mut self, why: &str) {
+        self.copied = Some((
+            format!("not pasted: {why}"),
+            true,
+            Instant::now() + COPIED_SHOWN,
+        ));
+    }
+
+    /// Why an image cannot attach now, if it cannot (kb d191): only the
+    /// input box takes one, with no question box or rewind pick in front
+    /// (Codex attaches nothing while a view is open), and not to a shell
+    /// command, which sends no image.
+    fn attach_refused(&self) -> Option<&'static str> {
+        if self.questions.front().is_some() {
+            Some("a question is open")
+        } else if self.picking.is_some() {
+            Some("the rewind pick is open")
+        } else if self.composer.shell().is_some() {
+            Some("a shell command takes no image")
+        } else {
+            None
+        }
+    }
+
+    /// Ctrl+V's images: they attach where the cursor is. Where none can
+    /// (something came in front while the clipboard was read), the text
+    /// beside them is pasted as any text, a secret in front taking it;
+    /// with no text the footer says why nothing was.
+    fn paste_images(&mut self, images: Vec<ImageInput>, text: &str) {
+        self.view.clear_selection();
+        match self.attach_refused() {
+            None => self.composer.attach_pasted(images, false),
+            Some(_) if !text.is_empty() => self.paste(text),
+            Some(why) => self.not_pasted(why),
+        }
+    }
+
+    /// Asks the clipboard for `selection`'s text, to paste when it comes;
+    /// `None` for Ctrl+V's, images first, or its text alone where no image
+    /// can attach now (a secret in front gets the text, as before images).
+    /// A request refused leaves the one out going on.
+    fn start_paste(&mut self, selection: Option<crate::clipboard::Selection>) {
+        let asked = match selection {
+            Some(selection) => self.clipboard.read(selection),
+            None if self.attach_refused().is_some() => {
+                self.clipboard.read(crate::clipboard::Selection::Clipboard)
             }
+            None => self.clipboard.paste(),
+        };
+        match asked {
+            Ok(id) => self.pasting = Some(id),
+            Err(refused) => self.not_pasted(refused.reason()),
         }
         self.dirty = true;
     }
@@ -428,13 +492,30 @@ impl App {
     /// Text pasted: a bracketed paste, or the clipboard's for Ctrl+V and
     /// the mouse. A secret in front takes it, no character reaching the
     /// input box; otherwise it goes into the input box as one block whose
-    /// newlines never send, and counts as typing for a question box.
+    /// newlines never send, and counts as typing for a question box. Text
+    /// that only names image files (a dropped file) attaches them where an
+    /// image can attach, a space after them; anywhere else it is text.
     fn paste(&mut self, text: &str) {
         self.view.clear_selection();
         self.pasting = None;
-        if !self.questions.paste(text, Instant::now()) {
-            self.questions.typed(Instant::now());
-            self.composer.paste(text);
+        if self.questions.paste(text, Instant::now()) {
+            return;
+        }
+        self.questions.typed(Instant::now());
+        let dropped = self
+            .attach_refused()
+            .is_none()
+            .then(|| image_paste::dropped_images(text))
+            .flatten();
+        match dropped {
+            Some(paths) => self.composer.attach_pasted(
+                paths
+                    .into_iter()
+                    .map(|path| ImageInput::File { path })
+                    .collect(),
+                true,
+            ),
+            None => self.composer.paste(text),
         }
     }
 
@@ -672,7 +753,8 @@ impl App {
             Input::Key(key) if key.kind != KeyEventKind::Release => {
                 return self.key(key, Instant::now());
             }
-            Input::Key(_) => {}
+            // A release ends Ctrl+V's repeat window, as any other key.
+            Input::Key(_) => self.paste_until = None,
             Input::Paste(text) => self.paste(&text),
             Input::Mouse(mouse) => self.mouse(mouse),
             Input::Resize(width, height) => term.resize(Size::new(width, height)),
@@ -736,12 +818,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Right) if self.picking.is_none() => {
-                self.start_paste(crate::clipboard::Selection::Clipboard);
+                self.start_paste(Some(crate::clipboard::Selection::Clipboard));
             }
             MouseEventKind::Down(MouseButton::Middle)
                 if self.picking.is_none() && self.clipboard.place().primary() =>
             {
-                self.start_paste(crate::clipboard::Selection::Primary);
+                self.start_paste(Some(crate::clipboard::Selection::Primary));
             }
             _ => return,
         }
@@ -775,6 +857,17 @@ impl App {
     /// from typing by the time between keys).
     fn key(&mut self, key: KeyEvent, now: Instant) -> Option<Flow> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+V again before any other key and within PASTE_REPEAT, or
+        // while a clipboard read is out, is the same one repeating: it does
+        // nothing, the paste it repeats going on (Codex's image-paste
+        // guard, which runs the paste before the next key).
+        let paste_key = is_ctrl(key, 'v') && self.picking.is_none();
+        let repeat = paste_key
+            && (self.pasting.is_some() || self.paste_until.is_some_and(|until| now < until));
+        self.paste_until = paste_key.then_some(now + PASTE_REPEAT);
+        if repeat {
+            return None;
+        }
         // A key typed before a clipboard read comes back cancels the paste
         // (Codex's right-click paste): typed text is never replaced.
         self.pasting = None;
@@ -831,8 +924,8 @@ impl App {
                 return None;
             }
         }
-        if is_ctrl(key, 'v') && self.picking.is_none() {
-            self.start_paste(crate::clipboard::Selection::Clipboard);
+        if paste_key {
+            self.start_paste(None);
             return None;
         }
         if self.picking.is_some() {
