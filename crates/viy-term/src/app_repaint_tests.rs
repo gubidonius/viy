@@ -86,6 +86,7 @@ fn rewind_picks_your_message_in_the_transcript() {
     ));
     f.app.event(EventMsg::InputPrefill(InputPrefillEvent {
         text: "two".into(),
+        images: Vec::new(),
     }));
     let screen = f.screen();
     assert!(!screen.iter().any(|r| r.contains("three")), "{screen:?}");

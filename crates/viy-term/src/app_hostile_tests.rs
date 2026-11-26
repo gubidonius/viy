@@ -292,7 +292,8 @@ fn a_hostile_paste_is_shown_in_the_input_and_sent_unchanged() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "rm -rf ~\x1b[2K\x1b[1A\nls\u{202e}txt.exe\tx".into()
+            text: "rm -rf ~\x1b[2K\x1b[1A\nls\u{202e}txt.exe\tx".into(),
+            images: Vec::new(),
         }]
     );
 }

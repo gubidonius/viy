@@ -150,7 +150,10 @@ impl Rig {
     async fn send(&mut self, text: &str) -> Vec<EventMsg> {
         let id = self
             .engine
-            .submit(Op::UserTurn { text: text.into() })
+            .submit(Op::UserTurn {
+                text: text.into(),
+                images: Vec::new(),
+            })
             .unwrap();
         let (mut ended, mut naming) = (false, false);
         let mut seen = Vec::new();
@@ -401,6 +404,7 @@ async fn an_interrupted_turn_keeps_what_streamed() {
         .engine
         .submit(Op::UserTurn {
             text: "build it".into(),
+            images: Vec::new(),
         })
         .unwrap();
     loop {
@@ -439,6 +443,7 @@ async fn an_interrupt_before_any_text_keeps_the_question() {
         .engine
         .submit(Op::UserTurn {
             text: "long careful prompt".into(),
+            images: Vec::new(),
         })
         .unwrap();
     loop {
@@ -789,6 +794,7 @@ async fn user_message_is_on_disk_before_the_reply() {
     rig.engine
         .submit(Op::UserTurn {
             text: "first".into(),
+            images: Vec::new(),
         })
         .unwrap();
     while !matches!(
@@ -824,6 +830,7 @@ async fn an_interrupted_turn_is_logged_as_it_was_closed() {
         .engine
         .submit(Op::UserTurn {
             text: "build it".into(),
+            images: Vec::new(),
         })
         .unwrap();
     while !matches!(
@@ -844,6 +851,7 @@ async fn closed_terminal_saves_the_open_turn() {
     rig.engine
         .submit(Op::UserTurn {
             text: "long careful prompt".into(),
+            images: Vec::new(),
         })
         .unwrap();
     while !matches!(
@@ -2387,7 +2395,12 @@ async fn an_interrupted_turn_still_gets_a_row() {
     let turns_path = chat.tracer().turns_path();
     let turns = Arc::new(ChatTurns::new(chat));
     let mut engine = Engine::spawn(turns.clone());
-    let id = engine.submit(Op::UserTurn { text: "go".into() }).unwrap();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "go".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     while !matches!(
         engine.next_event().await.unwrap().msg,
         EventMsg::AgentMessageContentDelta(_)
@@ -2862,4 +2875,25 @@ async fn file_read_override_applies_to_whole_files_and_ranges_independently_of_s
         }
         assert_eq!(d.chat.files.max_output, 20_000);
     }
+}
+
+/// Images are refused only where the pod's engine reads none on this
+/// profile (kb d191): Strata until its vision section (WP 9.49). vLLM reads
+/// them; a local vLLM and an OpenAI-compatible address answer for
+/// themselves.
+#[test]
+fn only_a_strata_pod_refuses_images() {
+    let mock = MockLlm::start(&json!({"responses": []})).unwrap();
+    let (_scratch, store) = sessions_store();
+    let refused = |over: &[(&str, &str)]| chat_at(&mock, over, &store).images_refused();
+    assert_eq!(refused(&[]), None);
+    assert_eq!(
+        refused(&[("ENGINE", "strata")]).as_deref(),
+        Some("not sent: Strata on this profile reads no images yet")
+    );
+    assert_eq!(
+        refused(&[("ENGINE", "strata"), ("BACKEND", "openai")]),
+        None
+    );
+    assert_eq!(refused(&[("ENGINE", "strata"), ("BACKEND", "local")]), None);
 }

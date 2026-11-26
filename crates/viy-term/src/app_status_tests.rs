@@ -208,7 +208,8 @@ fn a_refused_line_goes_back_into_the_input_box() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "what is 2+2".into()
+            text: "what is 2+2".into(),
+            images: Vec::new(),
         }]
     );
     f.type_text("and");
@@ -216,6 +217,7 @@ fn a_refused_line_goes_back_into_the_input_box() {
         .event(EventMsg::TurnRefused(viy_protocol::TurnRefusedEvent {
             text: "what is 2+2".into(),
             message: "no pod is running: /up starts one.".into(),
+            images: Vec::new(),
         }));
     let screen = f.screen();
     assert!(
@@ -271,6 +273,7 @@ fn refused_lines_come_back_in_order() {
         EventMsg::TurnRefused(viy_protocol::TurnRefusedEvent {
             text: text.into(),
             message: "no pod is running: /up starts one.".into(),
+            images: Vec::new(),
         })
     };
     f.app.event(refused("first"));

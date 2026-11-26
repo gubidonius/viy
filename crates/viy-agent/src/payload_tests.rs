@@ -221,3 +221,53 @@ fn the_title_names_the_first_exchange_with_an_answer() {
     );
     assert_eq!(title_pair(&messages[..2]), None);
 }
+
+/// At most MAX_IMAGES_PER_PROMPT images in a request, the ones nearest the
+/// end (kb d191); one given by address goes as text too. The saved chat is
+/// not touched.
+#[test]
+fn a_request_carries_the_last_four_images() {
+    let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+    let text = json!({"type": "text", "text": "[image]"});
+    let msgs = vec![
+        json!({"role": "user", "content": [image("data:,1"), image("data:,2")]}),
+        json!({"role": "assistant", "content": "two"}),
+        json!({"role": "user", "content": [image("https://example.com/3.png"), image("data:,4")]}),
+        json!({"role": "assistant", "content": "two more"}),
+        json!({"role": "user", "content": [image("data:,5"), image("data:,6")]}),
+    ];
+    let body = settings(&[]).payload(&msgs, &[], Tools::Auto, true);
+    let sent: Vec<&Value> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["content"].as_array())
+        .flatten()
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            &text,
+            &image("data:,2"),
+            &text,
+            &image("data:,4"),
+            &image("data:,5"),
+            &image("data:,6")
+        ]
+    );
+    assert_eq!(msgs[0]["content"][0], image("data:,1"));
+    let none = settings(&[("MAX_IMAGES_PER_PROMPT", "0")]).payload(&msgs, &[], Tools::Auto, true);
+    assert_eq!(none["messages"][4]["content"], json!([text, text]));
+    assert!(
+        Settings::from_config(
+            &{
+                let mut cfg = Config::defaults();
+                cfg.set("MAX_IMAGES_PER_PROMPT", "four");
+                cfg
+            },
+            "m".into(),
+            true
+        )
+        .is_err()
+    );
+}

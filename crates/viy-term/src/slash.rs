@@ -35,13 +35,6 @@ pub const COMMANDS: &[Command] = &[
     cmd("fork", "[title]", "go on in a copy of this chat", &[]),
     cmd("chats", "[query]", "list / search saved chats", &[]),
     cmd("resume", "[query]", "switch to a saved chat", &[]),
-    cmd(
-        "image",
-        "<path|url>",
-        "attach an image to the next message",
-        &[],
-    ),
-    cmd("images", "", "list pending attachments", &[]),
     cmd("temp", "<float>", "sampling temperature", &[]),
     cmd(
         "effort",

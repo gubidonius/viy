@@ -214,7 +214,7 @@ async fn dollar_name_sends_the_skill_with_the_message() {
         ]
     );
     let part = "<skill>\n<name>notes</name>\n# Notes\n\nShort lines.\n</skill>";
-    let content = d.chat.user_content(line.clone());
+    let content = d.chat.user_content(line.clone(), Vec::new());
     assert_eq!(
         content,
         json!([{"type": "text", "text": part}, {"type": "text", "text": line}])
@@ -247,7 +247,10 @@ async fn dollar_name_sends_the_skill_with_the_message() {
     d.chat.reset_web(&messages);
     assert_eq!(d.chat.web_taint(), None);
     // Nothing waits for the next message.
-    assert_eq!(d.chat.user_content("next".into()), json!("next"));
+    assert_eq!(
+        d.chat.user_content("next".into(), Vec::new()),
+        json!("next")
+    );
     // Named again, unchanged: not sent a second time.
     d.said();
     d.chat.attach_skills(&ctx, "again with $notes");
@@ -256,7 +259,7 @@ async fn dollar_name_sends_the_skill_with_the_message() {
         ["skill notes is already in this chat as it reads now; not sent again"]
     );
     assert_eq!(
-        d.chat.user_content("again with $notes".into()),
+        d.chat.user_content("again with $notes".into(), Vec::new()),
         json!("again with $notes")
     );
 }

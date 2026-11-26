@@ -15,7 +15,6 @@ use std::sync::atomic::Ordering;
 use viy_tools::mounts;
 use viy_tools::mounts::Mount;
 
-use base64::Engine as _;
 use serde_json::Value;
 use serde_json::json;
 use viy_protocol::Answer;
@@ -23,6 +22,7 @@ use viy_protocol::EffortChangedEvent;
 use viy_protocol::EventMsg;
 use viy_protocol::HistoryItem;
 use viy_protocol::HistoryRewrittenEvent;
+use viy_protocol::ImageInput;
 use viy_protocol::InputPrefillEvent;
 use viy_protocol::NoticeEvent;
 use viy_protocol::NoticeLevel;
@@ -55,8 +55,6 @@ const HELP: &str = "  /help              show this
                      branches from an earlier message
   /chats [query]     list / search saved chats  (--all: every project)
   /resume [query]    switch to a saved chat
-  /image <path|url>  attach an image to the next message
-  /images            list pending attachments
   /temp <float>      sampling temperature (default 1.0)
   /effort [xhigh|medium|low]  how hard the model thinks (default medium)
   /maxtok <int>      max tokens per reply, reasoning trace included
@@ -193,32 +191,40 @@ fn replay_call(tc: &Value) -> HistoryItem {
 }
 
 /// What the user typed, without the client's notes or the records of `!`
-/// commands; images as `[image]` (rp's `_user_text`).
+/// commands; images as `[image]` (rp's `_user_text`), unless the text
+/// names them with its `[Image #N]` placeholders (kb d191).
 fn user_text(m: &Value) -> String {
     match &m["content"] {
-        Value::Array(parts) => parts
-            .iter()
-            .filter(|p| {
-                p.is_object()
-                    && !p["text"].as_str().is_some_and(|t| {
-                        sessions::is_client_note(t)
-                            || crate::shell::is_record(t)
-                            || crate::skills::is_part(t)
-                    })
-            })
-            .map(|p| {
-                if p["type"] == "image_url" {
-                    "[image]".to_string()
-                } else {
-                    match &p["text"] {
-                        Value::String(s) => s.clone(),
-                        Value::Null => String::new(),
-                        other => other.to_string(),
+        Value::Array(parts) => {
+            let named = parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .any(|t| t.contains("[Image #"));
+            parts
+                .iter()
+                .filter(|p| {
+                    p.is_object()
+                        && !(named && p["type"] == "image_url")
+                        && !p["text"].as_str().is_some_and(|t| {
+                            sessions::is_client_note(t)
+                                || crate::shell::is_record(t)
+                                || crate::skills::is_part(t)
+                        })
+                })
+                .map(|p| {
+                    if p["type"] == "image_url" {
+                        "[image]".to_string()
+                    } else {
+                        match &p["text"] {
+                            Value::String(s) => s.clone(),
+                            Value::Null => String::new(),
+                            other => other.to_string(),
+                        }
                     }
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
         Value::String(s) => s.clone(),
         _ => String::new(),
     }
@@ -323,35 +329,6 @@ pub fn render_content(m: &Value) -> String {
         ));
     }
     c
-}
-
-/// An image for the next message: a URL as it is, a local file as a data
-/// URI (rp's `_encode_image`).
-fn encode_image(reference: &str, home: &Path) -> std::io::Result<String> {
-    if reference.starts_with("http://") || reference.starts_with("https://") {
-        return Ok(reference.to_string());
-    }
-    let path = expand_home(reference, home);
-    let bytes = std::fs::read(&path)?;
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase);
-    let mime = match ext.as_deref() {
-        Some("jpg" | "jpeg" | "jpe") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("svg") => "image/svg+xml",
-        Some("tif" | "tiff") => "image/tiff",
-        Some("ico") => "image/vnd.microsoft.icon",
-        Some("avif") => "image/avif",
-        _ => "image/png",
-    };
-    Ok(format!(
-        "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
-    ))
 }
 
 /// `~` and `~/...` under `home`.
@@ -544,41 +521,6 @@ impl Chat {
                 self.list_chats(ctx, &query, all);
             }
             "resume" => self.resume(ctx, arg).await,
-            "image" => {
-                if arg.is_empty() {
-                    warn("image", "usage: /image <path|url>".into());
-                    return;
-                }
-                match encode_image(arg, &self.places.home) {
-                    Ok(image) => {
-                        self.pending_images.push(image);
-                        info(
-                            "image",
-                            format!("attached ({} pending)", self.pending_images.len()),
-                        );
-                    }
-                    Err(_) => notice(
-                        ctx,
-                        NoticeLevel::Error,
-                        "image",
-                        format!("no such file: {arg}"),
-                    ),
-                }
-            }
-            "images" => {
-                if self.pending_images.is_empty() {
-                    info("images", "none pending".into());
-                }
-                for (i, image) in self.pending_images.iter().enumerate() {
-                    let more = if image.chars().count() > 70 {
-                        "..."
-                    } else {
-                        ""
-                    };
-                    let head: String = image.chars().take(70).collect();
-                    info("images", format!("  {}. {head}{more}", i + 1));
-                }
-            }
             "temp" => match arg.parse::<f64>() {
                 Ok(t) => {
                     self.settings.temperature = t;
@@ -985,17 +927,18 @@ impl Chat {
 
     /// The next user message: the records of the `!` commands run since
     /// the last one (kb d149), the pending `/mount` and `/ssh` notes, the
-    /// skills its `$name`s attached (kb d184), the line, then the pending
-    /// images (rp's `_user_content`). A record's output is untrusted text:
-    /// it taints the chat; a skill does not.
-    pub fn user_content(&mut self, line: String) -> Value {
+    /// skills its `$name`s attached (kb d184), the line, then its images as
+    /// data URLs, in the order of its `[Image #N]` placeholders (rp's
+    /// `_user_content`, kb d191). A record's output is untrusted text: it
+    /// taints the chat; a skill does not.
+    pub fn user_content(&mut self, line: String, images: Vec<String>) -> Value {
         let records = std::mem::take(&mut self.shell_records);
         if !records.is_empty() {
             self.taint("the output of a ! command".into());
         }
         let notes = [self.mount_note.take(), self.ssh_note.take()];
         let skills = std::mem::take(&mut self.skill_parts);
-        if self.pending_images.is_empty()
+        if images.is_empty()
             && notes.iter().all(Option::is_none)
             && records.is_empty()
             && skills.is_empty()
@@ -1013,12 +956,14 @@ impl Chat {
                 parts.push(json!({"type": "text", "text": text}));
             }
         }
+        // An image alone is a message too.
+        let alone = parts.is_empty() && !images.is_empty();
         parts.extend(
-            std::mem::take(&mut self.pending_images)
+            images
                 .into_iter()
                 .map(|url| json!({"type": "image_url", "image_url": {"url": url}})),
         );
-        if parts.len() > 1 {
+        if parts.len() > 1 || alone {
             Value::Array(parts)
         } else {
             Value::String(line)
@@ -1406,17 +1351,20 @@ impl Chat {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let images: Vec<String> = parts
+        // Only a data URL goes back: an older chat's image given by
+        // address (rp's `/image <url>`) is not sent again (kb d191).
+        let (images, by_address): (Vec<String>, Vec<String>) = parts
             .iter()
             .filter(|p| p["type"] == "image_url")
             .filter_map(|p| p["image_url"]["url"].as_str())
             .filter(|u| !u.is_empty())
             .map(str::to_string)
+            .partition(|u| u.starts_with("data:"));
+        let images: Vec<ImageInput> = images
+            .into_iter()
+            .map(|url| ImageInput::DataUrl { url })
             .collect();
         let n_images = images.len();
-        let mut pending = images;
-        pending.append(&mut self.pending_images);
-        self.pending_images = pending;
         // A /mount or /ssh note the dropped turns carried goes out again, up to date.
         let notes: Vec<&str> = dropped
             .iter()
@@ -1510,8 +1458,15 @@ impl Chat {
                 if n_images > 1 { "s" } else { "" }
             ));
         }
-        if !text.is_empty() {
-            ctx.emit(EventMsg::InputPrefill(InputPrefillEvent { text }));
+        if !by_address.is_empty() {
+            let n = by_address.len();
+            info(format!(
+                "{n} image{} given by address not attached again",
+                if n > 1 { "s" } else { "" }
+            ));
+        }
+        if !text.is_empty() || !images.is_empty() {
+            ctx.emit(EventMsg::InputPrefill(InputPrefillEvent { text, images }));
             info("your message is back at the prompt: edit it, or Enter to send it again".into());
         }
     }

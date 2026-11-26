@@ -74,7 +74,10 @@ pub fn parse(line: &str) -> Result<Input, String> {
             if text.trim().is_empty() {
                 return Err("a user line needs some text".into());
             }
-            Ok(Input::Submit(Op::UserTurn { text: text.into() }))
+            Ok(Input::Submit(Op::UserTurn {
+                text: text.into(),
+                images: Vec::new(),
+            }))
         }
         "command" => {
             let text = field("text").ok_or("a command line needs \"text\"")?;

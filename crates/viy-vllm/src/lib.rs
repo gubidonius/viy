@@ -30,11 +30,11 @@ pub use boot::build_vllm_args;
 /// The config keys only vLLM reads: its arguments and the boot script's
 /// cache and warmup switches. Another engine ignores them, which `viy model
 /// show` says. Not MAX_NUM_SEQS, which explore's parallel default reads
-/// too.
+/// too, nor MAX_IMAGES_PER_PROMPT, the chat's limit on every engine (kb
+/// d191).
 pub const OWN_KEYS: &[&str] = &[
     "VLLM_IMAGE",
     "GPU_MEMORY_UTILIZATION",
-    "MAX_IMAGES_PER_PROMPT",
     "TOOL_CALL_PARSER",
     "PREFIX_CACHING",
     "KV_CACHE_DTYPE",

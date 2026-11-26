@@ -69,9 +69,27 @@ fn ops_are_tagged_like_events() {
             id: "2".into(),
             op: Op::UserTurn {
                 text: "What is a haiku?".into(),
+                images: Vec::new(),
             },
         },
         json!({"id": "2", "op": {"type": "user_turn", "text": "What is a haiku?"}}),
+    );
+    // A message's images (kb d191): a file and the clipboard's picture.
+    round_trip(
+        &Op::UserTurn {
+            text: "[Image #1] or [Image #2]?".into(),
+            images: vec![
+                ImageInput::File {
+                    path: "/tmp/a.png".into(),
+                },
+                ImageInput::DataUrl {
+                    url: "data:image/png;base64,AA".into(),
+                },
+            ],
+        },
+        json!({"type": "user_turn", "text": "[Image #1] or [Image #2]?", "images": [
+            {"kind": "file", "path": "/tmp/a.png"},
+            {"kind": "data_url", "url": "data:image/png;base64,AA"}]}),
     );
     round_trip(&Op::Interrupt, json!({"type": "interrupt"}));
     round_trip(

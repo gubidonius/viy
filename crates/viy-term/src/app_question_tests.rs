@@ -285,7 +285,8 @@ fn enter_with_a_draft_sends_it_and_leaves_the_question() {
     assert_eq!(
         f.ops(),
         [Op::UserTurn {
-            text: "next".into()
+            text: "next".into(),
+            images: Vec::new(),
         }]
     );
     assert!(f.app.questions.front().is_some());

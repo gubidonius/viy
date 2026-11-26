@@ -28,6 +28,8 @@ use crossterm::event::KeyEvent;
 use crossterm::event::KeyModifiers;
 use tokio::time::Instant;
 
+use viy_protocol::ImageInput;
+
 use crate::history::History;
 pub use crate::history::Shell;
 use crate::slash::Completion;
@@ -116,6 +118,8 @@ pub struct Composer {
     /// after it shows it was typed by a person.
     shell: Option<Shell>,
     shell_typed: Option<Instant>,
+    /// The images the next message carries (kb d191).
+    images: Vec<ImageInput>,
 }
 
 impl Composer {
@@ -141,10 +145,32 @@ impl Composer {
         self.shell
     }
 
-    /// Empties the box (Ctrl-C with a draft), shell mode too.
+    /// Empties the box (Ctrl-C with a draft), shell mode and images too.
     pub fn clear(&mut self) {
         self.area.take();
         self.leave_shell();
+        self.images.clear();
+    }
+
+    /// The images the next message carries.
+    pub fn images(&self) -> &[ImageInput] {
+        &self.images
+    }
+
+    /// The images `/rewind` puts back with its message, in place of any.
+    pub fn set_images(&mut self, images: Vec<ImageInput>) {
+        self.images = images;
+    }
+
+    /// The images of a line not sent, ahead of those attached since.
+    pub fn give_back_images(&mut self, mut images: Vec<ImageInput>) {
+        images.append(&mut self.images);
+        self.images = images;
+    }
+
+    /// The images, for the message being sent.
+    pub fn take_images(&mut self) -> Vec<ImageInput> {
+        std::mem::take(&mut self.images)
     }
 
     /// Puts `text` in the box to edit: `/rewind`'s prefill, a line given

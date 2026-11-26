@@ -150,7 +150,10 @@ pub fn cmd_exec(
         let mut plain = Plain::new(&mut *out).show_think(args.think);
         let failed = |e: std::io::Error| Failure::from(e.to_string());
         let turn = engine
-            .submit(Op::UserTurn { text: prompt })
+            .submit(Op::UserTurn {
+                text: prompt,
+                images: Vec::new(),
+            })
             .map_err(|e| Failure::from(e.to_string()))?;
         while let Some(event) = engine.next_event().await {
             match &event.msg {
@@ -184,7 +187,10 @@ async fn run_json(
     let mut events = JsonEvents::new(&mut *out);
     events.thread_started(thread_id).map_err(failed)?;
     let turn = engine
-        .submit(Op::UserTurn { text: prompt })
+        .submit(Op::UserTurn {
+            text: prompt,
+            images: Vec::new(),
+        })
         .map_err(|e| Failure::from(e.to_string()))?;
     let mut ok = true;
     while let Some(event) = engine.next_event().await {

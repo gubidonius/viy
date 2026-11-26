@@ -16,6 +16,7 @@ pub mod drive;
 mod engine;
 pub mod filehistory;
 pub mod files;
+pub mod images;
 pub mod instructions;
 pub mod kb;
 pub mod payload;

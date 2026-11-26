@@ -50,6 +50,7 @@ use viy_protocol::ContextCompactedEvent;
 use viy_protocol::Event;
 use viy_protocol::EventMsg;
 use viy_protocol::HistoryItem;
+use viy_protocol::ImageInput;
 use viy_protocol::NoticeEvent;
 use viy_protocol::NoticeLevel;
 use viy_protocol::Op;
@@ -161,8 +162,9 @@ pub struct App {
     view: TranscriptView,
     composer: Composer,
     turn: Option<Turn>,
-    /// Messages sent that have not started yet, oldest first.
-    queued: VecDeque<String>,
+    /// Messages sent that have not started yet, oldest first, with their
+    /// images.
+    queued: VecDeque<(String, Vec<ImageInput>)>,
     /// The centipede header, first in the transcript (CHAT_HEADER).
     header: Option<crate::header::Header>,
     /// The start of the input box that lines not sent were put back as.
@@ -539,8 +541,8 @@ impl App {
             // Stopped before it started (Ctrl-C while it was admitted):
             // the line was never sent, so it goes back to the input box.
             EventMsg::TurnAborted(_) if self.turn.is_none() => {
-                if let Some(text) = self.queued.pop_front() {
-                    self.give_back(&text);
+                if let Some((text, images)) = self.queued.pop_front() {
+                    self.give_back(&text, images);
                 }
             }
             EventMsg::TurnAborted(_) => {
@@ -552,7 +554,7 @@ impl App {
             // transcript.
             EventMsg::TurnRefused(e) => {
                 self.queued.pop_front();
-                self.give_back(&e.text);
+                self.give_back(&e.text, e.images);
                 self.push(Cell::lines(vec![Line::from(e.message.yellow())]));
             }
             EventMsg::Notice(notice) => self.push(Cell::notice(&notice)),
@@ -654,7 +656,10 @@ impl App {
                 self.points.clear();
                 self.push(compacted_cell(&e));
             }
-            EventMsg::InputPrefill(e) => self.composer.set_text(&e.text),
+            EventMsg::InputPrefill(e) => {
+                self.composer.set_text(&e.text);
+                self.composer.set_images(e.images);
+            }
             EventMsg::ShutdownComplete => self.stopped = true,
             _ => {}
         }
@@ -961,8 +966,9 @@ impl App {
             }
             Op::Command { text }
         } else {
-            self.queued.push_back(text.clone());
-            Op::UserTurn { text }
+            let images = self.composer.take_images();
+            self.queued.push_back((text.clone(), images.clone()));
+            Op::UserTurn { text, images }
         };
         let _ = self.ops.send(op);
         self.sent = true;
@@ -977,7 +983,8 @@ impl App {
             self.composer.set_shell(&command, shell);
             return;
         }
-        self.queued.push_back(format!("{}{command}", shell.bang()));
+        self.queued
+            .push_back((format!("{}{command}", shell.bang()), Vec::new()));
         let _ = self.ops.send(Op::Shell {
             command,
             model_sees: shell == Shell::Shared,
@@ -988,8 +995,9 @@ impl App {
 
     /// Puts a line that was not sent back into the input box: after the
     /// lines given back before it, so several come back in the order they
-    /// were sent, and ahead of anything typed since.
-    fn give_back(&mut self, text: &str) {
+    /// were sent, and ahead of anything typed since; its images likewise.
+    fn give_back(&mut self, text: &str, images: Vec<ImageInput>) {
+        self.composer.give_back_images(images);
         // A shell command being typed keeps its `!` in sight: the lines
         // put back are text, and so is it now (kb d149).
         let draft = match self.composer.shell() {
@@ -1535,7 +1543,7 @@ impl App {
             .queued
             .iter()
             .take(QUEUED_ROWS)
-            .map(|text| {
+            .map(|(text, _)| {
                 let first = text.lines().next().unwrap_or_default();
                 let more = if text.contains('\n') { " …" } else { "" };
                 let row = format!("↳ {first}{more}");

@@ -119,7 +119,10 @@ pub async fn drive(engine: &mut Engine, scenario: &Scenario) -> Drive {
     let mut approvals = scenario.approvals.iter();
     for step in &scenario.steps {
         let op = match step {
-            Step::User(text) => Op::UserTurn { text: text.clone() },
+            Step::User(text) => Op::UserTurn {
+                text: text.clone(),
+                images: Vec::new(),
+            },
             Step::Command(text) => Op::Command { text: text.clone() },
         };
         let Ok(id) = engine.submit(op) else {

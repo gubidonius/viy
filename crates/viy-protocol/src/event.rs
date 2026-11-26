@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::ImageInput;
 use crate::Question;
 
 /// One event from the engine.
@@ -120,6 +121,9 @@ pub enum TurnOutcome {
 pub struct TurnRefusedEvent {
     /// The line, as the user entered it.
     pub text: String,
+    /// The images it carried, given back with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageInput>,
     /// Why, for the user.
     pub message: String,
 }
@@ -355,6 +359,9 @@ pub struct ContextCompactedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputPrefillEvent {
     pub text: String,
+    /// Images that go back into the input box with it (`/rewind`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

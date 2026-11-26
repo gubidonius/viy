@@ -83,6 +83,9 @@ hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"
 icu_normalizer = "2.2.0"
 # Non-ASCII host names, UTS 46 (flags F53); already in the tree through url.
 idna = "1.1.0"
+# The chat's images (kb d191): Codex's resize to fit 2048 (utils/image) and
+# its formats; Codex locks 0.25.9, 0.25.10 is the one in the offline cache.
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 indexmap = "2.14.0"
 # Frame snapshots, as Codex's TUI tests (codex-rs/Cargo.toml); no colours.
 insta = { version = "1.46.3", default-features = false }

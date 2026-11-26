@@ -23,6 +23,7 @@ oracle = ["viy-testkit/oracle"]
 futures-util = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+image = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }

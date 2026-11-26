@@ -2,6 +2,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::Answer;
+use crate::ImageInput;
 use crate::Secret;
 
 /// One request from the UI, with the id its events will carry.
@@ -17,8 +18,13 @@ pub struct Submission {
 #[non_exhaustive]
 pub enum Op {
     /// A line entered at the prompt: starts a turn, or waits for the one
-    /// running to end.
-    UserTurn { text: String },
+    /// running to end. `images`: what the input box held with it, in the
+    /// order of the line's `[Image #N]` placeholders (kb d191).
+    UserTurn {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageInput>,
+    },
     /// A slash command, `/` included; the engine answers with
     /// [`crate::EventMsg::CommandComplete`] once it has run.
     Command { text: String },

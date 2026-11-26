@@ -73,7 +73,7 @@ async fn a_bang_command_runs_in_the_workspace_and_goes_with_the_next_message() {
     assert_eq!(end.status, ToolCallStatus::Failed);
     assert_eq!(end.detail.as_deref(), Some("exit 3"));
     assert_eq!(shown(&mut d), [format!("hi\n{}\noops", ws.display())]);
-    let content = d.chat.user_content("why did it fail?".into());
+    let content = d.chat.user_content("why did it fail?".into(), Vec::new());
     let parts = content.as_array().unwrap();
     assert_eq!(parts.len(), 2);
     let record = parts[0]["text"].as_str().unwrap();
@@ -90,7 +90,10 @@ async fn a_bang_command_runs_in_the_workspace_and_goes_with_the_next_message() {
         Some("the output of a ! command")
     );
     // It went once.
-    assert_eq!(d.chat.user_content("next".into()), json!("next"));
+    assert_eq!(
+        d.chat.user_content("next".into(), Vec::new()),
+        json!("next")
+    );
 }
 
 #[tokio::test]
@@ -104,7 +107,7 @@ async fn a_double_bang_command_leaves_nothing_for_the_model() {
     assert_eq!(end.status, ToolCallStatus::Completed);
     assert_eq!(shown(&mut d), ["secret plans"]);
     assert!(d.chat.shell_records.is_empty());
-    assert_eq!(d.chat.user_content("hi".into()), json!("hi"));
+    assert_eq!(d.chat.user_content("hi".into(), Vec::new()), json!("hi"));
     assert_eq!(d.chat.web_taint, None);
 }
 

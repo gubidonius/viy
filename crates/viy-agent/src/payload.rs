@@ -51,11 +51,15 @@ pub struct Settings {
     pub top_k: i64,
     pub reasoning_effort: String,
     pub max_tokens: i64,
+    /// The images a request carries at most (`MAX_IMAGES_PER_PROMPT`, kb
+    /// d191), on every engine.
+    pub max_images: usize,
 }
 
 impl Settings {
-    /// From TEMPERATURE, TOP_P, TOP_K, REASONING_EFFORT and MAX_TOKENS; a
-    /// value that is not a number is an error, as it ends rp's chat.
+    /// From TEMPERATURE, TOP_P, TOP_K, REASONING_EFFORT, MAX_TOKENS and
+    /// MAX_IMAGES_PER_PROMPT; a value that is not a number is an error, as
+    /// it ends rp's chat.
     pub fn from_config(cfg: &Config, model: String, is_vllm: bool) -> Result<Self, String> {
         fn number<T: std::str::FromStr>(
             cfg: &Config,
@@ -75,6 +79,7 @@ impl Settings {
             top_k: number(cfg, "TOP_K", "20")?,
             reasoning_effort: cfg.get("REASONING_EFFORT").unwrap_or("medium").to_string(),
             max_tokens: number(cfg, "MAX_TOKENS", "4096")?,
+            max_images: number(cfg, "MAX_IMAGES_PER_PROMPT", "4")?,
         })
     }
 
@@ -82,10 +87,12 @@ impl Settings {
     /// offers; `think: false` turns the reasoning trace off, which changes
     /// only the end of the prompt, so the prefix cache still hits.
     pub fn payload(&self, msgs: &[Value], specs: &[Value], tools: Tools, think: bool) -> Value {
+        let mut messages = without_thought(msgs);
+        limit_images(&mut messages, self.max_images);
         let mut body = json!({
             "model": self.model,
             // Also repairs chats saved before broken calls were caught.
-            "messages": with_valid_tool_args(&without_thought(msgs)),
+            "messages": with_valid_tool_args(&messages),
             "stream": true,
             "temperature": self.temperature,
             "top_p": self.top_p,
@@ -238,6 +245,32 @@ pub fn with_valid_tool_args(msgs: &[Value]) -> Vec<Value> {
             m
         })
         .collect()
+}
+
+/// At most `keep` images in `msgs`, the ones nearest the end (kb d191):
+/// an earlier image goes as `[image]` text, and so does one not given as a
+/// data URL (an older chat's `/image <url>`, which the pod would fetch).
+/// Only the request changes; the saved chat keeps every image.
+pub fn limit_images(msgs: &mut [Value], keep: usize) {
+    let mut left = keep;
+    for m in msgs.iter_mut().rev() {
+        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut().rev() {
+            if part["type"] != "image_url" {
+                continue;
+            }
+            let data = part["image_url"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:"));
+            if data && left > 0 {
+                left -= 1;
+            } else {
+                *part = json!({"type": "text", "text": "[image]"});
+            }
+        }
+    }
 }
 
 /// `msgs` without the `thought` marks, which are for /resume, not the

@@ -21,8 +21,17 @@ pub(crate) fn delta(text: impl Into<String>) -> EventMsg {
 }
 
 impl Turns for StandIn {
-    fn turn(self: Arc<Self>, ctx: TurnContext, text: String) -> BoxFuture<'static, TurnOutcome> {
+    fn turn(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        text: String,
+        images: Vec<String>,
+    ) -> BoxFuture<'static, TurnOutcome> {
         Box::pin(async move {
+            for image in &images {
+                let head: String = image.chars().take(22).collect();
+                ctx.emit(delta(format!("image {head}")));
+            }
             ctx.emit(EventMsg::ReasoningContentDelta(DeltaEvent {
                 delta: "thinking".into(),
             }));
@@ -140,12 +149,113 @@ fn msgs(events: &[Event]) -> Vec<EventMsg> {
     events.iter().map(|e| e.msg.clone()).collect()
 }
 
+/// A one-pixel PNG as a data URL.
+fn png_url() -> String {
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1, 1)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    format!("data:image/png;base64,{encoded}")
+}
+
+/// The stand-in on a profile whose server reads no images.
+struct NoImages;
+
+impl Turns for NoImages {
+    fn turn(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        text: String,
+        images: Vec<String>,
+    ) -> BoxFuture<'static, TurnOutcome> {
+        Arc::new(StandIn).turn(ctx, text, images)
+    }
+
+    fn command(self: Arc<Self>, ctx: TurnContext, text: String) -> BoxFuture<'static, ()> {
+        Arc::new(StandIn).command(ctx, text)
+    }
+
+    fn images_refused(&self) -> Option<String> {
+        Some("not sent: Strata on this profile reads no images yet".into())
+    }
+}
+
+/// A line's images reach the turn prepared, as data URLs (kb d191).
+#[tokio::test]
+async fn a_turns_images_reach_it_prepared() {
+    let mut engine = engine();
+    let url = png_url();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "what is [Image #1]?".into(),
+            images: vec![ImageInput::DataUrl { url: url.clone() }],
+        })
+        .unwrap();
+    let events = until(&mut engine, turn_done(&id)).await;
+    let head: String = url.chars().take(22).collect();
+    assert!(
+        msgs(&events).contains(&delta(format!("image {head}"))),
+        "{events:?}"
+    );
+}
+
+/// A line with images the server cannot read, or with an image that
+/// cannot be prepared, is not shown as a turn: it comes back with its
+/// images and the reason.
+#[tokio::test]
+async fn a_line_whose_images_cannot_go_comes_back_with_them() {
+    let refused = |e: &Event| matches!(e.msg, EventMsg::TurnRefused(_));
+    let good = vec![ImageInput::DataUrl { url: png_url() }];
+    let mut strata = Engine::spawn(Arc::new(NoImages));
+    strata
+        .submit(Op::UserTurn {
+            text: "look".into(),
+            images: good.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        msgs(&until(&mut strata, refused).await),
+        [EventMsg::TurnRefused(TurnRefusedEvent {
+            text: "look".into(),
+            images: good.clone(),
+            message: "not sent: Strata on this profile reads no images yet".into(),
+        })]
+    );
+    let bad = vec![
+        good[0].clone(),
+        ImageInput::File {
+            path: "/nonexistent/viy-test/shot.png".into(),
+        },
+    ];
+    let mut engine = engine();
+    engine
+        .submit(Op::UserTurn {
+            text: "compare".into(),
+            images: bad.clone(),
+        })
+        .unwrap();
+    let events = msgs(&until(&mut engine, refused).await);
+    let [EventMsg::TurnRefused(e)] = events.as_slice() else {
+        panic!("{events:?}");
+    };
+    assert_eq!((e.text.as_str(), &e.images), ("compare", &bad));
+    assert!(
+        e.message
+            .starts_with("image #2 not sent: /nonexistent/viy-test/shot.png: "),
+        "{}",
+        e.message
+    );
+}
+
 #[tokio::test]
 async fn a_turn_says_it_started_streams_and_ended() {
     let mut engine = engine();
     let id = engine
         .submit(Op::UserTurn {
             text: "hello".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, turn_done(&id)).await;
@@ -172,13 +282,23 @@ async fn a_turn_says_it_started_streams_and_ended() {
 #[tokio::test]
 async fn turns_and_commands_queue_and_run_in_order() {
     let mut engine = engine();
-    let first = engine.submit(Op::UserTurn { text: "one".into() }).unwrap();
+    let first = engine
+        .submit(Op::UserTurn {
+            text: "one".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let command = engine
         .submit(Op::Command {
             text: "/maxtok 2048".into(),
         })
         .unwrap();
-    let second = engine.submit(Op::UserTurn { text: "two".into() }).unwrap();
+    let second = engine
+        .submit(Op::UserTurn {
+            text: "two".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let events = until(&mut engine, turn_done(&second)).await;
     let order: Vec<&str> = events.iter().map(|e| e.id.as_str()).collect();
     let mut runs = order.clone();
@@ -198,6 +318,7 @@ async fn a_question_is_a_request_answered_by_an_op() {
     let id = engine
         .submit(Op::UserTurn {
             text: "ask first".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, |e| {
@@ -231,6 +352,7 @@ async fn a_question_nothing_waits_for_is_closed() {
     let id = engine
         .submit(Op::UserTurn {
             text: "drop it".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, turn_done(&id)).await;
@@ -255,6 +377,7 @@ async fn the_asker_carries_a_pod_commands_question() {
     let id = engine
         .submit(Op::UserTurn {
             text: "pod up".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, |e| {
@@ -280,6 +403,7 @@ async fn interrupt_ends_the_turn_and_forgets_its_question() {
     let id = engine
         .submit(Op::UserTurn {
             text: "ask then hang".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, |e| {
@@ -316,6 +440,7 @@ async fn interrupt_ends_the_turn_and_forgets_its_question() {
     let next = engine
         .submit(Op::UserTurn {
             text: "again".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, turn_done(&next)).await;
@@ -329,6 +454,7 @@ async fn shutdown_stops_the_turn_and_ends_with_shutdown_complete() {
     let turn = engine
         .submit(Op::UserTurn {
             text: "hang".into(),
+            images: Vec::new(),
         })
         .unwrap();
     until(&mut engine, |e| {
@@ -363,7 +489,12 @@ async fn shutdown_stops_the_turn_and_ends_with_shutdown_complete() {
 async fn an_interrupt_with_nothing_running_changes_nothing() {
     let mut engine = engine();
     engine.submit(Op::Interrupt).unwrap();
-    let id = engine.submit(Op::UserTurn { text: "hi".into() }).unwrap();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "hi".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let events = until(&mut engine, turn_done(&id)).await;
     assert!(matches!(events[0].msg, EventMsg::TurnStarted(_)));
 }
@@ -399,7 +530,12 @@ fn notices_coded<'a>(events: &'a [Event], code: &str) -> Vec<&'a str> {
 /// Runs `text` as a turn, answering every question that reaches the UI
 /// with `answer`.
 async fn turn_answering(engine: &mut Engine, text: &str, answer: Answer) -> Vec<Event> {
-    let id = engine.submit(Op::UserTurn { text: text.into() }).unwrap();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: text.into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let mut seen = Vec::new();
     while let Some(event) = engine.next_event().await {
         if let EventMsg::QuestionRequest(r) = &event.msg {
@@ -504,7 +640,12 @@ async fn no_terminal_means_no() {
 #[tokio::test]
 async fn shift_tab_at_a_question_switches_and_answers() {
     let mut engine = Engine::spawn_with(Arc::new(StandIn), modes::DEFAULT, true);
-    let id = engine.submit(Op::UserTurn { text: "ask".into() }).unwrap();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "ask".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let events = until(&mut engine, |e| {
         matches!(e.msg, EventMsg::QuestionRequest(_))
     })
@@ -544,6 +685,7 @@ async fn shift_tab_asks_again_when_the_new_mode_does_not_answer() {
     let id = engine
         .submit(Op::UserTurn {
             text: "askpw".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, |e| {
@@ -580,7 +722,12 @@ async fn shift_tab_asks_again_when_the_new_mode_does_not_answer() {
 #[tokio::test]
 async fn shift_tab_without_a_question_only_changes_the_mode() {
     let mut engine = Engine::spawn_with(Arc::new(StandIn), modes::DEFAULT, true);
-    let id = engine.submit(Op::UserTurn { text: "ask".into() }).unwrap();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "ask".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let events = until(&mut engine, |e| {
         matches!(e.msg, EventMsg::QuestionRequest(_))
     })
@@ -657,8 +804,13 @@ struct Gated {
 }
 
 impl Turns for Gated {
-    fn turn(self: Arc<Self>, ctx: TurnContext, text: String) -> BoxFuture<'static, TurnOutcome> {
-        Arc::new(StandIn).turn(ctx, text)
+    fn turn(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        text: String,
+        images: Vec<String>,
+    ) -> BoxFuture<'static, TurnOutcome> {
+        Arc::new(StandIn).turn(ctx, text, images)
     }
 
     fn admit(self: Arc<Self>, _ctx: TurnContext) -> BoxFuture<'static, Result<(), String>> {
@@ -691,13 +843,19 @@ impl Turns for Gated {
 #[tokio::test]
 async fn a_line_not_admitted_is_refused_before_it_is_a_turn() {
     let mut engine = Engine::spawn(Arc::new(Gated::default()));
-    let id = engine.submit(Op::UserTurn { text: "hi".into() }).unwrap();
+    let id = engine
+        .submit(Op::UserTurn {
+            text: "hi".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let events = until(&mut engine, |e| matches!(e.msg, EventMsg::TurnRefused(_))).await;
     assert_eq!(
         msgs(&events),
         [EventMsg::TurnRefused(TurnRefusedEvent {
             text: "hi".into(),
-            message: "no pod is running".into()
+            message: "no pod is running".into(),
+            images: Vec::new(),
         })]
     );
     assert_eq!(events[0].id, id);
@@ -796,6 +954,7 @@ async fn an_interrupted_turn_reports_before_it_ends() {
     let id = engine
         .submit(Op::UserTurn {
             text: "ask hang".into(),
+            images: Vec::new(),
         })
         .unwrap();
     until(
@@ -823,6 +982,7 @@ async fn an_unattended_chat_does_not_announce_its_mode() {
     let id = engine
         .submit(Op::UserTurn {
             text: "quiet".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, turn_done(&id)).await;
@@ -839,6 +999,7 @@ async fn secret_turn(engine: &mut Engine, answer: impl Fn(&str) -> Op) -> Vec<Ev
     let id = engine
         .submit(Op::UserTurn {
             text: "secret".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let mut seen = Vec::new();
@@ -914,6 +1075,7 @@ async fn no_mode_answers_a_secret() {
     let id = engine
         .submit(Op::UserTurn {
             text: "secret".into(),
+            images: Vec::new(),
         })
         .unwrap();
     let events = until(&mut engine, |e| matches!(e.msg, EventMsg::SecretRequest(_))).await;
@@ -958,7 +1120,12 @@ fn shell_events(events: &[Event], id: &str) -> Vec<EventMsg> {
 #[tokio::test]
 async fn a_shell_command_is_a_call_that_waits_its_turn() {
     let mut engine = engine();
-    let turn = engine.submit(Op::UserTurn { text: "one".into() }).unwrap();
+    let turn = engine
+        .submit(Op::UserTurn {
+            text: "one".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     let shell = engine
         .submit(Op::Shell {
             command: "ls -la".into(),
@@ -1015,6 +1182,11 @@ async fn ctrl_c_ends_a_shell_command_as_interrupted() {
     assert_eq!(end.status, ToolCallStatus::Interrupted);
     assert_eq!(end.call_id, format!("shell-{shell}"));
     // The engine goes on: the next line runs.
-    let next = engine.submit(Op::UserTurn { text: "two".into() }).unwrap();
+    let next = engine
+        .submit(Op::UserTurn {
+            text: "two".into(),
+            images: Vec::new(),
+        })
+        .unwrap();
     until(&mut engine, turn_done(&next)).await;
 }

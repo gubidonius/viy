@@ -492,7 +492,10 @@ pub(crate) async fn plain_chat(
                     let op = if text.starts_with('/') {
                         Op::Command { text }
                     } else {
-                        Op::UserTurn { text }
+                        Op::UserTurn {
+                            text,
+                            images: Vec::new(),
+                        }
                     };
                     if engine.submit(op).is_ok() {
                         running += 1;

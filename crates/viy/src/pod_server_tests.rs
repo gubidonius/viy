@@ -164,7 +164,10 @@ impl Rig {
     async fn line(&mut self, text: &str) -> Vec<Event> {
         let id = self
             .engine
-            .submit(Op::UserTurn { text: text.into() })
+            .submit(Op::UserTurn {
+                text: text.into(),
+                images: Vec::new(),
+            })
             .unwrap();
         let ended = move |m: &EventMsg| {
             matches!(
@@ -250,6 +253,7 @@ async fn a_chat_without_a_pod_gives_the_line_back_and_keeps_nothing() {
         Some(TurnRefusedEvent {
             text: "what is 2+2".into(),
             message: "no pod is running: /up starts one.".into(),
+            images: Vec::new(),
         })
     );
     assert!(

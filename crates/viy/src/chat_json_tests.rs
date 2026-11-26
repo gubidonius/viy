@@ -15,7 +15,10 @@ use super::*;
 fn the_callers_lines() {
     assert_eq!(
         parse(r#"{"type":"user","text":"hi"}"#),
-        Ok(Input::Submit(Op::UserTurn { text: "hi".into() }))
+        Ok(Input::Submit(Op::UserTurn {
+            text: "hi".into(),
+            images: Vec::new()
+        }))
     );
     assert_eq!(
         parse(r#"{"type":"command","text":"/compact"}"#),
@@ -160,7 +163,10 @@ impl Rig {
 }
 
 fn user(text: &str) -> Result<Input, String> {
-    Ok(Input::Submit(Op::UserTurn { text: text.into() }))
+    Ok(Input::Submit(Op::UserTurn {
+        text: text.into(),
+        images: Vec::new(),
+    }))
 }
 
 fn kinds(lines: &[Value]) -> Vec<String> {

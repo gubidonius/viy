@@ -50,6 +50,7 @@ use viy_protocol::AskingSecret;
 use viy_protocol::CommandCompleteEvent;
 use viy_protocol::Event;
 use viy_protocol::EventMsg;
+use viy_protocol::ImageInput;
 use viy_protocol::ModeChangedEvent;
 use viy_protocol::NoticeEvent;
 use viy_protocol::NoticeLevel;
@@ -73,6 +74,7 @@ use viy_protocol::TurnStartedEvent;
 use viy_tools::modes;
 use viy_tools::modes::Mode;
 
+use crate::images;
 use crate::trace::Tracer;
 
 /// A boxed future, as the engine's traits return.
@@ -88,7 +90,19 @@ pub trait Turns: Send + Sync + 'static {
 
     /// Runs the user's turn; how it ended. The engine says it started and
     /// ended ([`EventMsg::TurnStarted`], [`EventMsg::TurnComplete`]).
-    fn turn(self: Arc<Self>, ctx: TurnContext, text: String) -> BoxFuture<'static, TurnOutcome>;
+    /// `images`: the line's images as data URLs, prepared (kb d191).
+    fn turn(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        text: String,
+        images: Vec<String>,
+    ) -> BoxFuture<'static, TurnOutcome>;
+
+    /// Why a line with images cannot be sent here (kb d191): the model's
+    /// server reads none. `None`: send them.
+    fn images_refused(&self) -> Option<String> {
+        None
+    }
 
     /// Runs a slash command; the engine says when it is done
     /// ([`EventMsg::CommandComplete`]).
@@ -897,8 +911,13 @@ fn start(
         events: events.clone(),
         questions: questions.clone(),
     };
+    let mut sub = sub;
+    let images = match &mut sub.op {
+        Op::UserTurn { images, .. } => std::mem::take(images),
+        _ => Vec::new(),
+    };
     let (work, text) = match sub.op {
-        Op::UserTurn { text } => (Work::Turn, text),
+        Op::UserTurn { text, .. } => (Work::Turn, text),
         Op::Command { text } => (Work::Command, text),
         Op::OpenSession {
             id,
@@ -952,24 +971,41 @@ fn start(
         match work {
             Work::Turn => {
                 ctx.questions.clear_report();
+                let refuse = |text: String, images: Vec<ImageInput>, message: String| {
+                    ctx.emit(EventMsg::TurnRefused(TurnRefusedEvent {
+                        text,
+                        images,
+                        message,
+                    }));
+                    let _ = done.send(ctx.sub_id.clone());
+                };
                 let _lease = match turns.turn_lease() {
                     Ok(lease) => lease,
-                    Err(message) => {
-                        ctx.emit(EventMsg::TurnRefused(TurnRefusedEvent { text, message }));
-                        let _ = done.send(ctx.sub_id);
-                        return;
-                    }
+                    Err(message) => return refuse(text, images, message),
                 };
                 if let Err(message) = Arc::clone(&turns).admit(ctx.clone()).await {
-                    ctx.emit(EventMsg::TurnRefused(TurnRefusedEvent { text, message }));
-                    let _ = done.send(ctx.sub_id);
-                    return;
+                    return refuse(text, images, message);
                 }
+                // The images, prepared before the turn is shown: one that
+                // cannot be sent gives the line back with all of them.
+                let prepared = if images.is_empty() {
+                    Vec::new()
+                } else if let Some(message) = turns.images_refused() {
+                    return refuse(text, images, message);
+                } else {
+                    let inputs = images.clone();
+                    let job = tokio::task::spawn_blocking(move || images::prepare_all(&inputs));
+                    match job.await {
+                        Ok(Ok(prepared)) => prepared,
+                        Ok(Err(message)) => return refuse(text, images, message),
+                        Err(e) => return refuse(text, images, format!("images not sent: {e}")),
+                    }
+                };
                 ctx.emit(EventMsg::TurnStarted(TurnStartedEvent {
                     turn_id: ctx.sub_id.clone(),
                     user_text: text.clone(),
                 }));
-                let outcome = turns.turn(ctx.clone(), text).await;
+                let outcome = turns.turn(ctx.clone(), text, prepared).await;
                 if let Some(report) = ctx.questions.report() {
                     ctx.emit(auto_yes_report(report));
                 }

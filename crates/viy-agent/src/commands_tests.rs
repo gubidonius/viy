@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use pretty_assertions::assert_eq;
 use viy_protocol::Answer;
 use viy_protocol::HistoryItem;
+use viy_protocol::ImageInput;
 use viy_protocol::RewriteReason;
 
 use super::*;
@@ -91,6 +92,16 @@ fn prefill(events: &[EventMsg]) -> Option<String> {
         EventMsg::InputPrefill(p) => Some(p.text.clone()),
         _ => None,
     })
+}
+
+fn prefill_images(events: &[EventMsg]) -> Vec<ImageInput> {
+    events
+        .iter()
+        .find_map(|e| match e {
+            EventMsg::InputPrefill(p) => Some(p.images.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn user(text: &str) -> HistoryItem {
@@ -182,21 +193,52 @@ async fn a_summary_is_not_a_rewind_point() {
     assert_eq!(d.chat.messages().len(), 2);
 }
 
+/// The images go back to the input box with the message (kb d191); one an
+/// older chat gave by address (rp's `/image <url>`) does not.
 #[tokio::test]
 async fn rewound_images_are_attached_again() {
     let mut d = direct(ok(0), &[]);
     d.chat.messages = vec![
         json!({"role": "user", "content": [
             {"type": "text", "text": "what is this"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}),
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}]}),
         json!({"role": "assistant", "content": "a cat"}),
     ];
     d.cmd("/rewind 1").await;
     let events = d.events();
     assert_eq!(d.chat.messages(), Vec::<Value>::new());
-    assert_eq!(d.chat.pending_images, ["data:image/png;base64,AA"]);
     assert_eq!(prefill(&events).as_deref(), Some("what is this"));
-    assert!(notices(&events).contains(&"1 image attached again".to_string()));
+    assert_eq!(
+        prefill_images(&events),
+        [ImageInput::DataUrl {
+            url: "data:image/png;base64,AA".into()
+        }]
+    );
+    let said = notices(&events);
+    assert!(
+        said.contains(&"1 image attached again".to_string()),
+        "{said:?}"
+    );
+    assert!(
+        said.contains(&"1 image given by address not attached again".to_string()),
+        "{said:?}"
+    );
+}
+
+/// A message that was only an image comes back as that image.
+#[tokio::test]
+async fn a_rewound_image_alone_comes_back() {
+    let mut d = direct(ok(0), &[]);
+    d.chat.messages = vec![
+        json!({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]}),
+        json!({"role": "assistant", "content": "a cat"}),
+    ];
+    d.cmd("/rewind 1").await;
+    let events = d.events();
+    assert_eq!(prefill(&events).as_deref(), Some(""));
+    assert_eq!(prefill_images(&events).len(), 1);
 }
 
 #[tokio::test]
@@ -685,12 +727,9 @@ async fn settings_commands_say_what_they_set() {
         ("/effort max", "usage: /effort xhigh|medium|low"),
         ("/system be brief", "system prompt set"),
         ("/system", "system prompt cleared"),
-        ("/images", "none pending"),
-        ("/image", "usage: /image <path|url>"),
-        (
-            "/image /nonexistent/x.png",
-            "no such file: /nonexistent/x.png",
-        ),
+        // Images are pasted or dropped into the input box (kb d191).
+        ("/image x.png", "unknown command: /image  (try /help)"),
+        ("/images", "unknown command: /images  (try /help)"),
         // nobody at a terminal to answer for each command (rp's no TTY)
         (
             "/ssh host",
@@ -722,24 +761,26 @@ async fn settings_commands_say_what_they_set() {
     );
 }
 
+/// A message's images follow its line, as data URLs, in placeholder order
+/// (kb d191); an image alone is a message too.
 #[tokio::test]
-async fn an_attached_image_goes_with_the_next_message() {
+async fn a_messages_images_follow_its_line() {
     let mut d = direct(ok(1), &[]);
-    d.cmd("/image https://example.com/cat.png").await;
-    assert_eq!(notices(&d.events()), ["attached (1 pending)"]);
-    let content = d.chat.user_content("what is it".into());
+    let (a, b) = ("data:image/png;base64,AA", "data:image/jpeg;base64,BB");
+    let content = d
+        .chat
+        .user_content("[Image #1] or [Image #2]?".into(), vec![a.into(), b.into()]);
     assert_eq!(
         content,
-        json!([{"type": "text", "text": "what is it"},
-               {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}}])
+        json!([{"type": "text", "text": "[Image #1] or [Image #2]?"},
+               {"type": "image_url", "image_url": {"url": a}},
+               {"type": "image_url", "image_url": {"url": b}}])
     );
-    assert!(d.chat.pending_images.is_empty());
-    let path = d._scratch.path().join("dot.gif");
-    std::fs::write(&path, b"GIF8").unwrap();
-    d.cmd(&format!("/image {}", path.display())).await;
-    d.cmd("/images").await;
-    let said = notices(&d.events());
-    assert_eq!(said[1], "  1. data:image/gif;base64,R0lGOA==");
+    assert_eq!(
+        d.chat.user_content(String::new(), vec![a.into()]),
+        json!([{"type": "image_url", "image_url": {"url": a}}])
+    );
+    assert_eq!(d.chat.user_content("again".into(), Vec::new()), "again");
     let _ = &d.mock;
 }
 
@@ -924,12 +965,12 @@ async fn read_only_mount_for_the_file_tools() {
     assert!(said.iter().any(|l| l.contains("1 secret file(s)")));
     // The chat holds outside text now; the note waits for the next message.
     assert!(d.chat.web_taint().unwrap().contains("mounted"));
-    let content = d.chat.user_content("look at it".into());
+    let content = d.chat.user_content("look at it".into(), Vec::new());
     assert!(viy_tools::mounts::is_note(
         content[0]["text"].as_str().unwrap()
     ));
     assert_eq!(content[1]["text"], "look at it");
-    assert_eq!(d.chat.user_content("again".into()), "again");
+    assert_eq!(d.chat.user_content("again".into(), Vec::new()), "again");
 }
 
 #[tokio::test]

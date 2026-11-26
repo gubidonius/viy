@@ -200,8 +200,6 @@ pub struct Chat {
     title_job: Option<JoinHandle<()>>,
     /// The turn in progress: its user message, until the turn closes.
     inflight: Option<Vec<Value>>,
-    /// Images for the next message (`/image`): data URIs or URLs.
-    pending_images: Vec<String>,
     /// Why the session ends when the chat closes: `exit`, or `exec` for
     /// `viy exec`.
     end_reason: &'static str,
@@ -436,7 +434,6 @@ impl Chat {
             measured_prompt: None,
             title_job: None,
             inflight: None,
-            pending_images: Vec::new(),
             end_reason: "exit",
             partial: String::new(),
             files,
@@ -499,6 +496,22 @@ impl Chat {
     /// The history: every closed turn.
     pub fn messages(&self) -> &[Value] {
         &self.messages
+    }
+
+    /// Why this chat's model is sent no images (kb d191): a pod whose
+    /// engine reads none on this profile. A local vLLM reads them, and an
+    /// OpenAI-compatible address answers for itself.
+    pub fn images_refused(&self) -> Option<String> {
+        if self.endpoint.backend != "runpod" {
+            return None;
+        }
+        let engine = viy_engine::EngineName::resolve(&self.cfg).ok()?;
+        (!engine.reads_images(&self.cfg)).then(|| {
+            format!(
+                "not sent: {} on this profile reads no images yet",
+                engine.label()
+            )
+        })
     }
 
     /// The system prompt's date.
@@ -2327,7 +2340,12 @@ impl Drop for Lease {
 }
 
 impl Turns for ChatTurns {
-    fn turn(self: Arc<Self>, ctx: TurnContext, text: String) -> BoxFuture<'static, TurnOutcome> {
+    fn turn(
+        self: Arc<Self>,
+        ctx: TurnContext,
+        text: String,
+        images: Vec<String>,
+    ) -> BoxFuture<'static, TurnOutcome> {
         Box::pin(async move {
             let Some(mut lease) = Lease::take(&self, &ctx) else {
                 return TurnOutcome::Failed {
@@ -2337,7 +2355,7 @@ impl Turns for ChatTurns {
             match lease.chat.as_mut() {
                 Some(chat) => {
                     chat.attach_skills(&ctx, &text);
-                    let content = chat.user_content(text);
+                    let content = chat.user_content(text, images);
                     chat.send(&ctx, content).await
                 }
                 None => TurnOutcome::Failed {
@@ -2345,6 +2363,10 @@ impl Turns for ChatTurns {
                 },
             }
         })
+    }
+
+    fn images_refused(&self) -> Option<String> {
+        self.with_chat(|chat| chat.images_refused()).flatten()
     }
 
     fn turn_lease(&self) -> Result<Option<std::fs::File>, String> {

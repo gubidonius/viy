@@ -226,9 +226,12 @@ async fn runs_after_the_users_yes() {
             .as_deref()
             .is_some_and(|w| w.contains("hetzner"))
     );
-    let content = f.d.chat.user_content("go".into());
+    let content = f.d.chat.user_content("go".into(), Vec::new());
     assert!(remote::is_note(content[0]["text"].as_str().unwrap()));
-    assert_eq!(f.d.chat.user_content("again".into()), json!("again"));
+    assert_eq!(
+        f.d.chat.user_content("again".into(), Vec::new()),
+        json!("again")
+    );
 }
 
 #[tokio::test]

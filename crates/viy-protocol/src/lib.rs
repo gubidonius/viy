@@ -12,10 +12,12 @@
 //! engine share these types without depending on each other.
 
 mod event;
+mod image;
 mod op;
 mod question;
 
 pub use event::*;
+pub use image::ImageInput;
 pub use op::Op;
 pub use op::Submission;
 pub use question::Answer;
