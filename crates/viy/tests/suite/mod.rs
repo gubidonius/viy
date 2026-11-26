@@ -2,6 +2,10 @@
 #[cfg(test)]
 mod chat_pty;
 #[cfg(test)]
+mod completion;
+#[cfg(test)]
+mod nebius_login;
+#[cfg(test)]
 mod resume_pty;
 #[cfg(test)]
 mod shell_op;

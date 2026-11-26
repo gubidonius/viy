@@ -187,6 +187,11 @@
    "stream": [
     {
      "content": "Traits first, then lifetimes."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },

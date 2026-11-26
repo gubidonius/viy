@@ -229,7 +229,7 @@ fn target(store: &Sessions, wanted: &Wanted, scope: &str) -> Result<Option<OpenS
 /// local vLLM.
 fn running_hint(backend: Backend, paths: &Paths) -> Option<&'static str> {
     let running = match backend {
-        Backend::Runpod => state::load(paths).is_ok_and(|s| s.pod_id().is_some()),
+        Backend::Managed => state::load(paths).is_ok_and(|s| s.pod_id().is_some()),
         Backend::Local => viy_pod::local::alive(paths).is_some(),
         Backend::Openai => false,
     };

@@ -58,6 +58,7 @@ impl Machine {
 
     fn env(&self) -> Env<'_> {
         Env {
+            terminal_login: false,
             paths: &self.paths,
             exec: &self.exec,
             http: &self.http,

@@ -146,7 +146,11 @@ pub type Result<T> = std::result::Result<T, ProviderError>;
 pub trait Provider: Send + Sync {
     /// Its name, as the config says it (`runpod`).
     fn name(&self) -> &'static str;
-    /// Every pod of the account that is not terminated, ours or not.
+    /// Whether this adapter only returns resources carrying our installation ownership label.
+    fn lists_owned_pods(&self) -> bool {
+        false
+    }
+    /// All visible non-terminated pods.
     fn pods(&self) -> BoxFuture<'_, Result<Vec<Pod>>>;
     /// One pod; `None` when the provider has none by that id.
     fn pod<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Pod>>>;

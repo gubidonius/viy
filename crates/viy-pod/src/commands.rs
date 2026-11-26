@@ -75,6 +75,8 @@ use viy_provider::ProviderError;
 /// This machine's side of the pod commands.
 #[derive(Clone, Copy)]
 pub struct Env<'a> {
+    /// The foreground command owns stdin and stderr and may show a sign-in link.
+    pub terminal_login: bool,
     pub paths: &'a Paths,
     pub exec: &'a dyn ExecBackend,
     /// RunPod's API and vLLM's /health.
@@ -85,6 +87,13 @@ pub struct Env<'a> {
 }
 
 impl<'a> Env<'a> {
+    pub(crate) fn nebius(&self) -> Result<viy_nebius::NebiusProvider, CommandError> {
+        Ok(
+            viy_nebius::NebiusProvider::new(self.paths, self.http.clone())?
+                .with_terminal_login(self.terminal_login),
+        )
+    }
+
     /// What the ssh and tunnel functions work with.
     pub fn ssh(&self, cfg: &'a Config) -> Ssh<'a> {
         Ssh {
@@ -299,15 +308,22 @@ async fn up_until(
     // and before a volume is made, so nothing billed is left behind.
     engine::for_config(cfg).map_err(CommandError::Exit)?;
     let _lock = PodLock::exclusive(env.paths, "up")?;
+    crate::rental::current(env.paths)?;
     let mut started = Instant::now();
     let mut started_wall = env.time.now();
     let mut timeline = Timeline::start(env.time);
     // RunPod from the config, or the provider given (the tests' second
     // one); RunPod's own side is its failover and backup volumes
     // (docs/provider-seam.md 2).
-    let (seam, runpod): (Arc<dyn Provider>, Option<Arc<RunPodProvider>>) = match given {
-        Some(seam) => (seam, None),
-        None => {
+    let nebius = if let viy_config::Rental::Nebius { region, .. } = &env.paths.rental {
+        Some((Arc::new(env.nebius()?), region))
+    } else {
+        None
+    };
+    let (seam, runpod): (Arc<dyn Provider>, Option<Arc<RunPodProvider>>) = match (given, &nebius) {
+        (Some(seam), _) => (seam, None),
+        (None, Some((adapter, _))) => (adapter.clone(), None),
+        (None, None) => {
             let runpod = Arc::new(provider(env, cfg)?);
             (runpod.clone(), Some(runpod))
         }
@@ -323,6 +339,9 @@ async fn up_until(
     // Never create a duplicate: adopt any existing pod with our name first.
     let existing = match resolve(&*seam, env, cfg, report).await {
         Ok(existing) => existing,
+        Err(ResolveError::Provider(error)) if nebius.is_some() && !error.transient => {
+            return Err(error.into());
+        }
         Err(ResolveError::Provider(error)) => {
             // A 429 says when RunPod takes requests again (kb d140).
             let when = error.retry_after.map_or_else(
@@ -347,6 +366,62 @@ async fn up_until(
         }
         Err(error) => return Err(error.into()),
     };
+    if let Some((adapter, region)) = nebius
+        && existing
+            .as_ref()
+            .is_none_or(|p| p.state == Some(PodState::Stopped))
+    {
+        let options = viy_nebius::Settings::load(env.paths)?;
+        let tier = options
+            .regions
+            .get(region)
+            .map(|r| r.disk_type.as_str())
+            .filter(|t| !t.is_empty())
+            .unwrap_or("NETWORK_SSD");
+        let mode = if options.spot { "spot" } else { "on-demand" };
+        let request = engine::for_config(cfg)
+            .map_err(CommandError::Exit)?
+            .pod_request(cfg, &vllm_key, "", None)
+            .map_err(|e| CommandError::Exit(e.to_string()))?;
+        let (_, ram) = adapter.placement().await?;
+        if request.gpu_count != 1 || request.min_ram_gb.is_some_and(|min| ram < min) {
+            return Err(CommandError::Exit(format!(
+                "Nebius preset {} has {ram} GiB RAM and one GPU; it does not fit this profile.",
+                options.preset
+            )));
+        }
+        let disks = seam
+            .volumes()
+            .ok_or_else(|| CommandError::Exit("Nebius workspace service unavailable".into()))?
+            .list()
+            .await?;
+        let has_disk = disks
+            .iter()
+            .any(|v| v.name.as_deref() == cfg.get("NETWORK_VOLUME_NAME"));
+        let workspace = if has_disk {
+            "existing workspace".into()
+        } else {
+            format!(
+                "new {} GiB {tier} workspace",
+                cfg_at(cfg, "NETWORK_VOLUME_SIZE_GB")
+            )
+        };
+        let prompt = Question::yes_no(
+            None,
+            format!(
+                "Start billed Nebius RTX PRO 6000 in {region} ({}, {mode}, {workspace}, {} GiB boot disk)?",
+                options.preset,
+                request.disk_gb.max(100)
+            ),
+        );
+        let approved = match ask(&prompt) {
+            Some(answer) => answer.await == Answer::Yes,
+            None => false,
+        };
+        if !approved {
+            return Err(CommandError::Exit("Nebius start cancelled.".into()));
+        }
+    }
     // A stopped pod whose host has no GPU free is terminated and `up` goes
     // on to create a pod, as with no pod at all (kb f175, f181).
     'adopt: {
@@ -368,26 +443,39 @@ async fn up_until(
                 Tone::Dim,
                 format!("Resuming stopped pod {pod_id} (named '{name}')..."),
             );
-            match seam.start(&pod_id).await {
-                Ok(()) => {
-                    timeline.mark("resume requested", [("pod_id", json!(pod_id))]);
-                    // A new run: reap counts its idle time and cap from now.
-                    if let Err(error) = idle::forget(env.paths) {
-                        say(
-                            report,
-                            Tone::Warn,
-                            format!(
-                                "Could not reset viy reap's count for the resumed pod: {error}"
-                            ),
-                        );
+            loop {
+                match seam.start(&pod_id).await {
+                    Ok(()) => {
+                        timeline.mark("resume requested", [("pod_id", json!(pod_id))]);
+                        // A new run: reap counts its idle time and cap from now.
+                        if let Err(error) = idle::forget(env.paths) {
+                            say(
+                                report,
+                                Tone::Warn,
+                                format!(
+                                    "Could not reset viy reap's count for the resumed pod: {error}"
+                                ),
+                            );
+                        }
                     }
+                    Err(error)
+                        if error.capacity && env.paths.rental != viy_config::Rental::Runpod =>
+                    {
+                        if crate::rental::retry_capacity(env, report, ask).await? {
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                    Err(error)
+                        if error.capacity && env.paths.rental == viy_config::Rental::Runpod =>
+                    {
+                        retire_stopped(env, cfg, &*seam, &existing, &error, report).await?;
+                        timeline.mark("resume refused", [("pod_id", json!(pod_id))]);
+                        break 'adopt;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) if error.capacity => {
-                    retire_stopped(env, cfg, &*seam, &existing, &error, report).await?;
-                    timeline.mark("resume refused", [("pod_id", json!(pod_id))]);
-                    break 'adopt;
-                }
-                Err(error) => return Err(error.into()),
+                break;
             }
         } else {
             say(
@@ -399,7 +487,10 @@ async fn up_until(
                 ),
             );
         }
-        if state::load(env.paths)?.get(key::TUNNEL_ONLY).is_none() && tunnel_enabled(cfg) {
+        if runpod.is_some()
+            && state::load(env.paths)?.get(key::TUNNEL_ONLY).is_none()
+            && tunnel_enabled(cfg)
+        {
             say(
                 report,
                 Tone::Warn,
@@ -475,6 +566,11 @@ async fn up_until(
 
     let pubkey = find_ssh_pubkey(env.paths)?;
     if tunnel_enabled(cfg) && pubkey.is_none() {
+        if env.paths.rental != viy_config::Rental::Runpod {
+            return Err(CommandError::Exit(
+                "Nebius needs an SSH public key in ~/.ssh before it can create a VM.".into(),
+            ));
+        }
         // sshd is the only route into a tunnel-only pod, and the key can
         // only be injected at creation, so making one now would strand it.
         return Err(CommandError::Exit(
@@ -512,7 +608,52 @@ async fn up_until(
     let created = if backup {
         creation.run_on_backup().await?
     } else {
-        creation.run(&volume_id, volume_is_new).await?
+        match creation.run(&volume_id, volume_is_new).await {
+            Ok(created) => created,
+            Err(error) if env.paths.rental != viy_config::Rental::Runpod => {
+                let certain = matches!(&error, CommandError::Provider(e) if e.status.is_some() && !e.transient);
+                match seam.pods().await {
+                    Ok(vms) if certain && vms.is_empty() && volume_is_new => {
+                        if let Some(volumes) = seam.volumes() {
+                            match volumes.delete(&volume_id).await {
+                                Ok(()) => say(
+                                    report,
+                                    Tone::Dim,
+                                    format!("Removed unused new workspace {volume_id}."),
+                                ),
+                                Err(e) => say(
+                                    report,
+                                    Tone::Warn,
+                                    format!("Workspace {volume_id} was retained: {e}"),
+                                ),
+                            }
+                        }
+                    }
+                    Ok(vms) => {
+                        let ids: Vec<_> = vms.iter().map(|v| v.id.as_str()).collect();
+                        say(
+                            report,
+                            Tone::Warn,
+                            format!(
+                                "Retained workspace {volume_id}. Tracked Nebius VMs: {}.",
+                                if ids.is_empty() {
+                                    "none visible".into()
+                                } else {
+                                    ids.join(", ")
+                                }
+                            ),
+                        );
+                    }
+                    Err(e) => say(
+                        report,
+                        Tone::Warn,
+                        format!("Workspace {volume_id} retained. Could not confirm VM state: {e}"),
+                    ),
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        }
     };
     // Time spent answering failover questions, or waiting between retries
     // for a free GPU, is the user's or RunPod's, not the boot's.
@@ -750,7 +891,7 @@ pub async fn ensure_volume(
             cfg.set("DATA_CENTER_ID", theirs);
         }
         let id = volume.id.clone();
-        profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", &id)?;
+        remember_volume(env, cfg, &id)?;
         return Ok((id, false));
     }
     let size = cfg_at(cfg, "NETWORK_VOLUME_SIZE_GB");
@@ -767,9 +908,18 @@ pub async fn ensure_volume(
     })?;
     // The primary takes its region's default tier, as rp.
     let id = volumes.create(&name, size_gb, &region).await?.id;
-    profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", &id)?;
+    remember_volume(env, cfg, &id)?;
     say(report, Tone::Ok, format!("  volume id: {id}"));
     Ok((id, true))
+}
+
+fn remember_volume(env: &Env<'_>, cfg: &mut Config, id: &str) -> io::Result<()> {
+    if env.paths.rental == viy_config::Rental::Runpod {
+        profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", id)
+    } else {
+        cfg.set("NETWORK_VOLUME_ID", id);
+        Ok(())
+    }
 }
 
 /// A stopped pod RunPod will not start because its host's GPUs are taken
@@ -877,7 +1027,9 @@ pub async fn volume(
     report: Reporter<'_>,
     ask: Asker<'_>,
 ) -> Result<(), CommandError> {
-    let seam = provider(env, cfg)?;
+    let seam = crate::rental::selected(env, cfg)?;
+    let _lock = PodLock::exclusive(env.paths, "volume")?;
+    crate::rental::current(env.paths)?;
     let Some(volumes) = seam.volumes() else {
         return Err(CommandError::Exit(format!(
             "{} has no network volumes.",
@@ -904,7 +1056,7 @@ pub async fn volume(
             }
         }
         VolumeAction::Create => {
-            let (id, created) = ensure_volume(env, cfg, &seam, report).await?;
+            let (id, created) = ensure_volume(env, cfg, &*seam, report).await?;
             let existed = if created { "" } else { " (already existed)" };
             print(format!("volume: {id}{existed}"));
         }
@@ -924,14 +1076,14 @@ pub async fn volume(
                 Some(asking) => asking.await,
                 None => question.unattended,
             };
-            if answer == Answer::No {
+            if answer != Answer::Yes {
                 print("aborted".to_string());
                 return Ok(());
             }
             volumes.delete(&id).await?;
             regions::forget(env.paths, &id)?;
             if cfg.get("NETWORK_VOLUME_ID") == Some(id.as_str()) {
-                profiles::persist(cfg, env.paths, "NETWORK_VOLUME_ID", "")?;
+                remember_volume(env, cfg, "")?;
             }
             print(format!("deleted {id}"));
         }
@@ -944,14 +1096,17 @@ pub async fn volume(
 /// `viy status`: the pod's state, GPU, region, cost, endpoint and
 /// transport, the tunnel, and whether vLLM answers.
 pub async fn status(env: &Env<'_>, cfg: &Config, report: Reporter<'_>) -> Result<(), CommandError> {
-    let seam = provider(env, cfg)?;
-    let pod = match resolve(&seam, env, cfg, report).await {
+    let seam = crate::rental::selected(env, cfg)?;
+    let pod = match resolve(&*seam, env, cfg, report).await {
         Ok(pod) => pod,
         Err(ResolveError::Provider(error)) => {
             say(
                 report,
                 Tone::Warn,
-                "Could not reach RunPod to check status; local state left as-is.",
+                format!(
+                    "Could not reach {} to check status; local state left as-is.",
+                    env.paths.rental.display_name()
+                ),
             );
             say(report, Tone::Dim, error.to_string());
             return Ok(());
@@ -969,7 +1124,11 @@ pub(crate) async fn status_of(
     pod: Option<Pod>,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let lifetimes = regions::lifetimes(env.paths, cfg, regions::now(env.time));
+    let lifetimes = if env.paths.rental == viy_config::Rental::Runpod {
+        regions::lifetimes(env.paths, cfg, regions::now(env.time))
+    } else {
+        vec![]
+    };
     let Some(pod) = pod else {
         say(
             report,
@@ -1007,10 +1166,14 @@ pub(crate) async fn status_of(
             .filter(|r| !r.is_empty())
             .unwrap_or("?")
     ));
-    line(format!(
-        "  cost:      ${:.2}/hr",
-        pod.cost_per_hour.unwrap_or(0.0)
-    ));
+    if env.paths.rental != viy_config::Rental::Runpod && pod.cost_per_hour.is_none() {
+        line("  cost:      unavailable".into());
+    } else {
+        line(format!(
+            "  cost:      ${:.2}/hr",
+            pod.cost_per_hour.unwrap_or(0.0)
+        ));
+    }
     if let Some(started) = &pod.started_at {
         line(format!("  started:   {started}"));
     }
@@ -1027,6 +1190,10 @@ pub(crate) async fn status_of(
         line(text);
     }
     if pod.state != Some(viy_provider::PodState::Running) {
+        return Ok(());
+    }
+    if env.paths.rental != viy_config::Rental::Runpod && !tunnel::running(&env.ssh(cfg))?.alive {
+        line("  serving:   SSH tunnel is down".into());
         return Ok(());
     }
     let request = Request::new(Method::GET, format!("{url}/health"))
@@ -1080,13 +1247,13 @@ pub async fn stop_confirmed(
 /// Pods of ours RunPod lists as neither stopped nor terminated: after the
 /// shutdown's stop there should be none, or `down` ends them.
 pub async fn running_pods(env: &Env<'_>, cfg: &Config) -> Result<Vec<String>, CommandError> {
-    let seam = provider(env, cfg)?;
+    let seam = crate::rental::selected(env, cfg)?;
     let ids: HashSet<String> = state::load(env.paths)?
         .pod_id()
         .map(str::to_string)
         .into_iter()
         .collect();
-    Ok(our_pods(&seam, cfg, &ids)
+    Ok(our_pods(&*seam, cfg, &ids)
         .await?
         .into_iter()
         .filter(|p| p.state != Some(PodState::Stopped))
@@ -1102,17 +1269,21 @@ async fn stop_pod(
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
     let _lock = PodLock::exclusive(env.paths, "stop")?;
-    let seam = provider(env, cfg)?;
-    let pod = match resolve(&seam, env, cfg, report).await {
+    crate::rental::current(env.paths)?;
+    let seam = crate::rental::selected(env, cfg)?;
+    let pod = match resolve(&*seam, env, cfg, report).await {
         Ok(pod) => pod,
         Err(ResolveError::Provider(error)) => {
             say(
                 report,
                 Tone::Warn,
-                "Could not reach RunPod; nothing was stopped.",
+                format!(
+                    "Could not reach {}; nothing was stopped.",
+                    env.paths.rental.display_name()
+                ),
             );
             say(report, Tone::Dim, error.to_string());
-            return if confirmed {
+            return if confirmed || env.paths.rental != viy_config::Rental::Runpod {
                 Err(CommandError::Failed)
             } else {
                 Ok(())
@@ -1124,7 +1295,7 @@ async fn stop_pod(
         say(report, Tone::Dim, "No pod to stop.");
         return Ok(());
     };
-    stop_on(env, cfg, &seam, &pod, report).await
+    stop_on(env, cfg, &*seam, &pod, report).await
 }
 
 /// Stops `pod` on `seam`, its forward first, and says what that costs.
@@ -1139,7 +1310,14 @@ pub(crate) async fn stop_on(
     // Nothing left to forward to.
     let mut said = |notice| report(Report::Notice(notice));
     tunnel::stop(&env.ssh(cfg), true, &mut said).await?;
+    say_slow(seam, report, format!("Stopping {pod_id}"), "about a minute");
     seam.stop(pod_id).await?;
+    crate::rental::observe(
+        env.paths,
+        "STOPPED",
+        pod.region.as_deref(),
+        pod.volume.as_deref(),
+    )?;
     say(
         report,
         Tone::Ok,
@@ -1148,9 +1326,24 @@ pub(crate) async fn stop_on(
     say(
         report,
         Tone::Dim,
-        "Note: a stopped pod costs nothing but its network volume; if its GPU is taken meanwhile, \
-         viy up makes a new pod.",
+        if env.paths.rental != viy_config::Rental::Runpod {
+            "Nebius retains the boot and workspace disks. Both continue to incur storage charges."
+        } else {
+            "Note: a stopped pod costs nothing but its network volume; if its GPU is taken meanwhile, \
+         viy up makes a new pod."
+        },
     );
+    if env.paths.rental != viy_config::Rental::Runpod {
+        let adapter = env.nebius()?;
+        match adapter.retained_cost(pod_id).await {
+            Ok(cost) => say(report, Tone::Dim, cost),
+            Err(e) => say(
+                report,
+                Tone::Dim,
+                format!("Retained storage estimate unavailable: {e}"),
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1170,7 +1363,14 @@ pub async fn down(
     cancelled_up: bool,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    down_on(env, cfg, &provider(env, cfg)?, cancelled_up, report).await
+    down_on(
+        env,
+        cfg,
+        &*crate::rental::selected(env, cfg)?,
+        cancelled_up,
+        report,
+    )
+    .await
 }
 
 /// [`down`] on `seam`: nothing in it is RunPod's but the console it names
@@ -1202,6 +1402,7 @@ pub(crate) async fn down_on(
         .find(|h| h.verb == "up")
         .map(crate::lock::Holder::tool_name);
     let lock = preempted.lock;
+    crate::rental::current(env.paths)?;
     // The forward goes before the state file, or its pid is lost and the
     // ssh outlives the pod it pointed at.
     let ssh = env.ssh(cfg);
@@ -1247,6 +1448,13 @@ pub(crate) async fn down_on(
         );
         return Err(CommandError::Failed);
     }
+    let prior = state::load(env.paths)?;
+    crate::rental::observe(
+        env.paths,
+        "absent",
+        cfg.get("DATA_CENTER_ID"),
+        prior.volume_id(),
+    )?;
     state::clear(env.paths)?;
     drop(lock);
     if done.is_empty() {
@@ -1286,8 +1494,21 @@ async fn our_pods(
         .pods()
         .await?
         .into_iter()
-        .filter(|p| p.name.as_deref() == Some(name) || (!p.id.is_empty() && ids.contains(&p.id)))
+        .filter(|p| {
+            seam.lists_owned_pods()
+                || p.name.as_deref() == Some(name)
+                || (!p.id.is_empty() && ids.contains(&p.id))
+        })
         .collect())
+}
+
+/// Says what a rental other than RunPod is about to wait for, in the
+/// provider's own operations, so the command is not silent meanwhile.
+/// RunPod answers at once and its lines are rp's.
+fn say_slow(seam: &dyn Provider, report: Reporter<'_>, what: String, takes: &str) {
+    if seam.name() != "runpod" {
+        say(report, Tone::Dim, format!("{what} ({takes})..."));
+    }
 }
 
 /// Terminates every pod of ours, then lists again until RunPod has shown
@@ -1304,6 +1525,7 @@ async fn sweep(
     let started = Instant::now();
     let mut clear_since: Option<Instant> = None;
     let mut done: Vec<String> = Vec::new();
+    let mut announced: HashSet<String> = HashSet::new();
     let mut error: Option<ProviderError> = None;
     let mut delay = Duration::from_secs(2);
     while started.elapsed() < budget {
@@ -1337,6 +1559,14 @@ async fn sweep(
             }
             let id = pod.id.clone();
             ids.insert(id.clone());
+            if announced.insert(id.clone()) {
+                say_slow(
+                    seam,
+                    report,
+                    format!("  terminating {id}"),
+                    "about 2 minutes",
+                );
+            }
             if let Err(e) = seam.terminate(&id).await
                 && e.status != Some(404)
             {
@@ -1394,11 +1624,15 @@ pub async fn logs(
     interrupted: impl Future<Output = ()>,
     report: Reporter<'_>,
 ) -> Result<(), CommandError> {
-    let seam = provider(env, cfg)?;
-    let pod = match resolve(&seam, env, cfg, report).await {
+    let seam = crate::rental::selected(env, cfg)?;
+    let pod = match resolve(&*seam, env, cfg, report).await {
         Ok(pod) => pod,
         Err(ResolveError::Provider(error)) => {
-            say(report, Tone::Warn, "Could not reach RunPod.");
+            say(
+                report,
+                Tone::Warn,
+                format!("Could not reach {}.", env.paths.rental.display_name()),
+            );
             say(report, Tone::Dim, error.to_string());
             return Ok(());
         }
@@ -1412,12 +1646,46 @@ pub async fn logs(
     say(
         report,
         Tone::Dim,
-        "RunPod platform + container logs (available before SSH):",
+        if env.paths.rental == viy_config::Rental::Runpod {
+            "RunPod platform + container logs (available before SSH):"
+        } else {
+            "Nebius serial console and engine logs:"
+        },
     );
     let print = async {
         let mut seen: HashSet<(Option<String>, Option<String>, String)> = HashSet::new();
         loop {
-            let entries = seam.logs(pod_id, 200, Duration::from_secs(8)).await?;
+            let mut entries = seam.logs(pod_id, 200, Duration::from_secs(8)).await?;
+            if env.paths.rental != viy_config::Rental::Runpod
+                && let Some((ip, port)) = &pod.ssh
+            {
+                let ssh = env.ssh(cfg);
+                if let Ok(opts) = ssh.opts("yes")
+                    && ssh.pinned_fingerprint().await.ok().flatten().is_some()
+                    && let Ok(out) = env
+                        .exec
+                        .run(
+                            viy_exec::Command::new("ssh")
+                                .args(["-o", "BatchMode=yes"])
+                                .args(opts)
+                                .arg("-p")
+                                .arg(port.to_string())
+                                .arg(ssh.login(ip))
+                                .arg(viy_nebius::ENGINE_LOG_COMMAND)
+                                .timeout(Duration::from_secs(8)),
+                        )
+                        .await
+                    && out.status.success()
+                {
+                    entries.extend(String::from_utf8_lossy(&out.stdout).lines().map(|line| {
+                        viy_provider::LogLine {
+                            time: None,
+                            source: Some("engine".into()),
+                            text: line.to_owned(),
+                        }
+                    }));
+                }
+            }
             for entry in &entries {
                 let identity = (entry.time.clone(), entry.source.clone(), entry.text.clone());
                 if !seen.insert(identity) {
@@ -1456,7 +1724,11 @@ pub async fn logs(
         say(
             report,
             Tone::Dim,
-            format!("Web console logs: https://console.runpod.io/pods/{pod_id}"),
+            if env.paths.rental == viy_config::Rental::Runpod {
+                format!("Web console logs: https://console.runpod.io/pods/{pod_id}")
+            } else {
+                format!("Check the Nebius serial console for VM {pod_id}.")
+            },
         );
     }
     Ok(())

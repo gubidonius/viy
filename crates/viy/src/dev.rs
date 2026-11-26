@@ -200,8 +200,15 @@ fn with_model(
         .enable_all()
         .build()
         .map_err(|e| Failure::from(e.to_string()))?;
-    let url = runtime.block_on(crate::exec::base_url(cfg, None, paths, &http, out))?;
     let backend = Backend::resolve(cfg)?;
+    let _lease = if backend == Backend::Managed {
+        Some(viy_pod::rental::lease(paths, false).map_err(|e| Failure::from(e.to_string()))?)
+    } else {
+        None
+    };
+    let selected = paths.selected().map_err(|e| Failure::from(e.to_string()))?;
+    let paths = &selected;
+    let url = runtime.block_on(crate::exec::base_url(cfg, None, paths, &http, out))?;
     if backend.api_key(cfg).is_empty() {
         return Err(Failure::from(backend.missing_key_hint(paths)));
     }
@@ -625,7 +632,11 @@ pub(crate) fn chat(
     };
     let sessions = Sessions::new(paths.sessions_dir(), Arc::new(SystemTimeProvider));
     let paths = paths.clone();
-    let touch = Arc::new(move || idle::touch(&paths, &SystemTimeProvider, false));
+    let touch = Arc::new(move || {
+        if let Ok(selected) = paths.selected() {
+            idle::touch(&selected, &SystemTimeProvider, false);
+        }
+    });
     let mut chat = Chat::new(
         cfg,
         places,

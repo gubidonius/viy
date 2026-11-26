@@ -71,6 +71,7 @@ fn the_settings_are_exported_before_the_script() {
         "export STRATA_ENGINE_SHA256=6723e1b6b6042bfe1d368723ebf873afb0fa65f4f1908d948dd865098f6cfb9e",
         "export STRATA_CONTROL_SHA256=045b6a7d7fbfbddab814794db5763d6244c887a394403b9fe0e8a4714d9bef8c",
         "export STRATA_PARALLEL=2",
+        "export STRATA_YARN_ORIG_CTX=0",
         "export STRATA_BATCH_MTP=1",
         "export STRATA_PLE_IO=mmap",
         "export STRATA_PLE_WARM=1",
@@ -83,8 +84,15 @@ fn the_settings_are_exported_before_the_script() {
     ] {
         assert!(script.contains(&format!("\n{line}\n")), "{line}");
     }
-    let cfg = with([("MODEL_FILES", "Q5_K_M/*"), ("TUNNEL", "0")]);
+    let cfg = with([
+        ("MODEL_FILES", "Q5_K_M/*"),
+        ("TUNNEL", "0"),
+        ("MAX_MODEL_LEN", "524288"),
+        ("STRATA_YARN_ORIG_CTX", "262144"),
+    ]);
     let script = build_boot_script(&cfg).unwrap();
+    assert!(script.contains("\nexport STRATA_MAX_CONTEXT=524288\n"));
+    assert!(script.contains("\nexport STRATA_YARN_ORIG_CTX=262144\n"));
     assert!(script.contains("\nexport STRATA_MODEL_FILES='Q5_K_M/*'\n"));
     assert!(script.contains("\nexport STRATA_HOST=0.0.0.0\n"));
 }
@@ -220,7 +228,7 @@ fn strata_pod_passes_its_tests() {
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
-    assert!(stderr.contains("Ran 43 tests"), "{stderr}");
+    assert!(stderr.contains("Ran 44 tests"), "{stderr}");
 }
 
 /// The body's keys in order, held apart from the code that writes them

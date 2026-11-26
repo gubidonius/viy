@@ -137,12 +137,13 @@ fn subcommands_and_flags_are_rps() {
         .flat_map(|s| match s["name"].as_str().unwrap() {
             "chats" => vec!["resume", "fork", "archive", "unarchive", "delete"],
             "ask" => vec!["exec"],
+            "volume" => vec!["volume", "provider", "completion"],
             "toolbox" => vec!["toolbox", "skills"],
             other => vec![other],
         })
         .collect();
     assert_eq!(names, rp_names);
-    assert_eq!(names.len(), 24);
+    assert_eq!(names.len(), 26);
     for rp in subcommands {
         let name = rp["name"].as_str().unwrap();
         let Some(sub) = cmd.find_subcommand(name) else {
@@ -183,7 +184,15 @@ fn subcommands_and_flags_are_rps() {
                     .is_some_and(|f| f.iter().any(|x| x == "-c" || x == "-r"));
                 !(name == "chat" && resume)
             })
-            .map(|a| expected(name, a))
+            .map(|a| {
+                let mut value = expected(name, a);
+                if name == "model" && value["choices"].is_array() {
+                    // The action also accepts a locally configured profile.
+                    value["choices"] = Value::Null;
+                    value["help"] = json!("list, show, use, add, or a profile name to select");
+                }
+                value
+            })
             .collect();
         assert_eq!(args, rp_args, "{name}");
     }
@@ -248,7 +257,7 @@ fn namespace(cli: &Cli) -> Value {
         }
         // viy's own; rp has nothing to compare it with.
         Command::CaptureBoot { boot_id, pod_id } => json!({"boot_id": boot_id, "pod_id": pod_id}),
-        Command::Dev(_) => json!({}),
+        Command::Dev(_) | Command::Provider { .. } | Command::Completion { .. } => json!({}),
     };
     ns["cmd"] = json!(cli.command.name());
     ns

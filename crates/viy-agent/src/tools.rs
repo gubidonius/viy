@@ -954,6 +954,7 @@ impl Chat {
             }
             "on" => {
                 self.tools_on = true;
+                self.refresh_history_gauge(ctx);
                 let _ = std::fs::create_dir_all(&self.places.workspace);
                 info(format!(
                     "build tools on: write_file, read_file, list_dir, run_shell. workspace: {}; mode {mode}",
@@ -982,6 +983,7 @@ impl Chat {
             }
             "off" => {
                 self.tools_on = false;
+                self.refresh_history_gauge(ctx);
                 info("build tools off".into());
             }
             // Old muscle memory: the approval modes are gone.

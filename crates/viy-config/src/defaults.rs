@@ -186,6 +186,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // For a GGUF repo, the files of MODEL_REPO to fetch (`hf download
     // --include`), e.g. Q5_K_M/*. Empty: the whole repo.
     ("MODEL_FILES", ""),
+    // A profile can opt into YaRN beyond the model's trained window.
+    ("STRATA_YARN_ORIG_CTX", ""),
     // Batch slots, and each slot verifying MTP proposals: two requests at
     // once without queueing, 147 tok/s together (kb d166).
     ("STRATA_PARALLEL", "2"),
@@ -346,6 +348,8 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     // Cap on the characters of file/command output fed back to the model (and
     // shown), so one noisy command can't blow the context window.
     ("TOOLS_MAX_OUTPUT", "20000"),
+    // Optional character cap for read_file, including explore helpers. Empty inherits TOOLS_MAX_OUTPUT.
+    ("TOOLS_FILE_READ_MAX_CHARS", ""),
     // A build loop (write -> run -> read error -> fix) needs more iterations
     // than a search does. Used when tools are on.
     // 25: codebase questions used 7-13 rounds at xhigh (kb d009).

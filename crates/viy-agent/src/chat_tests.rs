@@ -416,6 +416,13 @@ async fn an_interrupted_turn_keeps_what_streamed() {
             break;
         }
     }
+    rig.turns
+        .with_chat(|chat| {
+            let count = chat.gauge.as_ref().unwrap();
+            assert!(count.estimated);
+            assert_eq!(count.used, chat.context_state(&[]).0);
+        })
+        .unwrap();
     assert_eq!(
         rig.messages(),
         [
@@ -623,15 +630,37 @@ async fn a_turn_calibrates_reports_the_context_and_keeps_its_numbers() {
     let cpt = rig.turns.with_chat(|c| c.chars_per_token()).unwrap();
     assert_eq!(cpt, want.chars_per_token);
     assert_ne!(cpt, crate::context::DEFAULT_CHARS_PER_TOKEN);
-    let (used, budget) = rig
+    let (budget, prompt_budget) = rig
         .turns
-        .with_chat(|c| (c.context_state(&[]).0, c.prompt_budget()))
+        .with_chat(|c| (c.max_model_len(), c.prompt_budget()))
         .unwrap();
-    assert!(events.contains(&EventMsg::TokenCount(TokenCountEvent {
-        used,
-        budget,
-        auto_compact_at: Some((budget as f64 * 0.85) as u64),
-    })));
+    let counts: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            EventMsg::TokenCount(n) => Some((i, n)),
+            _ => None,
+        })
+        .collect();
+    let first_delta = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                EventMsg::ReasoningContentDelta(_) | EventMsg::AgentMessageContentDelta(_)
+            )
+        })
+        .unwrap();
+    assert!(counts.iter().any(|(i, n)| *i < first_delta && n.estimated));
+    assert_eq!(
+        counts.last().unwrap().1,
+        &TokenCountEvent {
+            used: 612,
+            budget,
+            estimated: false,
+            auto_compact_at: Some((prompt_budget as f64 * 0.85) as u64),
+        }
+    );
     let stats = rig
         .turns
         .with_chat(|c| c.stats().cloned())
@@ -646,7 +675,7 @@ async fn a_turn_calibrates_reports_the_context_and_keeps_its_numbers() {
         ),
         (Some(600), Some(12), 3, Some("stop"))
     );
-    assert_eq!(stats.context_tokens, used);
+    assert_eq!((stats.context_tokens, stats.context_budget), (612, budget));
     assert!(stats.ttft_s.is_some());
     assert_eq!(
         serde_json::to_value(&stats)
@@ -677,6 +706,7 @@ async fn a_turn_calibrates_reports_the_context_and_keeps_its_numbers() {
         .with_chat(|c| c.stats().cloned())
         .unwrap()
         .unwrap();
+    assert_eq!(stats.context_tokens, 9003);
     assert_eq!(
         (stats.prompt_tokens, stats.reasoning_chars),
         (Some(9000), 3)
@@ -1126,15 +1156,19 @@ async fn the_chat_says_its_effort_context_and_name() {
             effort: "low".into()
         })
     );
-    let budget = rig.turns.with_chat(|c| c.prompt_budget());
+    let (window, prompt_budget) = rig
+        .turns
+        .with_chat(|c| (c.max_model_len(), c.prompt_budget()))
+        .unwrap();
     let EventMsg::TokenCount(gauge) = &opening[1] else {
         panic!("{:?}", opening[1]);
     };
     assert!(gauge.used > 0, "the system prompt counts");
-    assert_eq!(Some(gauge.budget), budget);
+    assert_eq!(gauge.budget, window);
+    assert!(gauge.estimated);
     assert_eq!(
         gauge.auto_compact_at,
-        Some((gauge.budget as f64 * 0.85) as u64)
+        Some((prompt_budget as f64 * 0.85) as u64)
     );
     let titles = |events: &[EventMsg]| {
         events
@@ -2659,4 +2693,173 @@ async fn a_call_cut_off_by_max_tokens_is_stored_valid_and_explained() {
         "{result}"
     );
     assert!(!d.chat.places.workspace.join("a.py").exists());
+}
+
+#[test]
+fn served_window_uses_the_selected_models_live_metadata() {
+    let models = json!({"data":[
+        {"id":"first","max_model_len":8192},
+        {"id":"heretic-2","meta":{"n_ctx":131072}},
+    ]});
+    assert_eq!(served_context(&models, "heretic-2"), Some(131072));
+    assert_eq!(served_context(&models, "first"), Some(8192));
+    assert_eq!(served_context(&models, "unknown"), None);
+    let alias =
+        json!({"data":[{"id":"different-alias","max_model_len":0,"meta":{"n_ctx":524288}}]});
+    assert_eq!(served_context(&alias, "heretic-2"), Some(524288));
+}
+
+#[tokio::test]
+async fn context_updates_for_limit_changes_history_rewrites_and_a_reused_tunnel() {
+    let mut d = direct(
+        json!([{"stream":[{"content":"ok"},{"usage":{"total_tokens":31001}}]}]),
+        &[],
+    );
+    d.send("hello").await;
+    let count = |chat: &Chat| chat.gauge.clone().unwrap();
+    let measured = count(&d.chat);
+    assert_eq!((measured.used, measured.estimated), (31001, false));
+    d.chat.command(&d.ctx, "/maxtok 1000").await;
+    let adjusted = count(&d.chat);
+    assert_eq!(
+        (adjusted.used, adjusted.budget, adjusted.estimated),
+        (31001, measured.budget, false)
+    );
+    assert_eq!(
+        adjusted.auto_compact_at,
+        Some(((adjusted.budget - 1000) as f64 * 0.85) as u64)
+    );
+    d.chat.command(&d.ctx, "/autocompact off").await;
+    assert_eq!(count(&d.chat).auto_compact_at, None);
+    d.chat.connect(
+        &d.ctx,
+        crate::server::Ready {
+            base: d.mock.uri(),
+            model: "m".into(),
+            context_window: Some(131072),
+        },
+    );
+    assert_eq!(
+        (count(&d.chat).budget, count(&d.chat).used),
+        (131072, 31001)
+    );
+    d.chat.command(&d.ctx, "/new").await;
+    let reset = count(&d.chat);
+    assert_eq!(reset.budget, 131072);
+    assert_eq!(reset.used, d.chat.context_state(&[]).0);
+    assert!(reset.estimated);
+}
+
+#[tokio::test]
+async fn a_retry_without_usage_cannot_inherit_the_previous_rounds_measurement() {
+    let mut d = direct(
+        json!([
+            {"stream":[{"reasoning":"think"},{"usage":{"prompt_tokens":30000,"completion_tokens":17,"total_tokens":30017}}]},
+            {"stream":[{"content":"ok"},{"usage":{}}]},
+        ]),
+        &[],
+    );
+    d.send("hello").await;
+    let count = d.chat.gauge.as_ref().unwrap();
+    assert!(count.estimated);
+    let stats = d.chat.stats().unwrap();
+    assert_eq!((stats.prompt_tokens, stats.completion_tokens), (None, None));
+    assert_eq!(stats.context_tokens, count.used);
+}
+
+#[tokio::test]
+async fn measured_prompt_drives_compaction_at_each_served_windows_cutoff() {
+    // Real config discovery and SSE usage, with small synthetic messages whose
+    // character counts alone could never reach the reported prompt size.
+    for window in [262_144_u64, 524_288] {
+        let cutoff = ((window - 16_384) as f64 * 0.85).ceil() as u64;
+        let suffix = [
+            json!({"role":"assistant","content":"ok"}),
+            json!({"role":"user","content":"again"}),
+        ];
+        let new_tokens = Estimator::default().tokens(&suffix, 0);
+        for total in [cutoff - 1, cutoff] {
+            let reported = total - new_tokens;
+            let mock = MockLlm::start(&json!({"max_model_len":window,"responses":[
+                {"stream":[{"content":"ok"},{"usage":{"prompt_tokens":reported, "completion_tokens":1}}]},
+                {"stream":[{"content":"synthetic summary"}]},
+                {"stream":[{"content":"done"}]}
+            ]})).unwrap();
+            let (_scratch, store) = sessions_store();
+            let mut chat = chat_at(&mock, &[("COMPACT_BACKGROUND_AT", "0")], &store);
+            let (ctx, _rx) = TurnContext::detached();
+            chat.send(&ctx, json!("first")).await;
+            assert_eq!(chat.max_model_len(), window);
+            assert_eq!(chat.context_state(&suffix[1..]).0, total);
+            chat.send(&ctx, json!("again")).await;
+            let bodies = mock.chat_bodies();
+            assert_eq!(bodies.len(), if total == cutoff { 3 } else { 2 });
+            if total == cutoff {
+                assert!(bodies[2]["messages"].as_array().unwrap().iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|v| v.contains("synthetic summary"))
+                }));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn tool_loop_uses_reported_prompt_for_clipping_and_stopping() {
+    for window in [262_144_u64, 524_288] {
+        let ceiling = ((window - 16_384) as f64 * 0.95) as u64;
+        let mock = MockLlm::start(&json!({"max_model_len":window,"responses":[
+            {"stream":[{"raw":format!("data: {}\n\n", json!({"usage":{"prompt_tokens":ceiling - 200}}))},{"content":"ok"},{"usage":{"completion_tokens":1}}]}
+        ]}))
+        .unwrap();
+        let (_scratch, store) = sessions_store();
+        let mut chat = chat_at(&mock, &[("COMPACT_BACKGROUND_AT", "0")], &store);
+        let (ctx, _rx) = TurnContext::detached();
+        chat.send(&ctx, json!("first")).await;
+        let mut msgs = mock.chat_bodies()[0]["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let payload = "z".repeat(2000);
+        assert!(
+            chat.fit_tool_payload(&ctx, &payload, &msgs)
+                .contains("truncated")
+        );
+        assert!(!chat.tool_loop_overflows(&ctx, &msgs));
+        msgs.push(json!({"role":"tool","content":payload}));
+        assert!(chat.tool_loop_overflows(&ctx, &msgs));
+        msgs[0]["content"] = json!("changed prefix");
+        assert!(!chat.tool_loop_overflows(&ctx, &msgs));
+        assert_eq!(chat.fit_tool_payload(&ctx, &payload, &msgs), payload);
+    }
+}
+
+#[tokio::test]
+async fn file_read_override_applies_to_whole_files_and_ranges_independently_of_shell_output() {
+    let text = "界".repeat(30_000);
+    for (key, limit, clipped) in [
+        ("TOOLS_MAX_OUTPUT", "20000", true),
+        ("TOOLS_FILE_READ_MAX_CHARS", "40000", false),
+    ] {
+        let (mut d, scratch) = shell_chat(json!([]), &[(key, limit)]);
+        std::fs::write(scratch.path().join("ws/a.txt"), &text).unwrap();
+        for args in [
+            json!({"path":"a.txt"}),
+            json!({"path":"a.txt","start_line":1,"end_line":1}),
+        ] {
+            let result = d
+                .chat
+                .files
+                .read_file(args.as_object().unwrap(), &d.ctx)
+                .await
+                .result;
+            assert_eq!(result["truncated"], clipped);
+            assert_eq!(
+                result["content"].as_str().unwrap().contains(&text),
+                !clipped
+            );
+        }
+        assert_eq!(d.chat.files.max_output, 20_000);
+    }
 }

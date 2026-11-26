@@ -105,6 +105,7 @@ fn an_answer_with_its_reasoning_and_a_shell_call() {
         text("It is "),
         text("empty."),
         EventMsg::TokenCount(TokenCountEvent {
+            estimated: false,
             used: 1200,
             budget: 262144,
             auto_compact_at: None,

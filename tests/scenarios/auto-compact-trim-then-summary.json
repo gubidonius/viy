@@ -121,6 +121,11 @@
     },
     {
      "finish": "tool_calls"
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -133,6 +138,11 @@
    "stream": [
     {
      "content": "It retries three times with backoff."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -145,6 +155,11 @@
    "stream": [
     {
      "content": "Noted, point 1."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -157,6 +172,11 @@
    "stream": [
     {
      "content": "Noted, point 2."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -169,6 +189,11 @@
    "stream": [
     {
      "content": "Noted, point 3."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -181,6 +206,11 @@
    "stream": [
     {
      "content": "Noted, point 4."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -193,6 +223,11 @@
    "stream": [
     {
      "content": "Noted, point 5."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -205,6 +240,11 @@
    "stream": [
     {
      "content": "Noted, point 6."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -217,6 +257,11 @@
    "stream": [
     {
      "content": "Noted, point 7."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -241,6 +286,11 @@
    "stream": [
     {
      "content": "Noted, point 8."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -253,6 +303,11 @@
    "stream": [
     {
      "content": "Noted, point 9."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -265,6 +320,11 @@
    "stream": [
     {
      "content": "Noted, point 10."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -277,6 +337,11 @@
    "stream": [
     {
      "content": "Noted, point 11."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -289,6 +354,11 @@
    "stream": [
     {
      "content": "Noted, point 12."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -313,6 +383,11 @@
    "stream": [
     {
      "content": "Noted, point 13."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -325,6 +400,11 @@
    "stream": [
     {
      "content": "Noted, point 14."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -337,6 +417,11 @@
    "stream": [
     {
      "content": "Noted, point 15."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -349,6 +434,11 @@
    "stream": [
     {
      "content": "Noted, point 16."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -361,6 +451,11 @@
    "stream": [
     {
      "content": "Noted, point 17."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   }

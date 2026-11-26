@@ -235,6 +235,9 @@ async fn pod_command(
     let ask = |q: &Question| printer.ask(q);
     let time = SystemTimeProvider;
     let env = Env {
+        terminal_login: printer.terminal.stdin_tty
+            && printer.terminal.err_tty
+            && !matches!(command, Command::Reap { .. } | Command::CaptureBoot { .. }),
         paths,
         exec: printer.exec,
         http,
@@ -242,6 +245,9 @@ async fn pod_command(
         exe,
     };
     if let Command::CaptureBoot { boot_id, pod_id } = command {
+        if paths.rental != viy_config::Rental::Runpod {
+            return Err("Boot capture requires RunPod.".into());
+        }
         let rp = commands::connect(&env, &cfg).map_err(|e| failure(e, printer))?;
         return wait::capture_boot(&env.ssh(&cfg), &rp, boot_id, pod_id)
             .await
@@ -256,12 +262,41 @@ async fn pod_command(
 /// BACKEND says (reap looks itself), else BACKEND's.
 pub(crate) fn backend_for(command: &Command, cfg: &Config) -> Result<Backend, String> {
     match command {
-        Command::Backup { .. }
+        Command::Provider { .. }
+        | Command::Backup { .. }
         | Command::Volume(_)
         | Command::Reap { .. }
-        | Command::CaptureBoot { .. } => Ok(Backend::Runpod),
+        | Command::CaptureBoot { .. } => Ok(Backend::Managed),
         _ => Backend::resolve(cfg),
     }
+}
+
+async fn provider_command(
+    action: Option<&crate::cli::ProviderAction>,
+    env: &Env<'_>,
+    cfg: &Config,
+    report: Reporter<'_>,
+    ask: viy_pod::notice::Asker<'_>,
+) -> Result<(), CommandError> {
+    use crate::cli::ProviderAction;
+    use viy_pod::rental;
+    let (provider, region) = match action {
+        None => return rental::show(env.paths, None, report),
+        Some(ProviderAction::Show { provider }) => {
+            return rental::show(env.paths, provider.as_deref(), report);
+        }
+        Some(ProviderAction::List) => {
+            rental::list(env.paths, report);
+            return Ok(());
+        }
+        Some(ProviderAction::Stock { .. }) => {
+            return rental::stock(env, report).await;
+        }
+        Some(ProviderAction::Nebius { region }) => ("nebius", region.as_deref()),
+        Some(ProviderAction::Runpod) => ("runpod", None),
+        Some(ProviderAction::Use { provider, region }) => (provider.as_str(), region.as_deref()),
+    };
+    rental::switch(env, cfg, provider, region, report, ask).await
 }
 
 /// A pod command's work, the same for the terminal and the chat (kb
@@ -276,9 +311,33 @@ pub(crate) async fn work(
     report: Reporter<'_>,
     ask: viy_pod::notice::Asker<'_>,
 ) -> Result<(), CommandError> {
-    if backend != Backend::Runpod {
+    use viy_pod::rental;
+    if let Command::Provider { action } = command {
+        return provider_command(action.as_ref(), env, cfg, report, ask).await;
+    }
+    if backend != Backend::Managed {
         return other_backend(command, backend, env, cfg, interrupt, report).await;
     }
+    let mut scoped;
+    let cfg = if env.paths.rental != viy_config::Rental::Runpod {
+        if matches!(
+            command,
+            Command::Backup { .. } | Command::CaptureBoot { .. }
+        ) {
+            return Err(CommandError::Exit(
+                "Use viy provider stock nebius for Nebius placement.".into(),
+            ));
+        }
+        scoped = rental::settings(env.paths, cfg);
+        // Generate this once in the original profile so chat and the allocation use the same key.
+        if matches!(command, Command::Up { .. }) {
+            let key = viy_config::profiles::ensure_vllm_api_key(cfg, env.paths)?;
+            scoped.set("VLLM_API_KEY", &key);
+        }
+        &mut scoped
+    } else {
+        cfg
+    };
     match command {
         Command::Up { timeout, backup } => {
             let timeout = Duration::from_secs(*timeout);
@@ -287,7 +346,11 @@ pub(crate) async fn work(
         Command::Logs { follow } => {
             commands::logs(env, cfg, *follow, interrupt.next(), report).await
         }
-        Command::Tunnel(args) => tunnel_command(env, cfg, args, interrupt, report).await,
+        Command::Tunnel(args) => {
+            let _lease = rental::lease(env.paths, false)?;
+            rental::current(env.paths)?;
+            tunnel_command(env, cfg, args, interrupt, report).await
+        }
         other => {
             let work = async {
                 match other {
@@ -413,7 +476,7 @@ async fn tunnel_command(
         Action::Foreground
     };
     let ssh = env.ssh(cfg);
-    let connect = || commands::provider(env, cfg).map_err(|e| e.to_string());
+    let connect = || viy_pod::rental::selected(env, cfg).map_err(|e| e.to_string());
     let mut say = |notice| report(Report::Notice(notice));
     // The foreground tunnel ends on the first Ctrl-C itself, closing its
     // ssh; anything else, and a second one, ends at once.

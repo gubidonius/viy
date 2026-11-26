@@ -541,3 +541,37 @@ fn on_a_private_x_display_ctrl_v_pastes_and_a_drag_copies() {
         .status();
     let _ = xvfb.wait();
 }
+
+#[test]
+fn context_footer_tracks_a_paused_stream_and_keeps_the_final_usage() {
+    let mock = MockLlm::start(&json!({
+        "max_model_len": 524288,
+        "responses": [
+            {"stream":[
+                {"raw":"data: {\"usage\":{\"total_tokens\":131072}}\n\n"},
+                {"delay":0.8},
+                {"content":"live answer"},
+                {"delay":0.8},
+                {"usage":{"prompt_tokens":131072,"completion_tokens":32,"total_tokens":131104}}
+            ]},
+            {"message":"Footer test"}
+        ]
+    }))
+    .unwrap();
+    let dir = ScratchDir::new("ui-context").unwrap();
+    let pty = Pty::open(ROWS, COLS).unwrap();
+    let child = open_chat(&pty, &mock, dir.path());
+    pty.send(b"x").unwrap();
+    pty.send(b"\r").unwrap();
+    pty.wait_for("reported usage while the stream is paused", |s| {
+        s.contents().contains("ctx 25% 131K/524K")
+    });
+    pty.wait_for("new output after reported usage", |s| {
+        s.contents().contains("ctx ~25% 131K/524K")
+    });
+    pty.wait_for("final usage after the background title", |s| {
+        let screen = s.contents();
+        screen.contains("Footer test") && screen.contains("ctx 25% 131K/524K")
+    });
+    close(&pty, child);
+}

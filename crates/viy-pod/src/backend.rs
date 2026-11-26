@@ -32,18 +32,22 @@ use crate::wait::failure_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    Runpod,
+    Managed,
     Openai,
     Local,
 }
 
 impl Backend {
+    /// Legacy public spelling for callers that select managed hosting.
+    #[allow(non_upper_case_globals)]
+    pub const Runpod: Self = Self::Managed;
+
     /// The one `BACKEND` names, in any case, empty meaning RunPod; else
     /// rpctl's message.
     pub fn resolve(cfg: &Config) -> Result<Self, String> {
         let kind = cfg.get("BACKEND").unwrap_or("").trim().to_lowercase();
         match kind.as_str() {
-            "" | "runpod" => Ok(Self::Runpod),
+            "" | "runpod" | "managed" => Ok(Self::Managed),
             "openai" => Ok(Self::Openai),
             "local" => Ok(Self::Local),
             _ => Err(format!(
@@ -55,7 +59,7 @@ impl Backend {
     /// Its `BACKEND` value.
     pub fn name(self) -> &'static str {
         match self {
-            Self::Runpod => "runpod",
+            Self::Managed => "runpod",
             Self::Openai => "openai",
             Self::Local => "local",
         }
@@ -75,7 +79,7 @@ impl Backend {
     /// Said when a chat ends.
     pub fn exit_hint(self) -> Option<&'static str> {
         match self {
-            Self::Runpod => {
+            Self::Managed => {
                 Some("Pod is still running. viy stop to pause billing, viy down to terminate.")
             }
             Self::Openai => None,
@@ -126,7 +130,7 @@ impl Backend {
         report: Reporter<'_>,
     ) -> io::Result<Option<String>> {
         match self {
-            Self::Runpod => {
+            Self::Managed => {
                 let warn = |many: tracked::MultiplePods| say(report, Tone::Warn, many.to_string());
                 tracked::base_url(env.paths, cfg, Arc::clone(env.http), discover, warn).await
             }
@@ -138,7 +142,7 @@ impl Backend {
     /// Advisory lines to say before a chat; never fatal.
     pub async fn preflight(self, env: &Env<'_>, cfg: &Config) -> io::Result<Vec<String>> {
         match self {
-            Self::Runpod => tunnel::session_warnings(&env.ssh(cfg)).await,
+            Self::Managed => tunnel::session_warnings(&env.ssh(cfg)).await,
             Self::Openai => {
                 let url = endpoint_url(cfg).unwrap_or_default();
                 Ok(if url.starts_with("http://") && !is_loopback(&url) {

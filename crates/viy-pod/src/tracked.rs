@@ -156,6 +156,21 @@ pub async fn base_url(
     notice: impl FnMut(MultiplePods),
 ) -> io::Result<Option<String>> {
     let mut state = state::load(paths)?;
+    if paths.rental != viy_config::Rental::Runpod {
+        if discover && state.pod_id().is_none() {
+            let seam = viy_nebius::NebiusProvider::new(paths, http).map_err(io::Error::other)?;
+            resolve(&seam, paths, cfg, notice)
+                .await
+                .map_err(io::Error::other)?;
+            state = crate::state::load(paths)?;
+        }
+        let owned = state
+            .get(key::TUNNEL_PID)
+            .and_then(Value::as_u64)
+            .and_then(|p| u32::try_from(p).ok())
+            .is_some_and(|pid| crate::tunnel::matches_nebius_forward(pid, state.pod_id(), cfg));
+        return Ok((owned && state.pod_id().is_some()).then(|| local_url(cfg)));
+    }
     if state.pod_id().is_none()
         && discover
         && let Some(api_key) = cfg.get("RUNPOD_API_KEY").filter(|k| !k.is_empty())
@@ -183,7 +198,7 @@ pub async fn base_url(
 /// `pod.json` recorded then wins over TUNNEL; only a pod that recorded
 /// nothing goes by TUNNEL, the intent for the pod `up` is about to make.
 pub fn tunnel_only(paths: &Paths, cfg: &Config) -> io::Result<bool> {
-    Ok(reached_by_tunnel(&state::load(paths)?, cfg))
+    Ok(paths.rental != viy_config::Rental::Runpod || reached_by_tunnel(&state::load(paths)?, cfg))
 }
 
 /// The tunnel's local end, the same for every pod.
@@ -193,6 +208,9 @@ pub fn local_url(cfg: &Config) -> String {
 
 /// How the tracked pod is reached, in words.
 pub fn transport_label(paths: &Paths, cfg: &Config) -> io::Result<&'static str> {
+    if paths.rental != viy_config::Rental::Runpod {
+        return Ok(TUNNEL_LABEL);
+    }
     let state = state::load(paths)?;
     Ok(
         match (state.tunnel_only(), reached_by_tunnel(&state, cfg)) {
@@ -217,6 +235,12 @@ const CREATED_KEYS: [&str; 3] = [key::CREATED_AT, key::TUNNEL_ONLY, key::LAST_ST
 /// old pod's `tunnel_only` would make the new one's URL and label claim a
 /// tunnel-only route it may not have (rpctl b642713).
 fn cache(paths: &Paths, pod: &Pod) -> io::Result<()> {
+    crate::rental::observe(
+        paths,
+        pod.state_name.as_deref().unwrap_or("unknown"),
+        pod.region.as_deref(),
+        pod.volume.as_deref(),
+    )?;
     let id = pod.id.as_str();
     state::update(paths, |map| {
         if map.get(key::POD_ID).and_then(Value::as_str) != Some(id) {

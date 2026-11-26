@@ -81,6 +81,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// What runs a turn and a slash command: the chat (WP 3.2 on), or a test's
 /// stand-in.
 pub trait Turns: Send + Sync + 'static {
+    /// Pin a managed inference endpoint until this turn finishes or is cancelled.
+    fn turn_lease(&self) -> Result<Option<std::fs::File>, String> {
+        Ok(None)
+    }
+
     /// Runs the user's turn; how it ended. The engine says it started and
     /// ended ([`EventMsg::TurnStarted`], [`EventMsg::TurnComplete`]).
     fn turn(self: Arc<Self>, ctx: TurnContext, text: String) -> BoxFuture<'static, TurnOutcome>;
@@ -947,6 +952,14 @@ fn start(
         match work {
             Work::Turn => {
                 ctx.questions.clear_report();
+                let _lease = match turns.turn_lease() {
+                    Ok(lease) => lease,
+                    Err(message) => {
+                        ctx.emit(EventMsg::TurnRefused(TurnRefusedEvent { text, message }));
+                        let _ = done.send(ctx.sub_id);
+                        return;
+                    }
+                };
                 if let Err(message) = Arc::clone(&turns).admit(ctx.clone()).await {
                     ctx.emit(EventMsg::TurnRefused(TurnRefusedEvent { text, message }));
                     let _ = done.send(ctx.sub_id);

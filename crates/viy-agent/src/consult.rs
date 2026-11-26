@@ -1543,7 +1543,10 @@ impl Chat {
         let rest = rest.trim();
         const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
         match word {
-            "on" | "off" => self.consult.on = word == "on",
+            "on" | "off" => {
+                self.consult.on = word == "on";
+                self.refresh_history_gauge(ctx);
+            }
             "mode" if matches!(rest, "act" | "advise") => self.consult.mode = rest.into(),
             "model" if !rest.is_empty() => {
                 self.consult.model = if rest == "default" {

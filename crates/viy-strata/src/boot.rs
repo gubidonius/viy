@@ -78,6 +78,16 @@ fn whole_in(
 /// script read.
 pub fn settings(cfg: &Config) -> Result<Vec<(&'static str, String)>, BadValue> {
     let flag = |key| one_of(cfg, key, &["0", "1"], "0 or 1").map(str::to_string);
+    let original_context = if at(cfg, "STRATA_YARN_ORIG_CTX").trim().is_empty() {
+        0
+    } else {
+        whole_in(
+            cfg,
+            "STRATA_YARN_ORIG_CTX",
+            0..=1 << 30,
+            "a nonnegative token count up to 1073741824",
+        )?
+    };
     let host = if tunnel_enabled(cfg) {
         "127.0.0.1"
     } else {
@@ -106,6 +116,7 @@ pub fn settings(cfg: &Config) -> Result<Vec<(&'static str, String)>, BadValue> {
             )?
             .to_string(),
         ),
+        ("STRATA_YARN_ORIG_CTX", original_context.to_string()),
         (
             "STRATA_PARALLEL",
             whole_in(cfg, "STRATA_PARALLEL", 1..=8, "a whole number from 1 to 8")?.to_string(),

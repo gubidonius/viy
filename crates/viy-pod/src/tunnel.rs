@@ -42,8 +42,6 @@ use crate::tracked;
 use crate::tracked::ResolveError;
 use viy_provider::Provider;
 
-use crate::provider::RunPodProvider;
-
 /// `tunnel.log` starts over past this size.
 const TUNNEL_LOG_MAX: u64 = 256 * 1024;
 
@@ -97,7 +95,7 @@ pub fn tunnel_cmd(ssh: &Ssh<'_>, ip: &str, port: u16) -> io::Result<Command> {
         .args(ssh.opts("accept-new")?)
         .arg("-p")
         .arg(port.to_string())
-        .arg(format!("root@{ip}")))
+        .arg(ssh.login(ip)))
 }
 
 /// The background tunnel `pod.json` records, and whether it lives: a pid
@@ -111,6 +109,9 @@ pub fn running(ssh: &Ssh<'_>) -> io::Result<Running> {
         _ => None,
     });
     let alive = pid.is_some_and(|pid| {
+        if ssh.paths.rental != viy_config::Rental::Runpod {
+            return matches_nebius_forward(pid, state.pod_id(), ssh.cfg);
+        }
         process::pid_alive(pid)
             && process::cmdline(pid)
                 .first()
@@ -121,6 +122,23 @@ pub fn running(ssh: &Ssh<'_>) -> io::Result<Running> {
         recorded: value.is_some(),
         alive,
     })
+}
+
+pub(crate) fn matches_nebius_forward(pid: u32, id: Option<&str>, cfg: &viy_config::Config) -> bool {
+    let Some(id) = id else { return false };
+    let args = process::cmdline(pid);
+    let alias = format!("HostKeyAlias=nb-{id}");
+    let forward = format!(
+        "127.0.0.1:{}:127.0.0.1:{}",
+        tunnel_local_port(cfg),
+        cfg.get("VLLM_PORT").unwrap_or("")
+    );
+    process::pid_alive(pid)
+        && args.first().is_some_and(|a| basename(a) == b"ssh")
+        && args.iter().any(|a| a == alias.as_bytes())
+        && args
+            .windows(2)
+            .any(|w| w[0] == b"-L" && w[1] == forward.as_bytes())
 }
 
 fn basename(path: &[u8]) -> &[u8] {
@@ -290,7 +308,14 @@ pub async fn kill_strays(ssh: &Ssh<'_>) -> io::Result<()> {
             continue;
         };
         let argv = process::cmdline(pid);
-        if argv.first().is_some_and(|a| basename(a) == b"ssh")
+        if ssh.paths.rental != viy_config::Rental::Runpod {
+            if matches_nebius_forward(pid, state::load(ssh.paths)?.pod_id(), ssh.cfg) {
+                strays.push(pid);
+            }
+            continue;
+        }
+        if !argv.iter().any(|a| a.starts_with(b"HostKeyAlias=nb-"))
+            && argv.first().is_some_and(|a| basename(a) == b"ssh")
             && argv.iter().any(|a| a == spec.as_bytes())
         {
             strays.push(pid);
@@ -409,7 +434,9 @@ pub async fn session_warnings(ssh: &Ssh<'_>) -> io::Result<Vec<String>> {
         ]);
     }
     let mut warn = Vec::new();
-    if state::load(ssh.paths)?.tunnel_only().is_none() {
+    if ssh.paths.rental == viy_config::Rental::Runpod
+        && state::load(ssh.paths)?.tunnel_only().is_none()
+    {
         warn.push(
             "This pod predates tunnel mode: the tunnel works, but its http port through \
              RunPod's proxy is still open. Close it with:  viy down && viy up"
@@ -558,7 +585,7 @@ pub enum Action {
 pub async fn command(
     ssh: &Ssh<'_>,
     action: Action,
-    connect: impl FnOnce() -> Result<RunPodProvider, String>,
+    connect: impl FnOnce() -> Result<std::sync::Arc<dyn Provider>, String>,
     interrupted: impl Future<Output = ()>,
     say: Say<'_>,
 ) -> Result<(), TunnelError> {
@@ -592,7 +619,7 @@ pub async fn command(
         return Ok(());
     }
     let runpod = connect().map_err(TunnelError::Exit)?;
-    let seam: &dyn Provider = &runpod;
+    let seam: &dyn Provider = &*runpod;
     let (pod_id, ip, port) = resolve_target(ssh, seam, &mut *say).await?;
     if !tracked::tunnel_only(ssh.paths, ssh.cfg)? {
         say(Notice::new(

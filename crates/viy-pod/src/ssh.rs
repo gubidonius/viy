@@ -131,9 +131,26 @@ pub enum Checked {
 }
 
 impl Ssh<'_> {
+    pub fn login(&self, ip: &str) -> String {
+        format!(
+            "{}@{ip}",
+            if self.paths.rental == viy_config::Rental::Runpod {
+                "root"
+            } else {
+                "worker"
+            }
+        )
+    }
+    fn alias_for(&self, state: &PodState) -> String {
+        if self.paths.rental == viy_config::Rental::Runpod {
+            host_key_alias(state, self.cfg)
+        } else {
+            format!("nb-{}", state.pod_id().unwrap_or("missing"))
+        }
+    }
     /// The alias for the tracked pod ([`host_key_alias`]).
     pub fn alias(&self) -> io::Result<String> {
-        Ok(host_key_alias(&state::load(self.paths)?, self.cfg))
+        Ok(self.alias_for(&state::load(self.paths)?))
     }
 
     /// The host-key options every ssh gets: rp's `known_hosts`, the alias,
@@ -156,7 +173,15 @@ impl Ssh<'_> {
             file,
             "GlobalKnownHostsFile=/dev/null".into(),
             format!("HostKeyAlias={alias}").into(),
-            format!("StrictHostKeyChecking={strict}").into(),
+            format!(
+                "StrictHostKeyChecking={}",
+                if self.paths.rental == viy_config::Rental::Runpod {
+                    strict
+                } else {
+                    "yes"
+                }
+            )
+            .into(),
             "HostKeyAlgorithms=ssh-ed25519".into(),
             "ServerAliveInterval=15".into(),
             "ServerAliveCountMax=3".into(),
@@ -270,15 +295,8 @@ impl Ssh<'_> {
         say: Say<'_>,
     ) -> io::Result<Checked> {
         let state = state::load(self.paths)?;
-        self.pin_checked(
-            seam,
-            &state,
-            &host_key_alias(&state, self.cfg),
-            ip,
-            port,
-            say,
-        )
-        .await
+        self.pin_checked(seam, &state, &self.alias_for(&state), ip, port, say)
+            .await
     }
 
     async fn pin_checked(
@@ -294,6 +312,13 @@ impl Ssh<'_> {
             Some(pod_id) => logged_host_keys(seam, pod_id).await.unwrap_or_default(),
             None => BTreeSet::new(),
         };
+        if logged.is_empty() && self.paths.rental != viy_config::Rental::Runpod {
+            say(Notice::new(
+                Tone::Error,
+                "Waiting for the Nebius serial log to confirm the SSH host key.",
+            ));
+            return Ok(Checked::Mismatch);
+        }
         if logged.is_empty() {
             return Ok(Checked::Unchecked);
         }
@@ -354,7 +379,7 @@ impl Ssh<'_> {
         // One reading of pod.json, so the key is checked and pinned under
         // one alias even if rp saves the state meanwhile.
         let state = state::load(self.paths)?;
-        let alias = host_key_alias(&state, self.cfg);
+        let alias = self.alias_for(&state);
         let first_contact = self.fingerprint_under(&alias).await?.is_none();
         let checked = if first_contact {
             Some(
@@ -375,7 +400,7 @@ impl Ssh<'_> {
                     .args(self.opts_under(&alias, "accept-new")?)
                     .arg("-p")
                     .arg(port.to_string())
-                    .arg(format!("root@{ip}"))
+                    .arg(self.login(ip))
                     .arg("true"),
             )
             .await?;
@@ -429,8 +454,12 @@ impl Ssh<'_> {
             }
             say(Notice::new(
                 Tone::Dim,
-                "The key lives on the network volume, so every later pod must present the same \
-                 one or the connection is refused.",
+                if self.paths.rental != viy_config::Rental::Runpod {
+                    "The pin belongs to this Nebius VM and is checked again on resume."
+                } else {
+                    "The key lives on the network volume, so every later pod must present the same \
+                 one or the connection is refused."
+                },
             ));
         }
         Ok(true)

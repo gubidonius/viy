@@ -270,7 +270,7 @@ pub fn down_problems(cfg: &Config) -> Vec<String> {
             "viy stop does nothing for the '{}' backend; that step is skipped",
             backend.name()
         )],
-        Ok(Backend::Runpod) if cfg.get("RUNPOD_API_KEY").unwrap_or("").is_empty() => vec![
+        Ok(Backend::Managed) if cfg.get("RUNPOD_API_KEY").unwrap_or("").is_empty() => vec![
             "RUNPOD_API_KEY is not set, so viy stop can't reach RunPod; the pod would be left \
              to its own idle watchdog"
                 .into(),
@@ -899,7 +899,13 @@ pub async fn schedule(
         ))
     })?;
 
-    let mut problems = down_problems(cfg);
+    let mut problems = if host.paths.rental != viy_config::Rental::Runpod
+        && Backend::resolve(cfg) == Ok(Backend::Managed)
+    {
+        Vec::new()
+    } else {
+        down_problems(cfg)
+    };
     if poweroff {
         problems.extend(poweroff_problems(host).await);
     }

@@ -134,6 +134,12 @@ pub const COMMANDS: &[Command] = &[
         &["init", "import", "reset"],
     ),
     cmd("stats", "", "last response timing", &[]),
+    cmd(
+        "provider",
+        "[show|list|nebius|runpod|use|stock]",
+        "show or switch GPU providers",
+        &["show", "list", "nebius", "runpod", "use", "stock"],
+    ),
     // The pod's commands (kb d041, d068), with their subcommands' words.
     cmd(
         "up",

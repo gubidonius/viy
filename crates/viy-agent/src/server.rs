@@ -23,10 +23,17 @@ pub struct Ready {
     pub base: String,
     /// The model id requests name.
     pub model: String,
+    /// Capacity returned by the readiness probe, when available.
+    pub context_window: Option<u64>,
 }
 
 /// The model's server, watched for the chat.
 pub trait Server: Send + Sync + 'static {
+    /// Pin a managed inference endpoint until this turn finishes or is cancelled.
+    fn turn_lease(&self) -> Result<Option<std::fs::File>, String> {
+        Ok(None)
+    }
+
     /// Where a turn goes now, or why nothing would answer it (said to the
     /// user, whose line is given back).
     fn ready(self: Arc<Self>) -> BoxFuture<'static, Result<Ready, String>>;

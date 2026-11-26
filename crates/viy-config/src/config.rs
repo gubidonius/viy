@@ -44,6 +44,7 @@ pub const PROFILE_KEYS: &[&str] = &[
     // them, and a profile would keep an image pinned before a newer one.
     "ENGINE",
     "MODEL_FILES",
+    "STRATA_YARN_ORIG_CTX",
 ];
 
 /// The serving engine's keys, viy only (kb d162): `ENGINE`, and what
@@ -52,6 +53,7 @@ pub const ENGINE_KEYS: &[&str] = &[
     "ENGINE",
     "STRATA_IMAGE",
     "MODEL_FILES",
+    "STRATA_YARN_ORIG_CTX",
     "STRATA_PARALLEL",
     "STRATA_BATCH_MTP",
     "STRATA_PLE_IO",
@@ -66,6 +68,7 @@ pub const ENGINE_KEYS: &[&str] = &[
 pub const STRATA_KEYS: &[&str] = &[
     "STRATA_IMAGE",
     "MODEL_FILES",
+    "STRATA_YARN_ORIG_CTX",
     "STRATA_PARALLEL",
     "STRATA_BATCH_MTP",
     "STRATA_PLE_IO",

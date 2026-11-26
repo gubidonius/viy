@@ -135,6 +135,7 @@ async fn status_with(
     let exec = FakeExec::default();
     let time = FakeTime::at(chrono::Utc::now());
     let env = Env {
+        terminal_login: false,
         paths: &paths,
         exec: &exec,
         http: &http,
@@ -214,6 +215,7 @@ async fn preflight_and_base_url_for_the_endpoint() {
     let exec = FakeExec::default();
     let time = FakeTime::at(chrono::Utc::now());
     let env = Env {
+        terminal_login: false,
         paths: &paths,
         exec: &exec,
         http: &http,

@@ -40,6 +40,8 @@ pub fn run(
     out: &mut (dyn Write + Send),
     terminal: Terminal,
 ) -> Result<(), Failure> {
+    let _lease = viy_pod::rental::lease(paths, false).map_err(|e| Failure::from(e.to_string()))?;
+    viy_pod::rental::current(paths).map_err(|e| Failure::from(e.to_string()))?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -114,6 +116,9 @@ pub(crate) async fn arrange(
         }
         return Ok(None);
     };
+    let _lease =
+        viy_pod::rental::lease(host.paths, false).map_err(|e| Failure::from(e.to_string()))?;
+    viy_pod::rental::current(host.paths).map_err(|e| Failure::from(e.to_string()))?;
     let deadline = shutdown::schedule(host, cfg, when, args.poweroff(), args.foreground, report)
         .await
         .map_err(|e| Failure::from(e.to_string()))?;
@@ -140,6 +145,7 @@ async fn countdown(
         Arc::new(ReqwestHttp::new().map_err(|e| Failure::from(e.to_string()))?);
     let exe = std::env::current_exe().map_err(|e| Failure::from(format!("viy itself: {e}")))?;
     let env = Env {
+        terminal_login: false,
         paths: host.paths,
         exec: host.exec,
         http: &http,
@@ -153,7 +159,23 @@ async fn countdown(
             log.raw(&format!("{notice}\n"));
         }
     };
-    let down = async |cfg: &Config| shutdown::take_down(&env, cfg, &report).await;
+    let original_backend = viy_pod::backend::Backend::resolve(&cfg);
+    let pinned = viy_pod::state::load(host.paths)
+        .map_err(|e| Failure::from(e.to_string()))?
+        .pod_id()
+        .map(str::to_string);
+    let down = async |effective: &Config| {
+        if original_backend != viy_pod::backend::Backend::resolve(effective) {
+            return Err("The shutdown target backend changed during the countdown.".into());
+        }
+        if viy_pod::backend::Backend::resolve(effective)? == viy_pod::backend::Backend::Managed {
+            let current = viy_pod::state::load(host.paths).map_err(|e| e.to_string())?;
+            if current.pod_id() != pinned.as_deref() {
+                return Err("The tracked GPU changed during the shutdown countdown. Schedule a new shutdown for this machine.".into());
+            }
+        }
+        shutdown::take_down(&env, effective, &report).await
+    };
     let signals = |kind| signal(kind).map_err(|e| Failure::from(e.to_string()));
     let mut terminated = signals(SignalKind::terminate())?;
     let mut interrupted = signals(SignalKind::interrupt())?;

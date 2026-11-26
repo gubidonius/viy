@@ -238,3 +238,64 @@ async fn a_refused_connection_points_at_the_tunnel_on_loopback() {
     assert!(seen.notices()[0].1.starts_with("connection failed: "));
     assert_eq!(seen.notices()[2].1, "Is the server up? viy status");
 }
+
+#[test]
+fn live_context_includes_reasoning_and_calls_then_accepts_server_corrections() {
+    let mut reply = Reply::default();
+    let mut answer = String::new();
+    let sink = Sink {
+        emit: &|_| {},
+        touch: &|| {},
+    };
+    let mut gauge = RequestGauge::new(
+        TokenCountEvent {
+            used: 100,
+            budget: 524_288,
+            estimated: true,
+            auto_compact_at: None,
+        },
+        2.0,
+    );
+    let mut step = |line: String| {
+        reply.line(&line, &mut answer);
+        gauge.update(&reply, &sink);
+        (gauge.count.used, gauge.count.estimated)
+    };
+    assert_eq!(
+        step(delta(json!({"reasoning_content":"世界"}))),
+        (101, true)
+    );
+    assert_eq!(
+        step(delta(
+            json!({"tool_calls":[{"function":{"name":"call","arguments":"{}"}}]})
+        )),
+        (104, true)
+    );
+    assert_eq!(
+        step(data(json!({"usage":{"prompt_tokens":200}}))),
+        (204, true)
+    );
+    assert_eq!(step(delta(json!({"content":"ok"}))), (205, true));
+    assert_eq!(
+        step(data(
+            json!({"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}})
+        )),
+        (205, true)
+    );
+    assert_eq!(
+        step(data(json!({"usage":{"completion_tokens":7}}))),
+        (207, false)
+    );
+    assert_eq!(
+        step(data(
+            json!({"usage":{"prompt_tokens":200,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":128}}})
+        )),
+        (209, false)
+    );
+    assert_eq!(step(delta(json!({"content":"!"}))), (210, true));
+    assert_eq!(
+        step(data(json!({"usage":{"total_tokens":207}}))),
+        (207, false)
+    );
+    assert_eq!(step("data: [DONE]".into()), (207, false));
+}

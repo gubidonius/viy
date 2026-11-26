@@ -43,6 +43,7 @@ fn full(now: Instant) -> Status {
             effort: "medium".into(),
         }),
         EventMsg::TokenCount(TokenCountEvent {
+            estimated: false,
             used: 107_000,
             budget: 262_000,
             auto_compact_at: Some(222_700),
@@ -133,6 +134,7 @@ fn the_gauge_takes_rps_prompt_colours() {
         let mut s = Status::default();
         s.event(
             &EventMsg::TokenCount(TokenCountEvent {
+                estimated: false,
                 used,
                 budget,
                 auto_compact_at: auto,
@@ -319,4 +321,28 @@ fn tokens_as_codex_writes_them() {
     ] {
         assert_eq!(tokens(n), shown, "{n}");
     }
+}
+
+#[test]
+fn the_footer_marks_estimates_until_server_usage_arrives() {
+    let now = Instant::now();
+    let mut status = Status::default();
+    let mut count = TokenCountEvent {
+        used: 131_072,
+        budget: 524_288,
+        estimated: true,
+        auto_compact_at: None,
+    };
+    status.event(&EventMsg::TokenCount(count.clone()), now);
+    assert_eq!(
+        text(&status.line(Counts::default(), 80, now)),
+        "ctx ~25% 131K/524K"
+    );
+    count.used = 262_144;
+    count.estimated = false;
+    status.event(&EventMsg::TokenCount(count), now);
+    assert_eq!(
+        text(&status.line(Counts::default(), 80, now)),
+        "ctx 50% 262K/524K"
+    );
 }

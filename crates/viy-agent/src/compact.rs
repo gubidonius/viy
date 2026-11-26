@@ -233,6 +233,7 @@ impl Chat {
         let saved_tokens = (el.saved as f64 / self.estimator.chars_per_token) as i64;
         let n = el.n;
         self.apply_elision(el);
+        self.refresh_history_gauge(ctx);
         notice(
             ctx,
             NoticeLevel::Info,
@@ -251,6 +252,7 @@ impl Chat {
     /// read it again before overwriting it, unless a turn still in full
     /// read or wrote it.
     pub(crate) fn apply_elision(&mut self, el: Elision) {
+        self.measured_prompt = None;
         self.messages = el.messages;
         let gone: Vec<PathBuf> = el.forget.difference(&el.kept).cloned().collect();
         self.files.forget_paths(&gone);
@@ -844,7 +846,7 @@ impl Chat {
             preview.push(format!("  ... ({} more lines)", lines.len() - 8));
         }
         notice(ctx, NoticeLevel::Info, "compact", preview.join("\n"));
-        let (tok, _) = self.context_state(&[]);
+        let tok = self.refresh_history_gauge(ctx).used;
         let context = old_ctx.filter(|t| *t > 0).map_or(String::new(), |old| {
             format!(", context ~{old} -> ~{tok} tokens")
         });
@@ -908,6 +910,7 @@ impl Chat {
         let n = el.n;
         self.apply_elision(el);
         let (new_tok, new_frac) = self.context_state(extra);
+        self.refresh_history_gauge(ctx);
         self.tracer.event(
             "compact",
             json!({"auto": auto, "status": "ok", "mode": "trim",
@@ -1059,7 +1062,11 @@ impl Chat {
                 .chain(std::iter::once(instr_msg))
                 .cloned()
                 .collect();
-            self.estimate_tokens(&msgs) <= budget
+            self.estimate_request_tokens(
+                &msgs,
+                Tools::None,
+                self.cfg.get("COMPACT_THINKING") == Some("1"),
+            ) <= budget
         };
         while !chunk.is_empty() && !fits(&chunk) {
             let next = chunk
@@ -1099,6 +1106,7 @@ impl Chat {
             json!({"role": "user", "content": head}),
             json!({"role": "assistant", "content": SUMMARY_ACK}),
         ];
+        self.measured_prompt = None;
         self.messages.extend(after);
         self.abort_background();
         // The history behind the system prompt is new, so its prefix is
@@ -1333,6 +1341,7 @@ impl Chat {
             self.auto_compact_threshold = p;
             self.auto_compact = true;
         }
+        self.refresh_gauge_limits(ctx);
         let (tok, frac) = self.context_state(&[]);
         let state = if self.auto_compact {
             format!("on, triggers at {}", pct(self.auto_compact_threshold))

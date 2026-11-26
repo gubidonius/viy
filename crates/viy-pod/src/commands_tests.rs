@@ -126,6 +126,7 @@ impl Home {
 
     fn env(&self) -> Env<'_> {
         Env {
+            terminal_login: false,
             paths: &self.paths,
             exec: &self.exec,
             http: &self.http,
@@ -202,6 +203,7 @@ fn tracked(tunnel_only: bool) -> Option<Value> {
 
 async fn run_up(home: &mut Home, told: &Told) -> Result<(), CommandError> {
     let env = Env {
+        terminal_login: false,
         paths: &home.paths,
         exec: &home.exec,
         http: &home.http,
@@ -245,6 +247,7 @@ async fn up_interrupted(
         std::future::pending::<()>().await;
     };
     let env = Env {
+        terminal_login: false,
         paths: &home.paths,
         exec: &home.exec,
         http: &home.http,
@@ -1813,6 +1816,12 @@ mod on_a_second_provider {
         assert_eq!(left, ["x9"]);
         let texts = told.texts();
         assert!(
+            texts
+                .iter()
+                .any(|t| t == "  terminating s1 (about 2 minutes)..."),
+            "{texts:?}"
+        );
+        assert!(
             texts.contains(&"  terminated s1 (was running)".to_string()),
             "{texts:?}"
         );
@@ -1844,7 +1853,9 @@ mod on_a_second_provider {
         .unwrap();
         assert_eq!(seam.calls(), ["stop s1"]);
         assert_eq!(seam.pods_now()[0].state, Some(Run::Stopped));
-        assert!(told.texts()[0].starts_with("Stopped s1. GPU billing ends"));
+        let texts = told.texts();
+        assert_eq!(texts[0], "Stopping s1 (about a minute)...");
+        assert!(texts[1].starts_with("Stopped s1. GPU billing ends"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1887,6 +1898,7 @@ mod on_a_second_provider {
         let told = Told::default();
         let abort_at = AtomicU32::new(1);
         let env = Env {
+            terminal_login: false,
             paths: &home.paths,
             exec: &home.exec,
             http: &home.http,
@@ -1951,6 +1963,7 @@ mod on_a_second_provider {
         let told = Told::default();
         let abort_at = AtomicU32::new(1);
         let env = Env {
+            terminal_login: false,
             paths: &home.paths,
             exec: &home.exec,
             http: &home.http,

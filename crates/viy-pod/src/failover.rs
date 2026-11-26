@@ -258,6 +258,12 @@ impl<'a> Creation<'a> {
             .map_err(CommandError::Exit)?
             .pod_request(self.cfg, self.vllm_key, volume_id, self.pubkey)
             .map_err(|e| CommandError::Exit(e.to_string()))?;
+        if self.env.paths.rental != viy_config::Rental::Runpod {
+            self.request.env.push((
+                "NEBIUS_ENGINE_PORT".into(),
+                self.cfg.get("VLLM_PORT").unwrap_or("8000").into(),
+            ));
+        }
         let first = self.first();
         let mut refused = match self
             .attempt(&primary, volume_id, "primary", false, first)
@@ -266,6 +272,23 @@ impl<'a> Creation<'a> {
             Ok(pod) => return Ok(self.created(pod, volume_id, volume_is_new, &primary)),
             Err(error) => error,
         };
+        while self.env.paths.rental != viy_config::Rental::Runpod && refused.capacity {
+            let began = Instant::now();
+            if !crate::rental::retry_capacity(self.env, self.user.report, self.user.ask).await? {
+                return Err(refused.into());
+            }
+            self.waited += began.elapsed();
+            match self
+                .attempt(&primary, volume_id, "primary", false, first)
+                .await
+            {
+                Ok(pod) => return Ok(self.created(pod, volume_id, volume_is_new, &primary)),
+                Err(error) => refused = error,
+            }
+        }
+        if self.env.paths.rental != viy_config::Rental::Runpod {
+            return Err(refused.into());
+        }
         // With no backup to offer, the other types follow at once.
         if first == Ask::Preferred && refused.capacity && !self.failover_on() {
             refused = match self

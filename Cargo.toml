@@ -6,6 +6,7 @@ members = [
     "crates/viy-engine",
     "crates/viy-exec",
     "crates/viy-http",
+    "crates/viy-nebius",
     "crates/viy-pod",
     "crates/viy-provider",
     "crates/viy-strata",
@@ -34,6 +35,7 @@ viy-config = { path = "crates/viy-config", version = "0.3.0" }
 viy-engine = { path = "crates/viy-engine", version = "0.3.0" }
 viy-exec = { path = "crates/viy-exec", version = "0.3.0" }
 viy-http = { path = "crates/viy-http", version = "0.3.0" }
+viy-nebius = { path = "crates/viy-nebius", version = "0.3.0" }
 viy-pod = { path = "crates/viy-pod", version = "0.3.0" }
 viy-provider = { path = "crates/viy-provider", version = "0.3.0" }
 viy-strata = { path = "crates/viy-strata", version = "0.3.0" }
@@ -56,6 +58,7 @@ base64 = "0.22.1"
 # Local time, as Codex has it (codex-rs/Cargo.toml).
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.6", features = ["derive"] }
+clap_complete = { version = "4.6.12", features = ["unstable-dynamic"] }
 crossterm = "0.29.0"
 # crossterm's EventStream is a futures-core Stream (Codex takes the futures
 # facade; the trait alone is enough here).

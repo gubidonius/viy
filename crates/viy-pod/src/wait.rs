@@ -169,6 +169,9 @@ struct Summary {
     /// The last fetch met RunPod's rate limit, which holds until then:
     /// the log is out of reach, and what it showed last is stale.
     limited_until: Option<Instant>,
+    /// The engine's own log is read instead of the provider's
+    /// ([`Progress::engine_started`]).
+    engine_log: bool,
 }
 
 impl std::fmt::Debug for Progress {
@@ -203,6 +206,7 @@ impl Progress {
         let every = runpod_every(self.started, PROGRESS_EVERY, LONG_WAIT_PROGRESS_EVERY);
         let mut summary = self.summary();
         if summary.failure.is_none()
+            && !summary.engine_log
             && !summary.fetching
             && summary.fetched.is_none_or(|at| at.elapsed() >= every)
         {
@@ -219,10 +223,41 @@ impl Progress {
         self.summary().ready
     }
 
+    /// The engine's container runs, and its log is no part of the
+    /// provider's: a Nebius VM's is its serial console. From here on only
+    /// [`Progress::engine_log`] moves the summary, so the clock names what
+    /// the engine does instead of the refusals of an endpoint still loading.
+    fn engine_started(&self, label: &str) {
+        let mut summary = self.summary();
+        summary.engine_log = true;
+        summary.limited_until = None;
+        summary.text = format!("starting {label}");
+    }
+
+    /// The last lines of the engine's container, as `docker logs
+    /// --timestamps` prints them. The container runs no sshd of its own, so
+    /// nothing it says of one ends the wait.
+    fn engine_log(&self, text: &str) {
+        let entries: Vec<LogEntry> = text
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(ts, line)| LogEntry {
+                ts: Some(ts.into()),
+                source: Some("container".into()),
+                line: line.into(),
+            })
+            .collect();
+        self.summary().summarise(&entries, false);
+    }
+
     async fn refresh(&self) {
         let fetched = log_entries(&*self.seam, &self.pod_id, 30, Duration::from_secs(8)).await;
         let mut summary = self.summary();
         summary.fetching = false;
+        // Asked for before the engine started.
+        if summary.engine_log {
+            return;
+        }
         match fetched {
             Ok(entries) => {
                 summary.limited_until = None;
@@ -337,6 +372,8 @@ impl Summary {
                 self.text = "warming model / capturing graphs".into();
             } else if lower.contains("compil") && source == Some("container") {
                 self.text = "loading compilation cache / compiling".into();
+            } else if line.contains("[strata] loading the experts into RAM") {
+                self.text = "loading the experts into RAM".into();
             } else if line.contains("Loading safetensors")
                 || line.contains("Starting to load model")
             {
@@ -686,6 +723,55 @@ fn healthy(timeline: &mut Timeline<'_>, ready: bool, label: &str) -> bool {
     ready
 }
 
+/// A short client wait can detach while the engine continues to load. For a
+/// longer wait, let the server use that budget to read cold network storage.
+fn nebius_strata_ready_secs(timeout: Duration) -> String {
+    timeout.as_secs().max(900).to_string()
+}
+
+/// Docker removes this container on exit. A successful listing with no matching
+/// running container confirms the exit; SSH and Docker failures prove nothing.
+async fn nebius_engine_exit(
+    exec: &dyn viy_exec::ExecBackend,
+    ssh: Command,
+    label: &str,
+) -> Result<bool, WaitError> {
+    let probe = ssh
+        .arg("sudo -n docker ps --filter 'name=^/model-server$' --format '{{.Names}}'")
+        .timeout(Duration::from_secs(8));
+    loop {
+        tokio::time::sleep(PROGRESS_EVERY).await;
+        if let Ok(out) = exec.run(probe.clone()).await
+            && out.status.success()
+            && out.stdout.iter().all(u8::is_ascii_whitespace)
+        {
+            return Err(WaitError::Startup(format!(
+                "{label} exited before its endpoint was ready. The Nebius VM may still be billing. Run viy stop to stop it."
+            )));
+        }
+    }
+}
+
+/// Feeds the engine's container log to the wait's clock, over SSH. One that
+/// can't be read leaves the clock as it was.
+async fn nebius_engine_log(
+    exec: &dyn viy_exec::ExecBackend,
+    ssh: Command,
+    progress: &Progress,
+) -> std::convert::Infallible {
+    let read = ssh
+        .arg(viy_nebius::ENGINE_LOG_COMMAND)
+        .timeout(Duration::from_secs(8));
+    loop {
+        if let Ok(out) = exec.run(read.clone()).await
+            && out.status.success()
+        {
+            progress.engine_log(&String::from_utf8_lossy(&out.stdout));
+        }
+        tokio::time::sleep(PROGRESS_EVERY).await;
+    }
+}
+
 /// Waits for vLLM and returns the base URL it answered on, or `None`.
 ///
 /// A tunnel-only pod publishes no http port, so the only way to probe it
@@ -769,9 +855,93 @@ pub async fn await_endpoint(
         ),
     );
     let mut said = |notice| report(Report::Notice(notice));
+    if w.ssh.paths.rental != viy_config::Rental::Runpod
+        && w.ssh.pinned_fingerprint().await?.is_none()
+    {
+        // SSH may answer before cloud-init writes its key to the serial console.
+        while crate::ssh::logged_host_keys(&*w.seam, w.pod_id)
+            .await
+            .unwrap_or_default()
+            .is_empty()
+        {
+            if started.elapsed() >= timeout.min(Duration::from_secs(150)) {
+                return Err(WaitError::Startup(
+                    "Nebius serial logs did not confirm the SSH host key.".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
     if !tunnel::start(&w.ssh, &*w.seam, &ip, port, false, &mut said).await? {
         timeline.mark("tunnel failed to start", []);
         return Ok(None);
+    }
+    let mut engine_monitor = None;
+    if w.ssh.paths.rental != viy_config::Rental::Runpod {
+        let mut container_cfg = cfg.clone();
+        container_cfg.set("TUNNEL", "0"); // Docker publishes the container port only on host loopback.
+        container_cfg.set("RUNPOD_WATCHDOG_API_KEY", "");
+        let request = engine::for_config(&container_cfg)
+            .map_err(WaitError::Startup)?
+            .pod_request(&container_cfg, api_key.unwrap_or(""), "", None)
+            .map_err(|e| WaitError::Startup(e.to_string()))?;
+        let mut env: std::collections::BTreeMap<_, _> = request
+            .env
+            .into_iter()
+            .filter(|(k, _)| k != "RPCTL_WATCHDOG_KEY" && k != "PUBLIC_KEY")
+            .collect();
+        env.insert("RPCTL_IDLE_TTL_S".into(), "0".into()); // The host watchdog controls Nebius power.
+        if engine::name(cfg) == engine::EngineName::Strata {
+            env.insert(
+                "STRATA_ENGINE_READY_S".into(),
+                nebius_strata_ready_secs(timeout),
+            );
+        }
+        let payload = serde_json::json!({"command":request.command.first(),"image":request.image,"port":cfg.get("VLLM_PORT").unwrap_or("8000"),"env":env});
+        let ssh = Command::new("ssh")
+            .args(["-o", "BatchMode=yes"])
+            .args(w.ssh.opts("yes")?)
+            .arg("-p")
+            .arg(port.to_string())
+            .arg(w.ssh.login(&ip));
+        let launch = |remote: &str| {
+            w.ssh.exec.run(
+                ssh.clone()
+                    .arg(remote)
+                    .stdin(payload.to_string())
+                    .timeout(timeout.saturating_sub(started.elapsed())),
+            )
+        };
+        let mut out = launch(&viy_nebius::engine_launch_command(false)).await?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains("wipefs: invalid offset argument: 'TYPE'")
+                && stderr.contains("['/usr/local/sbin/gpu-workspace']")
+            {
+                say(
+                    report,
+                    Tone::Plain,
+                    "Updating the VM's workspace helper and retrying the engine launch.",
+                );
+                out = launch(&viy_nebius::engine_launch_command(true)).await?;
+            }
+        }
+        if !out.status.success() {
+            // A guest traceback can contain launch arguments. Report only known diagnostics.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let message = if stderr.contains("wipefs: invalid offset argument: 'TYPE'") {
+                "Nebius workspace initialization failed: the VM's mount helper passed TYPE as a byte offset to wipefs."
+            } else if stderr.contains("['/usr/local/sbin/gpu-workspace']") {
+                "Nebius workspace preparation failed before the engine container could start."
+            } else {
+                "Nebius engine launch failed; check the workspace mount, GPU image, Docker and the host watchdog."
+            };
+            return settle(Err(WaitError::Startup(message.into())), timeline, report);
+        }
+        viy_nebius::workspace_mounted(w.ssh.paths)
+            .map_err(|e| WaitError::Startup(e.to_string()))?;
+        progress.engine_started(engine::label(cfg));
+        engine_monitor = Some(ssh);
     }
     timeline.mark("tunnel up", []);
     let url = tracked::local_url(cfg);
@@ -781,7 +951,7 @@ pub async fn await_endpoint(
     let waited = if remaining.is_zero() {
         Ok(false)
     } else {
-        wait_ready(
+        let health = wait_ready(
             w.http,
             &url,
             api_key,
@@ -790,8 +960,17 @@ pub async fn await_endpoint(
             Some(&mut guard),
             engine::name(cfg),
             report,
-        )
-        .await
+        );
+        if let Some(ssh) = engine_monitor {
+            tokio::select! {
+                biased;
+                result = health => result,
+                result = nebius_engine_exit(w.ssh.exec, ssh.clone(), engine::label(cfg)) => result,
+                never = nebius_engine_log(w.ssh.exec, ssh, &progress) => match never {},
+            }
+        } else {
+            health.await
+        }
     };
     let Some(ready) = settle(waited, timeline, report)? else {
         return Ok(None);

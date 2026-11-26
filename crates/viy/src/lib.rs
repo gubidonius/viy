@@ -150,6 +150,11 @@ fn dispatch(
         viy_config::config::load(paths, &project).map_err(|e| e.to_string())
     };
     match command {
+        Command::Completion { shell } => clap_complete::env::Shells::builtins()
+            .completer(shell)
+            .ok_or("unsupported completion shell")?
+            .write_registration(cli::COMPLETION_ENV, "viy", "viy", "viy", out)
+            .map_err(|e| Failure::from(e.to_string())),
         Command::Init(args) => {
             let paths = paths()?;
             init::cmd_init(&paths, &cwd()?, out)?;
@@ -177,6 +182,7 @@ fn dispatch(
         | Command::Down
         | Command::Tunnel(_)
         | Command::Backup { .. }
+        | Command::Provider { .. }
         | Command::Volume(_)
         | Command::Reap { .. }
         | Command::CaptureBoot { .. } => {

@@ -764,7 +764,10 @@ impl Chat {
     /// `/search [on|off]`: switch the web tools, and say what they use.
     pub(crate) async fn search_command(&mut self, ctx: &TurnContext, arg: &str) {
         match arg {
-            "on" | "off" => self.search_on = arg == "on",
+            "on" | "off" => {
+                self.search_on = arg == "on";
+                self.refresh_history_gauge(ctx);
+            }
             "" => {}
             _ => {
                 notice(ctx, NoticeLevel::Warn, "search", "usage: /search [on|off]");

@@ -35,6 +35,11 @@
    "stream": [
     {
      "content": "From /etc/acme/app.toml."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -47,6 +52,11 @@
    "stream": [
     {
      "content": "Three."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   },
@@ -67,6 +77,11 @@
    "stream": [
     {
      "content": "You're welcome."
+    },
+    {
+     "usage": {
+      "completion_tokens": 10
+     }
     }
    ]
   }

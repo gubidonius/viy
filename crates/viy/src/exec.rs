@@ -102,6 +102,13 @@ pub fn cmd_exec(
     runtime.block_on(async {
         // Advisory lines stay off a JSON stdout.
         let advisory: &mut (dyn Write + Send) = if args.json { &mut *err } else { &mut *out };
+        let _lease = if args.url.is_none() && Backend::resolve(&cfg)? == Backend::Managed {
+            Some(viy_pod::rental::lease(paths, false).map_err(|e| Failure::from(e.to_string()))?)
+        } else {
+            None
+        };
+        let selected = paths.selected().map_err(|e| Failure::from(e.to_string()))?;
+        let paths = &selected;
         let url = base_url(&cfg, args.url.as_deref(), paths, &http, advisory).await?;
         let mut chat = dev::chat(&cfg, &url, Arc::clone(&http), paths, start, saved)?;
         let store = Sessions::new(paths.sessions_dir(), Arc::new(SystemTimeProvider));
@@ -257,6 +264,7 @@ pub(crate) async fn base_url(
     let backend = Backend::resolve(cfg)?;
     let exe = std::env::current_exe().map_err(|e| Failure::from(format!("viy itself: {e}")))?;
     let env = Env {
+        terminal_login: false,
         paths,
         exec: &SystemExec,
         http,
@@ -275,7 +283,7 @@ pub(crate) async fn base_url(
     let Some(url) = found else {
         return Err(Failure::from(match backend {
             Backend::Openai => "ENDPOINT_URL is not set (BACKEND=openai).".to_string(),
-            Backend::Runpod => "No pod is running. Start one with:  viy up".to_string(),
+            Backend::Managed => "No pod is running. Start one with:  viy up".to_string(),
             Backend::Local => "No server is running. Start one with:  viy up".to_string(),
         }));
     };

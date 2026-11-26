@@ -236,9 +236,17 @@ pub enum StatusPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCountEvent {
     pub used: u64,
+    /// Full context window, including room for the reply.
     pub budget: u64,
+    /// The request or history was sized locally. Older senders only emitted estimates.
+    #[serde(default = "estimated_by_default")]
+    pub estimated: bool,
     /// Where auto-compaction starts, if it is on.
     pub auto_compact_at: Option<u64>,
+}
+
+fn estimated_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

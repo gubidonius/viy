@@ -238,16 +238,20 @@ pub async fn reap(
         }
     };
     // BACKEND as up reads it.
-    if Backend::resolve(cfg).map_err(CommandError::Exit)? != Backend::Runpod {
+    if Backend::resolve(cfg).map_err(CommandError::Exit)? != Backend::Managed {
         return Ok(());
     }
+    let Ok(_lease) = crate::rental::lease(env.paths, false) else {
+        return Ok(());
+    };
+    crate::rental::current(env.paths)?;
     if !PodLock::is_free(env.paths)? {
         print("rp or viy up/stop/down is running; not checking now".into());
         return Ok(());
     }
-    let seam = commands::provider(env, cfg)?;
+    let seam = crate::rental::selected(env, cfg)?;
     // Volumes and tracking stay RunPod's (kb d182).
-    let rp = seam.client();
+
     let now = regions::now(env.time);
     let mut tell = |message: String| {
         alert(report, "viy reap", message.clone(), false);
@@ -255,19 +259,53 @@ pub async fn reap(
     };
     // Volumes unused for BACKUP_IDLE_DAYS or PRIMARY_IDLE_DAYS (expiry
     // takes the pod lock itself when one is due).
-    match regions::expire(rp, env.paths, cfg, now, &mut tell).await {
-        Err(CommandError::RunPod(error)) => {
-            print(format!("volume check failed: {}", first_line(&error)));
-        }
-        result => {
-            result?;
+    if env.paths.rental == viy_config::Rental::Runpod {
+        let rp = commands::connect(env, cfg)?;
+        match regions::expire(&rp, env.paths, cfg, now, &mut tell).await {
+            Err(CommandError::RunPod(error)) => {
+                print(format!("volume check failed: {}", first_line(&error)));
+            }
+            result => {
+                result?;
+            }
         }
     }
-    let found = match commands::resolve(&seam, env, cfg, report).await {
+    if env.paths.rental != viy_config::Rental::Runpod
+        && cfg.get("RUNPOD_API_KEY").is_some_and(|key| !key.is_empty())
+    {
+        let mut legacy = env.paths.clone();
+        legacy.rental = viy_config::Rental::Runpod;
+        let rp = commands::connect(
+            &Env {
+                paths: &legacy,
+                ..*env
+            },
+            cfg,
+        )?;
+        if let Err(e) = regions::expire(&rp, &legacy, cfg, now, &mut tell).await {
+            tell(format!("RunPod volume check failed: {e}"));
+        }
+    }
+    let scopes = crate::rental::nebius_scopes(env.paths)?;
+    if !scopes.is_empty() && viy_nebius::Settings::load(env.paths)?.workspace_idle_days != 0 {
+        let _lock = PodLock::exclusive(env.paths, "volume-expiry")?;
+        for scoped in scopes {
+            let provider = viy_nebius::NebiusProvider::new(&scoped, env.http.clone())?;
+            match provider.expire_workspace(now as u64).await {
+                Ok(Some(disk)) => tell(format!("Expired unused Nebius workspace {disk}")),
+                Ok(None) => {}
+                Err(e) => tell(format!("Nebius workspace expiry: {e}")),
+            }
+        }
+    }
+    let found = match commands::resolve(&*seam, env, cfg, report).await {
         Ok(found) => found,
         Err(ResolveError::Provider(error)) => {
             let first = error.message.lines().next().unwrap_or_default();
-            print(format!("could not reach RunPod: {first}"));
+            print(format!(
+                "could not reach {}: {first}",
+                env.paths.rental.display_name()
+            ));
             return Ok(());
         }
         Err(ResolveError::State(error)) => return Err(error.into()),
@@ -282,8 +320,12 @@ pub async fn reap(
     };
     // The pod through the seam: its state in RunPod's word, which
     // `decide` reads as rp's `idle.decide` does.
-    let desired = pod.state_name.as_deref();
-    if desired != Some("EXITED") {
+    let desired = if pod.state == Some(viy_provider::PodState::Stopped) {
+        Some("EXITED")
+    } else {
+        pod.state_name.as_deref()
+    };
+    if desired != Some("EXITED") && env.paths.rental == viy_config::Rental::Runpod {
         // A stopped pod is not a use of its volume (kb d178).
         regions::note_pod(env.paths, &pod, now)?;
         let volume = pod.volume.as_deref().unwrap_or_default();

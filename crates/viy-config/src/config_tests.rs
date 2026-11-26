@@ -129,6 +129,7 @@ fn the_layers_merge_as_rpctl_merges_them() {
             ours.retain(|(k, _)| {
                 ![
                     "CHAT_HEADER",
+                    "TOOLS_FILE_READ_MAX_CHARS",
                     "CLIENT_TAG",
                     "GPU_PREFERRED",
                     "BACKUP_VOLUME_TYPE",
@@ -146,11 +147,11 @@ fn the_layers_merge_as_rpctl_merges_them() {
 /// CHAT_AUTOSAVE: viy always saves chats, as Codex (kb d083); and viy's own
 /// CHAT_HEADER, the chat's header art, and CLIENT_TAG (kb d137),
 /// GPU_PREFERRED (kb d138), BACKUP_VOLUME_TYPE (kb d139), PRIMARY_IDLE_DAYS
-/// (kb d178) and the serving engine's ENGINE_KEYS (kb d162).
+/// (kb d178), TOOLS_FILE_READ_MAX_CHARS and the serving engine's ENGINE_KEYS (kb d162).
 #[test]
 fn defaults_are_rpctls_keys_but_chat_autosave() {
-    assert_eq!(DEFAULTS.len(), 116 + ENGINE_KEYS.len());
-    assert_eq!(Config::defaults().iter().count(), 116 + ENGINE_KEYS.len());
+    assert_eq!(DEFAULTS.len(), 117 + ENGINE_KEYS.len());
+    assert_eq!(Config::defaults().iter().count(), 117 + ENGINE_KEYS.len());
     assert_eq!(Config::defaults().get("BACKUP_IDLE_DAYS"), Some("7"));
     assert_eq!(Config::defaults().get("PRIMARY_IDLE_DAYS"), Some(""));
     assert_eq!(Config::defaults().get("ENGINE"), Some("vllm"));

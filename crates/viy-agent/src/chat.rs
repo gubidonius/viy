@@ -63,6 +63,7 @@ use viy_protocol::TokenCountEvent;
 use viy_protocol::TurnOutcome;
 
 use crate::context::Estimator;
+use crate::context::MeasuredPrompt;
 use crate::context::prompt_budget;
 use crate::context::schema_chars;
 use crate::engine::BoxFuture;
@@ -86,9 +87,10 @@ use crate::sessions::Sessions;
 use crate::sessions::default_title;
 use crate::shell;
 use crate::stream::Endpoint;
+use crate::stream::RequestGauge;
 use crate::stream::Round;
 use crate::stream::Sink;
-use crate::stream::stream_once;
+use crate::stream::stream_with_context;
 use crate::trace::Severity;
 use crate::trace::Tracer;
 use crate::trace::TurnMonitor;
@@ -191,6 +193,9 @@ pub struct Chat {
     /// The summary being written in the background, if any.
     background: Option<compact::Background>,
     stats: Option<TurnStats>,
+    /// Latest main request, or the estimated history after it was edited.
+    gauge: Option<TokenCountEvent>,
+    measured_prompt: Option<MeasuredPrompt>,
     /// The background title request.
     title_job: Option<JoinHandle<()>>,
     /// The turn in progress: its user message, until the turn closes.
@@ -343,6 +348,16 @@ impl Chat {
             .get("TOOLS_MAX_OUTPUT")
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(20000);
+        files.file_read_max_chars = cfg
+            .get("TOOLS_FILE_READ_MAX_CHARS")
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                v.parse::<usize>().map_err(|_| {
+                    format!("TOOLS_FILE_READ_MAX_CHARS={v:?} is not a nonnegative integer")
+                })
+            })
+            .transpose()?;
         files.clients = viy_tools::guard::client_paths();
         let session: Arc<Mutex<Option<SessionLog>>> = Arc::default();
         let tracer = {
@@ -417,6 +432,8 @@ impl Chat {
                 .and_then(|n| n.trim().parse().ok())
                 .unwrap_or(0.85),
             stats: None,
+            gauge: None,
+            measured_prompt: None,
             title_job: None,
             inflight: None,
             pending_images: Vec::new(),
@@ -537,20 +554,39 @@ impl Chat {
         ctx.emit(EventMsg::EffortChanged(EffortChangedEvent {
             effort: self.settings.reasoning_effort.clone(),
         }));
-        let (used, _) = self.context_state(&[]);
-        ctx.emit(EventMsg::TokenCount(self.token_count(used)));
+        self.refresh_history_gauge(ctx);
         self.announce_label(ctx, None);
     }
 
     /// The context gauge at `used` tokens.
-    fn token_count(&self, used: u64) -> TokenCountEvent {
-        let budget = self.prompt_budget();
+    fn token_count(&self, used: u64, estimated: bool) -> TokenCountEvent {
         TokenCountEvent {
             used,
-            budget,
+            estimated,
+            budget: self.max_model_len,
             auto_compact_at: self
                 .auto_compact
-                .then_some((budget as f64 * self.auto_compact_threshold) as u64),
+                .then_some((self.prompt_budget() as f64 * self.auto_compact_threshold) as u64),
+        }
+    }
+
+    fn publish_count(&mut self, ctx: &TurnContext, count: TokenCountEvent) {
+        if self.gauge.as_ref() != Some(&count) {
+            ctx.emit(EventMsg::TokenCount(count.clone()));
+            self.gauge = Some(count);
+        }
+    }
+
+    pub(crate) fn refresh_history_gauge(&mut self, ctx: &TurnContext) -> TokenCountEvent {
+        let (used, _) = self.context_state(&[]);
+        let count = self.token_count(used, true);
+        self.publish_count(ctx, count.clone());
+        count
+    }
+
+    fn refresh_gauge_limits(&mut self, ctx: &TurnContext) {
+        if let Some(previous) = &self.gauge {
+            self.publish_count(ctx, self.token_count(previous.used, previous.estimated));
         }
     }
 
@@ -1100,6 +1136,9 @@ impl Chat {
     /// next request: the pod was replaced or restarted.
     pub fn server_changed(&mut self) {
         self.discovered = false;
+        self.max_model_len = max_model_len(&self.cfg);
+        self.gauge = None;
+        self.measured_prompt = None;
     }
 
     /// Tokens the conversation may occupy before a reply no longer fits.
@@ -1116,9 +1155,7 @@ impl Chat {
         }
         msgs.extend(self.messages.iter().cloned());
         msgs.extend(extra.iter().cloned());
-        let tokens = self
-            .estimator
-            .tokens(&msgs, schema_chars(&self.tool_specs()));
+        let tokens = self.estimate_tokens(&msgs);
         (tokens, tokens as f64 / self.prompt_budget() as f64)
     }
 
@@ -1143,13 +1180,18 @@ impl Chat {
 
     /// Sends the next turn to `ready`: a new address or model is asked for
     /// its context length again before the turn (kb d041).
-    pub fn connect(&mut self, ready: crate::server::Ready) {
+    pub fn connect(&mut self, ctx: &TurnContext, ready: crate::server::Ready) {
         if self.endpoint.base != ready.base || self.settings.model != ready.model {
             self.endpoint.base = ready.base;
             self.settings.model = ready.model;
-            self.discovered = false;
+            self.server_changed();
             self.probed = false;
         }
+        // A replacement pod can keep the same model alias and tunnel address.
+        if let Some(window) = ready.context_window {
+            self.max_model_len = window;
+        }
+        self.refresh_gauge_limits(ctx);
     }
 
     /// The model id requests name.
@@ -1161,7 +1203,6 @@ impl Chat {
     /// only what was asked for, and a running pod can predate a config
     /// edit. Keeps the configured value when the server does not say.
     pub async fn discover_max_model_len(&mut self) -> u64 {
-        self.discovered = true;
         let request = self
             .endpoint
             .request(Method::GET, "/v1/models")
@@ -1170,13 +1211,12 @@ impl Chat {
             && response.status == 200
             && let Ok(bytes) = response.bytes().await
             && let Ok(models) = serde_json::from_slice::<Value>(&bytes)
-            && let Some(n) = models["data"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find_map(|m| m["max_model_len"].as_u64().filter(|n| *n > 0))
+            && models["data"].is_array()
         {
-            self.max_model_len = n;
+            self.discovered = true;
+            if let Some(n) = served_context(&models, &self.settings.model) {
+                self.max_model_len = n;
+            }
         }
         self.max_model_len
     }
@@ -1353,8 +1393,20 @@ impl Chat {
     /// The estimated tokens of `msgs` with this request's tool schemas
     /// (rp's `_estimate_tokens`).
     fn estimate_tokens(&self, msgs: &[Value]) -> u64 {
-        self.estimator
-            .tokens(msgs, schema_chars(&self.tool_specs()))
+        self.estimate_request_tokens(msgs, Tools::Auto, true)
+    }
+
+    fn estimate_request_tokens(&self, msgs: &[Value], tools: Tools, think: bool) -> u64 {
+        let specs = self.tool_specs();
+        if let Some(prefix) = &self.measured_prompt {
+            // Only the template options are needed here. Avoid constructing another copy
+            // of a potentially half-million-token request to check its fingerprint.
+            let options = self.settings.payload(&[], &specs, tools, think);
+            if let Some(tokens) = prefix.estimate(&options, msgs, self.estimator) {
+                return tokens;
+            }
+        }
+        self.estimator.tokens(msgs, schema_chars(&specs))
     }
 
     /// The instruction files in force, re-read so an edit lands on the next
@@ -1407,6 +1459,7 @@ impl Chat {
         self.partial.clear();
         if !self.discovered {
             self.discover_max_model_len().await;
+            self.refresh_gauge_limits(ctx);
             notice(
                 ctx,
                 NoticeLevel::Info,
@@ -1510,7 +1563,6 @@ impl Chat {
         let mut out = Round::default();
         let mut sent = msgs.clone();
         let mut first_token = None;
-        let mut usage: Option<Value> = None;
         let mut reasoning_chars = 0;
         let mut text = String::new();
         let mut stopped_full = false;
@@ -1570,6 +1622,7 @@ impl Chat {
                     &format!("model request failed in round {round_i}"),
                 );
                 self.close_inflight("interrupted: the request failed", false);
+                self.refresh_history_gauge(ctx);
                 return TurnOutcome::Failed {
                     message: "the request failed".into(),
                 };
@@ -1582,9 +1635,6 @@ impl Chat {
             // Now part of `r`, not a fragment.
             self.partial.clear();
             first_token = first_token.or(r.first_token);
-            if r.usage.is_some() {
-                usage.clone_from(&r.usage);
-            }
             reasoning_chars += r.reasoning.chars().count();
             text.clone_from(&r.text);
 
@@ -1712,14 +1762,12 @@ impl Chat {
                 text.clone_from(&out.text);
                 answer_thought |= !out.reasoning.is_empty();
                 reasoning_chars += out.reasoning.chars().count();
-                if out.usage.is_some() {
-                    usage.clone_from(&out.usage);
-                }
             }
         }
 
         // A reasoning model spends the budget on its trace first, so at the
         // cap the stream just stops, often before any answer.
+        let usage = &out.usage;
         let cut = out.finish.as_deref() == Some("length");
         if cut {
             let done = usage
@@ -1787,8 +1835,13 @@ impl Chat {
         }
         let elapsed = started.elapsed().as_secs_f64();
         let completion_tokens = usage.as_ref().and_then(|u| u["completion_tokens"].as_u64());
-        let (context_tokens, fraction) = self.context_state(&[]);
-        let budget = self.prompt_budget();
+        let count = match self.gauge.clone() {
+            Some(count) if !stopped_full => count,
+            _ => self.refresh_history_gauge(ctx),
+        };
+        let context_tokens = count.used;
+        let budget = count.budget;
+        let fraction = context_tokens as f64 / budget.max(1) as f64;
         self.stats = Some(TurnStats {
             elapsed_s: round_to(elapsed, 2),
             ttft_s: first_token.map(|t| round_to(t.duration_since(started).as_secs_f64(), 2)),
@@ -1804,7 +1857,6 @@ impl Chat {
             context_pct: round_to(fraction * 100.0, 1),
             chars_per_token: round_to(self.estimator.chars_per_token, 2),
         });
-        ctx.emit(EventMsg::TokenCount(self.token_count(context_tokens)));
         let extra = json!({"answer_chars": text.chars().count(), "finish": out.finish,
                            "context_pct": round_to(fraction * 100.0, 1)});
         self.finish_monitor(ctx, extra);
@@ -1847,7 +1899,9 @@ impl Chat {
     /// A tool result clipped to the room left under the loop's ceiling
     /// (rp's `_fit_tool_payload`).
     fn fit_tool_payload(&self, ctx: &TurnContext, payload: &str, msgs: &[Value]) -> String {
-        let room = self.tool_loop_ceiling() as i64 - self.estimate_tokens(msgs) as i64;
+        let room = self
+            .tool_loop_ceiling()
+            .saturating_sub(self.estimate_tokens(msgs));
         let max_chars = (room as f64 * self.estimator.chars_per_token) as i64;
         let len = payload.chars().count() as i64;
         if max_chars >= len {
@@ -1882,13 +1936,49 @@ impl Chat {
     ) -> Option<Round> {
         ctx.emit(EventMsg::RoundStarted(RoundStartedEvent { round, kind }));
         let body = self.settings.payload(msgs, specs, tools, true);
+        let prompt = self
+            .measured_prompt
+            .as_ref()
+            .and_then(|p| p.estimate(&body, msgs, self.estimator))
+            .unwrap_or_else(|| {
+                self.estimator.tokens(
+                    body["messages"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                    schema_chars(
+                        body["tools"]
+                            .as_array()
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    ),
+                )
+            });
+        let count = self.token_count(prompt, true);
+        self.publish_count(ctx, count.clone());
+        // The stream now owns the visible count. Cancellation must republish the retained history.
+        self.gauge = None;
+        let mut gauge = RequestGauge::new(count, self.estimator.chars_per_token);
         let emit = |msg| ctx.emit(msg);
         let sink = Sink {
             emit: &emit,
             touch: self.touch.as_ref(),
         };
         let started = std::time::Instant::now();
-        let out = stream_once(&self.endpoint, &body, &sink, &mut self.partial).await;
+        let out = stream_with_context(
+            &self.endpoint,
+            &body,
+            &sink,
+            &mut self.partial,
+            Some(&mut gauge),
+        )
+        .await;
+        self.gauge = out.as_ref().map(|_| gauge.count);
+        if out.is_some()
+            && let Some(tokens) = gauge.reported_prompt
+        {
+            self.measured_prompt = Some(MeasuredPrompt::new(&body, msgs, tokens));
+        }
         if self.rounds_log.is_some() {
             let rec = self.round_record(round, msgs, tools, out.as_ref(), started.elapsed());
             if let Some(f) = self.rounds_log.as_mut() {
@@ -2105,6 +2195,21 @@ pub fn max_model_len(cfg: &Config) -> u64 {
         .unwrap_or(65536)
 }
 
+fn served_context(models: &Value, model: &str) -> Option<u64> {
+    let rows = models["data"].as_array()?;
+    let row = rows
+        .iter()
+        .find(|m| m["id"].as_str() == Some(model))
+        .or(match rows.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        })?;
+    [&row["max_model_len"], &row["meta"]["n_ctx"]]
+        .into_iter()
+        .filter_map(Value::as_u64)
+        .find(|n| *n > 0)
+}
+
 /// A turn's numbers, rp's `last_stats`, in its key order.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TurnStats {
@@ -2211,6 +2316,7 @@ impl Drop for Lease {
                     "interrupted"
                 };
                 chat.close_inflight(reason, true);
+                chat.refresh_history_gauge(&self.ctx);
                 chat.checkpoint(&self.ctx);
             }
             // A turn interrupted still gets its row.
@@ -2241,14 +2347,19 @@ impl Turns for ChatTurns {
         })
     }
 
+    fn turn_lease(&self) -> Result<Option<std::fs::File>, String> {
+        self.server
+            .as_ref()
+            .map_or(Ok(None), |server| server.turn_lease())
+    }
+
     fn admit(self: Arc<Self>, ctx: TurnContext) -> BoxFuture<'static, Result<(), String>> {
-        let _ = ctx;
         Box::pin(async move {
             let Some(server) = self.server.clone() else {
                 return Ok(());
             };
             let ready = server.ready().await?;
-            self.with_chat(|chat| chat.connect(ready));
+            self.with_chat(|chat| chat.connect(&ctx, ready));
             Ok(())
         })
     }
@@ -2292,7 +2403,7 @@ impl Turns for ChatTurns {
                 && let Some(server) = self.server.clone()
                 && let Ok(ready) = server.ready().await
             {
-                self.with_chat(|chat| chat.connect(ready));
+                self.with_chat(|chat| chat.connect(&ctx, ready));
             }
             if let Some(mut lease) = Lease::take(&self, &ctx)
                 && let Some(chat) = lease.chat.as_mut()

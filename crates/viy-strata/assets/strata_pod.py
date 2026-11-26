@@ -330,8 +330,13 @@ def settings(ready, environ=os.environ):
         args += ["--spec", "4", "--spec-min-p", "0.5", "--mtp", ready["mtp"]]
         if parallel > 1 and get("STRATA_BATCH_MTP") == "1":
             args.append("--batch-mtp")
-    args += ["--max-context", get("STRATA_MAX_CONTEXT") or "131072", "--kv", kv,
+    max_context = int(get("STRATA_MAX_CONTEXT") or 131072)
+    args += ["--max-context", str(max_context), "--kv", kv,
              "--vram-reserve-mib", get("STRATA_VRAM_RESERVE_MIB") or "1536"]
+    original_context = int(get("STRATA_YARN_ORIG_CTX") or 0)
+    if 0 < original_context < max_context:
+        args += ["--rope-scaling", "yarn", "--rope-scale", f"{max_context / original_context:.12g}",
+                 "--yarn-orig-ctx", str(original_context)]
     cfg = {"exe": ready["engine"], "args": args, "cwd": str(Path(ready["pack"]).parent),
            "tokenizer": str(Path(ready["pack"]) / "tokenizer"),
            "model_name": get("STRATA_MODEL_NAME") or "model",

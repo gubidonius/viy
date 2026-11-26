@@ -4,6 +4,7 @@ use std::io::Write;
 
 use clap::Args;
 use clap::ValueEnum;
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 
 use viy_config::Config;
 use viy_config::Paths;
@@ -12,31 +13,61 @@ use viy_config::profiles;
 use viy_pod::engine;
 use viy_pod::engine::EngineName;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
 pub enum ModelAction {
     List,
     Show,
     Use,
     Add,
+    #[value(skip)]
+    Select(String),
 }
 
 impl ModelAction {
-    fn word(self) -> &'static str {
-        match self {
-            Self::List => "list",
-            Self::Show => "show",
-            Self::Use => "use",
-            Self::Add => "add",
+    fn parse(word: &str) -> Result<Self, String> {
+        if let Ok(action) = Self::from_str(word, false) {
+            return Ok(action);
         }
+        if profile_names().iter().any(|name| name == word) {
+            return Ok(Self::Select(word.to_owned()));
+        }
+        Err(format!(
+            "unknown model action or profile '{word}' (viy model list)"
+        ))
     }
+}
+
+fn profile_names() -> Vec<String> {
+    Paths::from_env()
+        .and_then(|paths| profiles::list_profiles(&paths))
+        .unwrap_or_default()
+}
+
+fn profile_candidates() -> Vec<CompletionCandidate> {
+    profile_names()
+        .into_iter()
+        .filter(|name| !name.chars().any(char::is_control))
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn model_candidates() -> Vec<CompletionCandidate> {
+    ModelAction::value_variants()
+        .iter()
+        .filter_map(ValueEnum::to_possible_value)
+        .map(|value| CompletionCandidate::new(value.get_name().to_owned()))
+        .chain(profile_candidates())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ModelArgs {
-    #[arg(value_enum)]
+    #[arg(value_name = "ACTION_OR_PROFILE", value_parser = ModelAction::parse,
+        add = ArgValueCandidates::new(model_candidates),
+        help = "list, show, use, add, or a profile name to select")]
     pub action: ModelAction,
     // The profile; required for `use` and `add`.
-    #[arg(help = "profile name (required for use/add)")]
+    #[arg(help = "profile name (required for use/add)", add = ArgValueCandidates::new(profile_candidates))]
     pub name: Option<String>,
     // `add`: overwrite an existing profile.
     #[arg(long, help = "model add: overwrite an existing profile")]
@@ -57,7 +88,6 @@ pub fn cmd_model(
         };
     }
     let name = args.name.as_deref();
-    let needs_name = || format!("viy model {} needs a profile name", args.action.word());
     let io = |e: std::io::Error| e.to_string();
     match args.action {
         ModelAction::List => {
@@ -133,8 +163,14 @@ pub fn cmd_model(
                 }
             }
         }
-        ModelAction::Use => {
-            let name = name.ok_or_else(needs_name)?;
+        ModelAction::Use | ModelAction::Select(_) => {
+            let name = match (&args.action, name) {
+                (ModelAction::Select(profile), None) => profile.as_str(),
+                (ModelAction::Select(_), Some(_)) => {
+                    return Err("viy model takes one profile name".into());
+                }
+                (_, name) => name.ok_or("viy model use needs a profile name")?,
+            };
             if !profiles::list_profiles(paths)
                 .map_err(io)?
                 .iter()
@@ -152,7 +188,7 @@ pub fn cmd_model(
             );
         }
         ModelAction::Add => {
-            let name = name.ok_or_else(needs_name)?;
+            let name = name.ok_or("viy model add needs a profile name")?;
             let path = profiles::profile_path(paths, name);
             if path.exists() && !args.force {
                 return Err(format!(

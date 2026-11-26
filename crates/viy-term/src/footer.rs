@@ -270,7 +270,8 @@ fn gauge(c: &TokenCountEvent) -> Option<Item> {
         _ => dim(),
     };
     let text = format!(
-        "ctx {:.0}% {}/{}",
+        "ctx {}{:.0}% {}/{}",
+        if c.estimated { "~" } else { "" },
         frac * 100.0,
         tokens(c.used),
         tokens(c.budget)
@@ -281,7 +282,10 @@ fn gauge(c: &TokenCountEvent) -> Option<Item> {
 /// The pod's items: where it is, its price, the idle countdown, the tunnel.
 fn pod_items(pod: &PodStatusEvent, idle_left: Option<Duration>) -> Vec<Item> {
     let mut items = Vec::new();
-    if pod.backend != "runpod" {
+    if pod.backend == "nebius" {
+        items.push(Item::new(4, "Nebius".into(), dim()));
+    }
+    if !matches!(pod.backend.as_str(), "runpod" | "nebius") {
         let text = match &pod.model {
             Some(model) => format!("{} {model}", pod.backend),
             None => pod.backend.clone(),

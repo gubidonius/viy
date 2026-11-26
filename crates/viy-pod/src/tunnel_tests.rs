@@ -625,7 +625,7 @@ async fn the_command_stops_reports_and_refuses_a_second_tunnel() {
     let bench = Bench::new();
     bench.pin();
     let ssh = bench.ssh();
-    let never = || -> Result<RunPodProvider, String> { panic!("no RunPod client needed") };
+    let never = || -> Result<Arc<dyn Provider>, String> { panic!("no RunPod client needed") };
     command(
         &ssh,
         Action::Stop,
@@ -641,11 +641,11 @@ async fn the_command_stops_reports_and_refuses_a_second_tunnel() {
     );
 
     let pods = [bench.pod(), bench.pod()];
-    let connect = || {
-        Ok(test_seam(RunPod::new(
+    let connect = || -> Result<Arc<dyn Provider>, String> {
+        Ok(Arc::new(test_seam(RunPod::new(
             API_KEY,
             Arc::new(V1::new(Arc::new(FakeHttp::new(pods)))),
-        )))
+        ))))
     };
     command(
         &ssh,

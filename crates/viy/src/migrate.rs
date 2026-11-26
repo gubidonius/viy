@@ -63,8 +63,10 @@ pub fn cmd_finish(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
+    let mut legacy = paths.clone();
+    legacy.rental = viy_config::Rental::Runpod;
     let machine = finish::Machine {
-        paths,
+        paths: &legacy,
         cwd,
         me: &me,
         on_path: on_path.as_deref(),

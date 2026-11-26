@@ -14,6 +14,8 @@ pub mod paths;
 pub mod profiles;
 pub mod project;
 pub mod redact;
+pub mod rental;
+pub use rental::Rental;
 pub mod vault;
 
 pub use config::Config;

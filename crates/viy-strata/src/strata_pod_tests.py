@@ -423,6 +423,16 @@ class SettingsTests(unittest.TestCase):
         # the expert arena without transparent huge pages, through the config's env
         self.assertEqual(cfg["env"], {"STRATA_NO_ARENA_THP": "1"})
 
+    def test_yarn_scales_an_extended_window_only_when_configured(self):
+        extended = dict(ENV, STRATA_MAX_CONTEXT="524288", STRATA_YARN_ORIG_CTX="262144")
+        args = pod.settings(READY, extended)["args"]
+        self.assertEqual(args[args.index("--max-context") + 1], "524288")
+        self.assertEqual(args[-6:], ["--rope-scaling", "yarn", "--rope-scale", "2",
+                                     "--yarn-orig-ctx", "262144"])
+        for overrides in ({"STRATA_MAX_CONTEXT": "262144"}, {"STRATA_MAX_CONTEXT": "131072"},
+                          {"STRATA_YARN_ORIG_CTX": "0"}):
+            self.assertNotIn("--rope-scaling", pod.settings(READY, dict(extended, **overrides))["args"])
+
     def test_huge_pages_auto_leaves_strata_to_choose(self):
         for env in (dict(ENV, STRATA_HUGE_PAGES="auto"),
                     {k: v for k, v in ENV.items() if k != "STRATA_HUGE_PAGES"}):

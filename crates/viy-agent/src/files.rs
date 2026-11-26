@@ -114,6 +114,8 @@ pub struct FileTools {
     pub write_requires_read: bool,
     /// TOOLS_MAX_OUTPUT, in characters.
     pub max_output: usize,
+    /// Optional per-profile override for read_file (whole files and line ranges).
+    pub file_read_max_chars: Option<usize>,
     /// Where the workspace locks live: rpctl's state folder, so rp and viy
     /// lock each other out.
     pub locks_dir: PathBuf,
@@ -286,10 +288,15 @@ impl FileTools {
             clients: guard::client_paths(),
             write_requires_read: true,
             max_output: 20000,
+            file_read_max_chars: None,
             locks_dir,
             quarantine_dir,
             seen: HashMap::new(),
         }
+    }
+
+    pub(crate) fn clip_file_read(&self, text: &str) -> String {
+        clip(text, self.file_read_max_chars.unwrap_or(self.max_output))
     }
 
     /// Forgets every read (a new chat, a resumed one, a compaction).
@@ -780,7 +787,7 @@ impl FileTools {
         if let Some((a, b)) = line_span(args, lines.len()) {
             let part: Vec<String> = (a..=b).map(|n| format!("{n}: {}", lines[n - 1])).collect();
             let part = part.join("\n");
-            let clipped = clip(&part, self.max_output);
+            let clipped = self.clip_file_read(&part);
             let truncated = clipped != part;
             return (
                 Outcome::ok(json!({
@@ -792,7 +799,7 @@ impl FileTools {
                 Some(seen),
             );
         }
-        let clipped = clip(&data, self.max_output);
+        let clipped = self.clip_file_read(&data);
         let mut out = json!({"path": shown, "content": clipped, "truncated": clipped != data});
         if clipped != data {
             out["note"] = json!(format!(

@@ -114,6 +114,7 @@ const HELP: &str = "  /help              show this
   /tunnel [--stop|--status|--forget-key]  SSH forward to vLLM
   /boots [list|show] [boot] [-n N]  stage timings of recent boots
   /backup [--samples N]  primary and backup region, A100 stock per region
+  /provider [show|list|nebius|runpod|use|stock]  show or switch GPU providers, or check regional stock
   /volume [list|create|delete] [id]  manage the weights network volume
   /reap [--quiet]    viy stop if nothing streamed for IDLE_TTL_MIN +
                      REAP_GRACE_MIN
@@ -131,9 +132,9 @@ const HELP: &str = "  /help              show this
   End a line with \\ to continue it on the next line.";
 
 /// The pod's commands (kb d041, d068), which the chat's server runs.
-pub const POD_COMMANDS: [&str; 11] = [
-    "up", "stop", "down", "status", "logs", "tunnel", "boots", "backup", "volume", "reap",
-    "shutdown",
+pub const POD_COMMANDS: [&str; 12] = [
+    "up", "stop", "down", "status", "logs", "tunnel", "boots", "backup", "volume", "provider",
+    "reap", "shutdown",
 ];
 
 /// How a replayed tool call is labelled, as the live chat shows it: the
@@ -404,6 +405,7 @@ impl Chat {
             }
             "reload" => {
                 self.snapshot_skills();
+                self.refresh_history_gauge(ctx);
                 info(format!(
                     "{} skill(s) in the system prompt (it changes, so the next message re-reads \
                      the whole history)",
@@ -435,6 +437,7 @@ impl Chat {
             "on" | "off" => {
                 self.toolbox_on = word == "on";
                 self.snapshot_toolbox();
+                self.refresh_history_gauge(ctx);
                 notice(
                     ctx,
                     NoticeLevel::Info,
@@ -518,6 +521,7 @@ impl Chat {
                 let system = (!arg.is_empty()).then(|| arg.to_string());
                 if self.messages.is_empty() {
                     self.system = system;
+                    self.refresh_history_gauge(ctx);
                 } else {
                     self.new_session(ctx, system).await;
                     self.redraw(ctx, RewriteReason::New);
@@ -585,6 +589,7 @@ impl Chat {
             "maxtok" => match arg.parse::<i64>() {
                 Ok(n) => {
                     self.settings.max_tokens = n;
+                    self.refresh_gauge_limits(ctx);
                     info("maxtok", format!("max_tokens = {n}"));
                 }
                 Err(_) => warn("maxtok", "usage: /maxtok 4096".into()),
@@ -642,6 +647,7 @@ impl Chat {
             "instructions" => {
                 if matches!(arg, "on" | "off") {
                     self.instructions_on = arg == "on";
+                    self.refresh_history_gauge(ctx);
                     info("instructions", format!("instruction files {arg}"));
                     if !self.instructions_on {
                         return;
@@ -1021,12 +1027,12 @@ impl Chat {
 
     /// Draws the history again, and the footer's gauge and name with it.
     fn redraw(&mut self, ctx: &TurnContext, reason: RewriteReason) {
+        self.measured_prompt = None;
         ctx.emit(EventMsg::HistoryRewritten(HistoryRewrittenEvent {
             reason,
             items: history_items(&self.messages, &self.earlier),
         }));
-        let (used, _) = self.context_state(&[]);
-        ctx.emit(EventMsg::TokenCount(self.token_count(used)));
+        self.refresh_history_gauge(ctx);
         self.announce_label(ctx, None);
     }
 

@@ -189,7 +189,7 @@ impl Helper<'_> {
                 .join("\n"),
             None => data.clone(),
         };
-        let clipped = clip(&shown_data, s.files.max_output);
+        let clipped = s.files.clip_file_read(&shown_data);
         let shown = s.files.ws_rel(&path);
         self.files.push(shown.clone());
         json!({"path": shown, "lines": lines.len(), "content": clipped,

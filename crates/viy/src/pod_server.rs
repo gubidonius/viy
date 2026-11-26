@@ -193,9 +193,10 @@ impl PodServer {
         lock(&self.cfg).clone()
     }
 
-    fn env(&self) -> Env<'_> {
+    fn env<'a>(&'a self, paths: &'a Paths) -> Env<'a> {
         Env {
-            paths: &self.parts.paths,
+            terminal_login: false,
+            paths,
             exec: self.parts.exec.as_ref(),
             http: &self.parts.http,
             time: self.parts.time.as_ref(),
@@ -223,25 +224,43 @@ impl PodServer {
 
     /// Where the model answers now, or why not; `None` for a reason that
     /// is a state (booting, stopping).
-    async fn probe(&self, cfg: &Config, backend: Backend) -> Result<String, String> {
+    async fn probe(&self, paths: &Paths, cfg: &Config, backend: Backend) -> Result<Ready, String> {
         let report = |_: Report| {};
         let base = backend
-            .base_url(&self.env(), cfg, false, &report)
+            .base_url(&self.env(paths), cfg, false, &report)
             .await
             .map_err(|e| e.to_string())?;
+        let ready = |base, context_window| Ready {
+            base,
+            model: backend.model_name(cfg),
+            context_window,
+        };
         match backend {
-            Backend::Openai => {
-                base.ok_or_else(|| "ENDPOINT_URL is not set (BACKEND=openai).".into())
-            }
-            Backend::Local => {
-                base.ok_or_else(|| "no local vLLM is running: /up starts one.".into())
-            }
-            Backend::Runpod => {
+            Backend::Openai => base
+                .map(|url| ready(url, None))
+                .ok_or_else(|| "ENDPOINT_URL is not set (BACKEND=openai).".into()),
+            Backend::Local => base
+                .map(|url| ready(url, None))
+                .ok_or_else(|| "no local vLLM is running: /up starts one.".into()),
+            Backend::Managed => {
                 let Some(base) = base else {
                     return Err("no pod is running: /up starts one.".into());
                 };
-                if self.healthy(&base).await {
-                    Ok(base)
+                if let Some(response) = self.health(&base).await {
+                    let window = if cfg.get("ENGINE").map(str::trim) == Some("strata")
+                        && response.status == 200
+                    {
+                        response
+                            .bytes()
+                            .await
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            .and_then(|health| health["max_context"].as_u64())
+                            .filter(|n| *n > 0)
+                    } else {
+                        None
+                    };
+                    Ok(ready(base, window))
                 } else {
                     Err("the pod is not answering: /status says why, /up brings it back.".into())
                 }
@@ -250,7 +269,7 @@ impl PodServer {
     }
 
     /// Whether vLLM at `base` answers `/health`, as `viy status` asks it.
-    async fn healthy(&self, base: &str) -> bool {
+    async fn health(&self, base: &str) -> Option<viy_http::Response> {
         let request = || {
             Request::new(Method::GET, format!("{base}/health"))
                 .header("User-Agent", user_agent::RP_REQUESTS)
@@ -264,12 +283,12 @@ impl PodServer {
         // new connection.
         for _ in 0..2 {
             match viy_http::send(self.parts.http.as_ref(), request()).await {
-                Ok(response) => return matches!(response.status, 200 | 401),
-                Err(viy_http::HttpError::Timeout) => return false,
+                Ok(response) => return matches!(response.status, 200 | 401).then_some(response),
+                Err(viy_http::HttpError::Timeout) => return None,
                 Err(_) => {}
             }
         }
-        false
+        None
     }
 
     /// The pod's status as the footer shows it.
@@ -288,24 +307,32 @@ impl PodServer {
         let Ok(backend) = self.backend.clone() else {
             return status;
         };
-        status.backend = backend.name().into();
-        if backend != Backend::Runpod {
+        let Ok(paths) = self.parts.paths.selected() else {
+            return status;
+        };
+        status.backend = if backend == Backend::Managed {
+            paths.rental.name()
+        } else {
+            backend.name()
+        }
+        .into();
+        if backend != Backend::Managed {
             status.model = Some(backend.model_name(&cfg));
         }
         let others = || {
-            (backend == Backend::Runpod)
+            (backend == Backend::Managed)
                 .then(|| self.others_state())
                 .flatten()
         };
         if let Some(state) = self.own_state().or_else(others) {
             status.state = state;
-        } else if self.parts.url.is_some() || self.probe(&cfg, backend).await.is_ok() {
+        } else if self.parts.url.is_some() || self.probe(&paths, &cfg, backend).await.is_ok() {
             status.state = PodState::Ready;
         }
-        if backend != Backend::Runpod {
+        if backend != Backend::Managed {
             return status;
         }
-        let pod = state::load(&self.parts.paths).unwrap_or_default();
+        let pod = state::load(&paths).unwrap_or_default();
         let Some(pod_id) = pod.pod_id().map(str::to_string) else {
             return status;
         };
@@ -313,10 +340,10 @@ impl PodServer {
             .get(state::key::COST_PER_HR)
             .and_then(number)
             .filter(|p| *p > 0.0);
-        status.gpu = self.gpu_of(&pod_id);
-        status.idle_seconds_left = self.idle_left(&cfg, &pod_id);
-        if tracked::tunnel_only(&self.parts.paths, &cfg).unwrap_or(false) {
-            let ssh = self.env().ssh(&cfg);
+        status.gpu = self.gpu_of(&paths, &pod_id);
+        status.idle_seconds_left = self.idle_left(&paths, &cfg, &pod_id);
+        if tracked::tunnel_only(&paths, &cfg).unwrap_or(false) {
+            let ssh = self.env(&paths).ssh(&cfg);
             status.tunnel_up = Some(tunnel::running(&ssh).is_ok_and(|t| t.alive));
         }
         status
@@ -324,13 +351,13 @@ impl PodServer {
 
     /// The GPU of pod `pod_id`, from its most recent boot record; kept once
     /// found.
-    fn gpu_of(&self, pod_id: &str) -> Option<String> {
+    fn gpu_of(&self, paths: &Paths, pod_id: &str) -> Option<String> {
         if let Some((id, gpu)) = lock(&self.gpu).as_ref()
             && id == pod_id
         {
             return Some(gpu.clone());
         }
-        let gpu = Records::new(&self.parts.paths)
+        let gpu = Records::new(paths)
             .history(20)
             .iter()
             .rev()
@@ -342,15 +369,14 @@ impl PodServer {
 
     /// Seconds before the reaper takes the pod down for want of tokens, as
     /// `viy reap` counts them; `None` with IDLE_TTL_MIN off.
-    fn idle_left(&self, cfg: &Config, pod_id: &str) -> Option<u64> {
+    fn idle_left(&self, paths: &Paths, cfg: &Config, pod_id: &str) -> Option<u64> {
         let limits = idle::limits(cfg);
         if limits.ttl == 0.0 {
             return None;
         }
         let now = self.parts.time.now().timestamp_micros() as f64 / 1e6;
-        let seen = idle::Seen::load(&self.parts.paths, pod_id, now);
-        let activity =
-            idle::last_activity(&self.parts.paths).map(|at| at.timestamp_micros() as f64 / 1e6);
+        let seen = idle::Seen::load(paths, pod_id, now);
+        let activity = idle::last_activity(paths).map(|at| at.timestamp_micros() as f64 / 1e6);
         let last = idle::last_active(activity, &seen);
         Some((limits.ttl + limits.grace - (now - last)).max(0.0) as u64)
     }
@@ -368,8 +394,11 @@ impl PodServer {
             && let Ok(backend) = self.backend.clone()
         {
             let cfg = self.cfg();
+            let Ok(paths) = self.parts.paths.selected() else {
+                return;
+            };
             for line in backend
-                .preflight(&self.env(), &cfg)
+                .preflight(&self.env(&paths), &cfg)
                 .await
                 .unwrap_or_default()
             {
@@ -447,7 +476,11 @@ impl PodServer {
                 );
             }
             Command::Boots(a) => {
-                return match pods::boots_text(&self.parts.paths, a) {
+                let paths = match self.parts.paths.selected() {
+                    Ok(paths) => paths,
+                    Err(e) => return say(NoticeLevel::Error, e.to_string()),
+                };
+                return match pods::boots_text(&paths, a) {
                     Ok(text) => say(NoticeLevel::Info, text),
                     Err(e) => say(NoticeLevel::Error, e),
                 };
@@ -556,7 +589,14 @@ impl PodServer {
         let result = if cancelled_up {
             // As `viy down` after the up it cancelled: a pod that up asked
             // for may still appear.
-            let env = self.env();
+            let paths = match self.parts.paths.selected() {
+                Ok(paths) => paths,
+                Err(e) => {
+                    background(BackgroundState::Failed, Some(e.to_string()));
+                    return;
+                }
+            };
+            let env = self.env(&paths);
             let down = viy_pod::commands::down(&env, &cfg, true, &report);
             tokio::select! {
                 biased;
@@ -608,12 +648,13 @@ impl PodServer {
         report: &(dyn Fn(Report) + Send + Sync),
         ask: &(dyn Fn(&viy_protocol::Question) -> Option<viy_protocol::Asking> + Send + Sync),
     ) -> Result<(), CommandError> {
-        let env = self.env();
+        let paths = self.parts.paths.selected()?;
+        let env = self.env(&paths);
         match command {
             Command::Shutdown(args) => {
                 let var = |name: &str| std::env::var_os(name);
                 let host = Host {
-                    paths: &self.parts.paths,
+                    paths: &paths,
                     exec: self.parts.exec.as_ref(),
                     time: self.parts.time.as_ref(),
                     chats: &SystemChats,
@@ -739,6 +780,15 @@ fn number(value: &Value) -> Option<f64> {
 }
 
 impl Server for PodServer {
+    fn turn_lease(&self) -> Result<Option<std::fs::File>, String> {
+        if self.parts.url.is_none() && self.backend == Ok(Backend::Managed) {
+            viy_pod::rental::lease(&self.parts.paths, false)
+                .map(Some)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(None)
+        }
+    }
     fn ready(self: Arc<Self>) -> BoxFuture<'static, Result<Ready, String>> {
         Box::pin(async move {
             let backend = self.backend.clone()?;
@@ -748,11 +798,12 @@ impl Server for PodServer {
                 return Ok(Ready {
                     base: base.trim_end_matches('/').to_string(),
                     model,
+                    context_window: None,
                 });
             }
             let busy = self
                 .own_state()
-                .or_else(|| self.others_state().filter(|_| backend == Backend::Runpod));
+                .or_else(|| self.others_state().filter(|_| backend == Backend::Managed));
             match busy {
                 Some(PodState::Booting { stage }) => {
                     return Err(format!("the pod is still booting ({stage})"));
@@ -760,10 +811,8 @@ impl Server for PodServer {
                 Some(_) => return Err("the pod is stopping".into()),
                 None => {}
             }
-            match self.probe(&cfg, backend).await {
-                Ok(base) => Ok(Ready { base, model }),
-                Err(why) => Err(why),
-            }
+            let paths = self.parts.paths.selected().map_err(|e| e.to_string())?;
+            self.probe(&paths, &cfg, backend).await
         })
     }
 

@@ -1024,6 +1024,9 @@ async fn summary_written_after_a_turn_is_used_at_compaction() {
         format!("{SUMMARY_HEAD}\n\nbg summary")
     );
     assert_eq!(d.chat.messages[2..], [qa(2), qa(3)].concat()[..]);
+    let gauge = d.chat.gauge.as_ref().unwrap();
+    assert!(gauge.estimated);
+    assert_eq!(gauge.used, d.chat.context_state(&[]).0);
     assert!(d.chat.background.is_none());
 }
 

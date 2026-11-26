@@ -291,6 +291,7 @@ async fn run_case(case: &Value) -> Replayed {
     let time = FakeTime::at(DateTime::from_timestamp(NOW, 0).unwrap());
     let exec = FakeExec::new([Run::StandIn(Command::new("true"))]);
     let env = Env {
+        terminal_login: false,
         paths: &paths,
         exec: &exec,
         http: &http,

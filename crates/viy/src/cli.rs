@@ -15,6 +15,12 @@ use clap::ValueEnum;
 
 use crate::model::ModelArgs;
 
+pub const COMPLETION_ENV: &str = "VIY_SHELL_COMPLETE";
+
+fn completion_shells() -> clap::builder::PossibleValuesParser {
+    clap::builder::PossibleValuesParser::new(clap_complete::env::Shells::builtins().names())
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "viy",
@@ -135,6 +141,16 @@ pub enum Command {
     },
     #[command(about = "manage the weights network volume")]
     Volume(VolumeArgs),
+    /// Show or switch the machine-wide GPU rental provider.
+    Provider {
+        #[command(subcommand)]
+        action: Option<ProviderAction>,
+    },
+    /// Print the shell script that enables viy tab completion.
+    Completion {
+        #[arg(default_value = "bash", value_parser = completion_shells())]
+        shell: String,
+    },
     /// Internal: collect a boot's logs next to its record; `viy up` starts
     /// it in the background (`viy_pod::wait::spawn_capture`).
     #[command(hide = true, name = "capture-boot")]
@@ -172,10 +188,42 @@ impl Command {
             Self::Model(_) => "model",
             Self::Backup { .. } => "backup",
             Self::Volume(_) => "volume",
+            Self::Provider { .. } => "provider",
+            Self::Completion { .. } => "completion",
             Self::CaptureBoot { .. } => "capture-boot",
             Self::Dev(_) => "dev",
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProviderAction {
+    /// Show the selected provider and locally recorded resources.
+    Show {
+        #[arg(value_parser = viy_config::Rental::NAMES)]
+        provider: Option<String>,
+    },
+    /// List supported providers and mark the selected one.
+    List,
+    /// Select Nebius, optionally in a specific region.
+    Nebius {
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// Select RunPod.
+    Runpod,
+    /// Select RunPod or Nebius. Choosing a provider does not allocate a GPU.
+    Use {
+        #[arg(value_parser = viy_config::Rental::NAMES)]
+        provider: String,
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// Show live regional RTX PRO 6000 capacity.
+    Stock {
+        #[arg(value_parser = ["nebius"])]
+        provider: String,
+    },
 }
 
 #[derive(Debug, Args)]

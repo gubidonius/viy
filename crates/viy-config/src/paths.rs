@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
+    pub rental: crate::Rental,
     pub home: PathBuf,
     /// `$XDG_CONFIG_HOME`, else `~/.config`.
     pub config_home: PathBuf,
@@ -38,6 +39,7 @@ impl Paths {
         })?;
         let mut paths = Self::from_vars(home, |name| std::env::var_os(name));
         paths.pod_state_moved = crate::cutover::Record::load(&paths.state_dir())?.pod_state_moved;
+        paths.rental = crate::Rental::load(&paths)?;
         Ok(paths)
     }
 
@@ -50,6 +52,7 @@ impl Paths {
             _ => home.join(default),
         };
         Self {
+            rental: crate::Rental::Runpod,
             config_home: xdg("XDG_CONFIG_HOME", ".config"),
             data_home: xdg("XDG_DATA_HOME", ".local/share"),
             state_home: xdg("XDG_STATE_HOME", ".local/state"),
@@ -95,11 +98,29 @@ impl Paths {
         self.state_home.join(TOOL)
     }
 
+    /// Re-read the selection for a new operation in a long-lived process.
+    pub fn selected(&self) -> io::Result<Self> {
+        let mut paths = self.clone();
+        paths.rental = crate::Rental::load(self)?;
+        Ok(paths)
+    }
+
     /// Where the pod state is (`pod.json`, `pod.lock`, `last_activity`,
     /// `known_hosts`, the boot records): rp's state directory, shared with
     /// rp until cutover (kb d006), then viy's own, once `viy migrate
     /// --finish` has moved it there (kb d135).
     pub fn pod_state_dir(&self) -> PathBuf {
+        if let crate::Rental::Nebius { project, region } = &self.rental {
+            return self
+                .state_dir()
+                .join("providers/nebius")
+                .join(project)
+                .join(region);
+        }
+        self.legacy_pod_dir()
+    }
+
+    fn legacy_pod_dir(&self) -> PathBuf {
         if self.pod_state_moved {
             self.state_dir()
         } else {
@@ -124,7 +145,7 @@ impl Paths {
 
     /// Held for the whole of up, stop and down, by rp and viy alike.
     pub fn pod_lock_file(&self) -> PathBuf {
-        self.pod_state_dir().join("pod.lock")
+        self.legacy_pod_dir().join("pod.lock")
     }
 
     /// The pods' SSH host keys, pinned under an alias per volume, apart
@@ -185,23 +206,23 @@ impl Paths {
     /// The scheduled shutdown's runner, deadline and poweroff,
     /// `shutdown.json`: one per machine, whichever tool scheduled it.
     pub fn shutdown_state_file(&self) -> PathBuf {
-        self.pod_state_dir().join("shutdown.json")
+        self.legacy_pod_dir().join("shutdown.json")
     }
 
     /// What the scheduled shutdown's runner writes, `shutdown.log`.
     pub fn shutdown_log_file(&self) -> PathBuf {
-        self.pod_state_dir().join("shutdown.log")
+        self.legacy_pod_dir().join("shutdown.log")
     }
 
     /// The local backend's vLLM process: its pid, port and start,
     /// `local.json`.
     pub fn local_state_file(&self) -> PathBuf {
-        self.pod_state_dir().join("local.json")
+        self.legacy_pod_dir().join("local.json")
     }
 
     /// What the local backend's vLLM writes, `local-vllm.log`.
     pub fn local_log_file(&self) -> PathBuf {
-        self.pod_state_dir().join("local-vllm.log")
+        self.legacy_pod_dir().join("local-vllm.log")
     }
 
     /// Where `viy reap --install` puts its timer, as rp puts its own:

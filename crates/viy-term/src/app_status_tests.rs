@@ -28,6 +28,7 @@ fn statuses() -> Vec<EventMsg> {
             effort: "medium".into(),
         }),
         EventMsg::TokenCount(TokenCountEvent {
+            estimated: false,
             used: 107_000,
             budget: 262_000,
             auto_compact_at: Some(222_700),

@@ -19,6 +19,7 @@ pub mod notice;
 pub mod process;
 pub mod provider;
 pub mod regions;
+pub mod rental;
 pub mod shutdown;
 pub mod ssh;
 pub mod state;

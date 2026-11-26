@@ -7,6 +7,10 @@
 //! converges on what this tokenizer does with this user's mix of prose and
 //! code.
 
+use std::hash::DefaultHasher;
+use std::hash::Hash;
+use std::hash::Hasher;
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -171,6 +175,44 @@ impl Estimator {
             return;
         }
         self.chars_per_token += 0.35 * (ratio - self.chars_per_token);
+    }
+}
+
+/// The last measured prompt prefix. A fingerprint lets us reuse its token count
+/// only while the source messages, model, template and tool schemas still match.
+pub(crate) struct MeasuredPrompt {
+    messages: usize,
+    fingerprint: u64,
+    tokens: u64,
+}
+
+impl MeasuredPrompt {
+    fn fingerprint(body: &Value, messages: &[Value]) -> u64 {
+        let mut hash = DefaultHasher::new();
+        for key in ["model", "tools", "tool_choice", "chat_template_kwargs"] {
+            body[key].hash(&mut hash);
+        }
+        messages.hash(&mut hash);
+        hash.finish()
+    }
+
+    pub(crate) fn new(body: &Value, messages: &[Value], tokens: u64) -> Self {
+        Self {
+            messages: messages.len(),
+            fingerprint: Self::fingerprint(body, messages),
+            tokens,
+        }
+    }
+
+    pub(crate) fn estimate(
+        &self,
+        body: &Value,
+        messages: &[Value],
+        estimator: Estimator,
+    ) -> Option<u64> {
+        let (prefix, suffix) = messages.split_at_checked(self.messages)?;
+        (Self::fingerprint(body, prefix) == self.fingerprint)
+            .then(|| self.tokens.saturating_add(estimator.tokens(suffix, 0)))
     }
 }
 

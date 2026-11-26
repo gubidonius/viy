@@ -169,11 +169,13 @@ fn every_scenario_without_build_tools_sends_what_rp_sent() {
 #[test]
 fn drive_shows_scenario_one_as_events() {
     let (events, _, _) = drive("plain-two-turns");
-    let types: Vec<&str> = events
+    let mut types: Vec<&str> = events
         .iter()
         .map(|e| e["msg"]["type"].as_str().unwrap())
         .filter(|t| !t.ends_with("_delta"))
         .collect();
+    // A streamed request may publish several context updates between deltas.
+    types.dedup_by(|a, b| *a == "token_count" && *b == "token_count");
     assert_eq!(
         types,
         [

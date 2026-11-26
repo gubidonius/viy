@@ -24,6 +24,7 @@ use viy_protocol::DeltaEvent;
 use viy_protocol::EventMsg;
 use viy_protocol::NoticeEvent;
 use viy_protocol::NoticeLevel;
+use viy_protocol::TokenCountEvent;
 
 /// Where the model is: the backend's base URL, key and kind, as
 /// `viy_pod::backend::Backend` gives them (viy-agent sits below viy-pod).
@@ -90,6 +91,9 @@ pub struct Reply {
     finish: Option<String>,
     first_token: Option<tokio::time::Instant>,
     done: bool,
+    /// Accumulate deltas once, including text the UI never prints (tool arguments).
+    output_chars: u64,
+    reported: ReportedUsage,
 }
 
 impl Reply {
@@ -103,9 +107,6 @@ impl Reply {
             return None;
         }
         let chunk: Value = serde_json::from_str(data).ok()?;
-        if truthy(&chunk["usage"]) {
-            self.usage = Some(chunk["usage"].clone());
-        }
         let mut pieces = Vec::new();
         for choice in chunk["choices"].as_array().into_iter().flatten() {
             if let Some(finish) = choice["finish_reason"].as_str().filter(|f| !f.is_empty()) {
@@ -121,9 +122,11 @@ impl Reply {
                     slot.id = id.to_string();
                 }
                 if let Some(name) = nonempty(&tc["function"]["name"]) {
+                    self.output_chars += name.chars().count() as u64;
                     slot.name = name.to_string();
                 }
                 if let Some(arguments) = nonempty(&tc["function"]["arguments"]) {
+                    self.output_chars += arguments.chars().count() as u64;
                     slot.arguments.push_str(arguments);
                 }
             }
@@ -131,15 +134,21 @@ impl Reply {
                 nonempty(&delta["reasoning"]).or(nonempty(&delta["reasoning_content"]))
             {
                 self.reasoning.push_str(text);
+                self.output_chars += text.chars().count() as u64;
                 pieces.push(Piece::Reasoning(text.to_string()));
             }
             if let Some(text) = nonempty(&delta["content"]) {
+                self.output_chars += text.chars().count() as u64;
                 answer.push_str(text);
                 pieces.push(Piece::Content(text.to_string()));
             }
         }
         if !pieces.is_empty() && self.first_token.is_none() {
             self.first_token = Some(tokio::time::Instant::now());
+        }
+        if truthy(&chunk["usage"]) {
+            self.usage = Some(chunk["usage"].clone());
+            self.reported.record(&chunk["usage"], self.output_chars);
         }
         Some(pieces)
     }
@@ -163,6 +172,88 @@ impl Reply {
 
 fn nonempty(value: &Value) -> Option<&str> {
     value.as_str().filter(|s| !s.is_empty())
+}
+
+/// Cumulative server counters can arrive in separate chunks. Each output count
+/// covers the stream only up to the character at which it was received.
+#[derive(Debug, Default)]
+struct ReportedUsage {
+    prompt: Option<u64>,
+    completion: Option<(u64, u64)>,
+    total: Option<(u64, u64)>,
+}
+
+impl ReportedUsage {
+    fn record(&mut self, usage: &Value, chars: u64) {
+        if let Some(prompt) = usage["prompt_tokens"].as_u64().filter(|n| *n > 0) {
+            self.prompt = Some(prompt);
+        }
+        // Some compatible servers send all-zero placeholders before accounting starts.
+        if let Some(output) = usage["completion_tokens"]
+            .as_u64()
+            .filter(|n| *n > 0 || chars == 0)
+        {
+            self.completion = Some((output, chars));
+            if let Some(prompt) = self.prompt {
+                self.total = Some((prompt.saturating_add(output), chars));
+            }
+        }
+        if let Some(total) = usage["total_tokens"].as_u64().filter(|n| *n > 0) {
+            self.total = Some((total, chars));
+        }
+    }
+}
+
+/// One main-model request. SSE chunks may contain any number of tokens. Use the
+/// server's cumulative usage when supplied and estimate only the uncovered text.
+pub(crate) struct RequestGauge {
+    prompt: u64,
+    chars_per_token: f64,
+    pub(crate) count: TokenCountEvent,
+    pub(crate) reported_prompt: Option<u64>,
+}
+
+impl RequestGauge {
+    pub(crate) fn new(count: TokenCountEvent, chars_per_token: f64) -> Self {
+        Self {
+            prompt: count.used,
+            reported_prompt: None,
+            chars_per_token,
+            count,
+        }
+    }
+
+    fn update(&mut self, reply: &Reply, sink: &Sink<'_>) {
+        let reported = &reply.reported;
+        self.reported_prompt = reported.prompt;
+        let estimate_since =
+            |at| ((reply.output_chars - at) as f64 / self.chars_per_token).ceil() as u64;
+        let (used, estimated) = if let Some((total, at)) = reported.total {
+            (
+                total.saturating_add(estimate_since(at)),
+                at != reply.output_chars,
+            )
+        } else {
+            let (output, at) = reported.completion.unwrap_or((0, 0));
+            let used = reported
+                .prompt
+                .unwrap_or(self.prompt)
+                .saturating_add(output)
+                .saturating_add(estimate_since(at));
+            (
+                used,
+                reported.prompt.is_none()
+                    || reported.completion.is_none()
+                    || at != reply.output_chars,
+            )
+        };
+        if (used, estimated) == (self.count.used, self.count.estimated) {
+            return;
+        }
+        self.count.used = used;
+        self.count.estimated = estimated;
+        (sink.emit)(EventMsg::TokenCount(self.count.clone()));
+    }
 }
 
 /// Python's truthiness of a JSON value.
@@ -201,6 +292,16 @@ pub async fn stream_once(
     body: &Value,
     sink: &Sink<'_>,
     answer: &mut String,
+) -> Option<Round> {
+    stream_with_context(endpoint, body, sink, answer, None).await
+}
+
+pub(crate) async fn stream_with_context(
+    endpoint: &Endpoint,
+    body: &Value,
+    sink: &Sink<'_>,
+    answer: &mut String,
+    mut gauge: Option<&mut RequestGauge>,
 ) -> Option<Round> {
     answer.clear();
     let request = endpoint
@@ -292,12 +393,22 @@ pub async fn stream_once(
         while let Some(end) = pending.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = pending.drain(..=end).collect();
             if take_line(&mut reply, &line, sink, answer) {
-                return Some(reply.finish(answer));
+                break;
             }
+        }
+        // One update per network read, including the last read before a pause.
+        if let Some(gauge) = gauge.as_deref_mut() {
+            gauge.update(&reply, sink);
+        }
+        if reply.done {
+            return Some(reply.finish(answer));
         }
     }
     if !pending.is_empty() {
         take_line(&mut reply, &pending, sink, answer);
+    }
+    if let Some(gauge) = gauge {
+        gauge.update(&reply, sink);
     }
     Some(reply.finish(answer))
 }

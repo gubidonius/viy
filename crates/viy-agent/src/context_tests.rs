@@ -4,6 +4,7 @@
 //! chat_tests, where the chat builds it.
 
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use viy_config::Config;
 use viy_testkit::fixtures;
 
@@ -128,4 +129,23 @@ fn the_template_spaces_the_schemas() {
     let one = serde_json::json!({"a": [1, 2], "b": {"c": "é"}});
     // {"a": [1, 2], "b": {"c": "é"}}
     assert_eq!(schema_chars(&[one]), 32);
+}
+
+#[test]
+fn only_an_unchanged_prompt_prefix_can_reuse_its_reported_tokens() {
+    let estimator = Estimator::default();
+    let mut options = json!({"model":"m","tools":[]});
+    let mut messages = vec![json!({"role":"user","content":"test"})];
+    let prefix = MeasuredPrompt::new(&options, &messages, 9000);
+    let added = json!({"role":"assistant","content":"a reply"});
+    messages.push(added.clone());
+    assert_eq!(
+        prefix.estimate(&options, &messages, estimator),
+        Some(9000 + estimator.tokens(&[added], 0))
+    );
+    options["tools"] = json!([{"function":{"name":"read"}}]);
+    assert_eq!(prefix.estimate(&options, &messages, estimator), None);
+    options["tools"] = json!([]);
+    messages[0]["content"] = json!("edit");
+    assert_eq!(prefix.estimate(&options, &messages, estimator), None);
 }

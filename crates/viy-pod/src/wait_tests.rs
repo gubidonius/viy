@@ -31,6 +31,85 @@ use crate::provider::test_seam;
 const API_KEY: &str = "rpa_SYNTHETICKEY0000";
 const VLLM_KEY: &str = "sk-SYNTHETICENDPOINT";
 
+#[tokio::test(start_paused = true)]
+async fn cold_nebius_boot_can_outlast_stratas_default_and_reports_a_confirmed_exit() {
+    assert_eq!(nebius_strata_ready_secs(Duration::from_secs(2700)), "2700");
+    assert_eq!(nebius_strata_ready_secs(Duration::from_secs(60)), "900");
+    let exec = FakeExec::new([
+        Run::Fail(io::ErrorKind::TimedOut),
+        Run::exit(1, "", "Docker unavailable"),
+        Run::stdout("model-server\n"),
+        Run::stdout(""),
+    ]);
+    let error = nebius_engine_exit(&exec, Command::new("ssh"), "Strata")
+        .await
+        .unwrap_err();
+    assert_eq!(exec.left(), 0);
+    assert!(matches!(error, WaitError::Startup(s) if s.contains("Strata exited")));
+}
+
+/// A Nebius VM's log is its serial console. The engine's is read from its
+/// container, so a load the endpoint refuses for minutes shows as the load
+/// (2026-08-11: "waiting for Strata (ConnectionError)" for 14 minutes).
+#[tokio::test(start_paused = true)]
+async fn a_nebius_wait_shows_the_engine_load_not_the_refused_endpoint() {
+    use viy_testkit::provider::Scripted;
+
+    let seam = Arc::new(Scripted::new([]).with_logs(["serial console: warmup"]));
+    let shared: Arc<dyn Provider> = seam.clone();
+    let progress = Progress::new(shared, "s1", true);
+    progress.engine_started("Strata");
+    let exec = FakeExec::new([
+        Run::Fail(io::ErrorKind::TimedOut),
+        Run::stdout(
+            "2026-01-01T00:00:01.000000001Z RPCTL_PHASE starting Strata\n\
+             2026-01-01T00:00:02.5Z [strata] loading the experts into RAM (tens of GB)\n\
+             2026-01-01T00:00:03Z          Please wait\n\
+             2026-01-01T00:00:04Z [strata] still starting (20 s) - please wait ...\n",
+        ),
+        Run::exit(1, "", "No such container"),
+        Run::stdout("2026-01-01T00:00:50Z RPCTL_PHASE model ready\n"),
+        Run::stdout(""),
+    ]);
+    let health = RouteHttp::new(|_| Reply::Fail(HttpError::Network("empty reply".into())));
+    let told = Told::default();
+    let report = told.reporter();
+    let wait = wait_ready(
+        &health,
+        "http://127.0.0.1:18002",
+        None,
+        Duration::from_secs(90),
+        Some(&progress),
+        None,
+        crate::engine::EngineName::Strata,
+        &report,
+    );
+    let ready = tokio::select! {
+        ready = wait => ready.unwrap(),
+        never = nebius_engine_log(&exec, Command::new("ssh"), &progress) => match never {},
+    };
+    assert!(!ready);
+    let mut shown: Vec<String> = told.clocks().into_iter().map(|c| c.state).collect();
+    shown.dedup();
+    assert_eq!(
+        shown,
+        [
+            "starting",
+            "starting Strata",
+            "loading the experts into RAM",
+            "ready in pod, local endpoint: ConnectionError",
+        ]
+    );
+    assert_eq!(seam.calls(), Vec::<String>::new());
+    for sent in exec.sent() {
+        assert!(
+            sent.argv().iter().any(|a| a.contains("docker logs")),
+            "{:?}",
+            sent.argv()
+        );
+    }
+}
+
 /// What a test was told, in order.
 #[derive(Default, Clone)]
 struct Told(Arc<Mutex<Vec<Report>>>);
